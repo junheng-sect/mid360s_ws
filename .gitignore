@@ -1,0 +1,27 @@
+# ROS and catkin build artifacts
+build/
+devel/
+install/
+logs/
+.catkin_tools/
+
+# In-tree dependency build and local install prefix
+.deps/
+third_party/Livox-SDK2/build/
+
+# Runtime data, point clouds, bags, and logs
+*.bag
+*.pcd
+*.log
+test_artifacts/
+src/FAST_LIO/Log/*.txt
+src/FAST_LIO/Log/*.png
+src/FAST_LIO/Log/*.csv
+src/FAST_LIO/Log/*.pdf
+src/FAST_LIO/PCD/*.pcd
+
+# System and editor files
+.vscode/
+*.swp
+*~
+__pycache__/
