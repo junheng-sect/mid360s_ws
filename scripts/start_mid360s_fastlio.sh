@@ -2,8 +2,10 @@
 set -euo pipefail
 
 # ==============================================================================
-# 一键前台启动 Livox MID-360S 驱动与 FAST-LIO2
+# 一键前台启动 Livox MID-360S 驱动、FAST-LIO2 与重力对齐桥接
 # 路径: /home/orangepi/mid360s_ws/scripts/start_mid360s_fastlio.sh
+# 用法: ./start_mid360s_fastlio.sh [--check] [--send-to-mavros]
+#   --send-to-mavros   把带协方差位姿输出改为 /mavros/vision_pose/pose_cov
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,13 +21,23 @@ LIDAR_DEVICE_IP="192.168.1.194"
 ROS_MASTER_PORT=11311
 
 CHECK_ONLY=0
-if [[ $# -eq 1 && "$1" == "--check" ]]; then
-    CHECK_ONLY=1
-elif [[ $# -gt 0 ]]; then
-    echo "用法: $0 [--check]" >&2
-    echo "  --check   仅执行前置网络、依赖、状态及 launch 解析检查，不启动节点" >&2
-    exit 2
-fi
+SEND_TO_MAVROS=0
+for arg in "$@"; do
+    case "$arg" in
+        --check)
+            CHECK_ONLY=1
+            ;;
+        --send-to-mavros)
+            SEND_TO_MAVROS=1
+            ;;
+        *)
+            echo "用法: $0 [--check] [--send-to-mavros]" >&2
+            echo "  --check            仅执行前置网络、依赖、状态及 launch 解析检查，不启动节点" >&2
+            echo "  --send-to-mavros   把带协方差位姿输出改为 /mavros/vision_pose/pose_cov" >&2
+            exit 2
+            ;;
+    esac
+done
 
 CHECK_FAILED=0
 
@@ -69,6 +81,7 @@ done
 
 DRIVER_PKG_DIR=$(rospack find livox_ros_driver2 2>/dev/null || true)
 FASTLIO_PKG_DIR=$(rospack find fast_lio 2>/dev/null || true)
+BRIDGE_PKG_DIR=$(rospack find fastlio_gravity_bridge 2>/dev/null || true)
 
 if [[ -z "$DRIVER_PKG_DIR" ]]; then
     echo "[ERROR] 无法找到 ROS 包 livox_ros_driver2" >&2
@@ -80,8 +93,14 @@ if [[ -z "$FASTLIO_PKG_DIR" ]]; then
     if [[ $CHECK_ONLY -eq 1 ]]; then CHECK_FAILED=1; else exit 1; fi
 fi
 
+if [[ -z "$BRIDGE_PKG_DIR" ]]; then
+    echo "[ERROR] 无法找到 ROS 包 fastlio_gravity_bridge" >&2
+    if [[ $CHECK_ONLY -eq 1 ]]; then CHECK_FAILED=1; else exit 1; fi
+fi
+
 DRIVER_LAUNCH="${DRIVER_PKG_DIR}/launch_ROS1/msg_MID360s.launch"
 FASTLIO_LAUNCH="${FASTLIO_PKG_DIR}/launch/mapping_mid360s.launch"
+BRIDGE_LAUNCH="${BRIDGE_PKG_DIR}/launch/gravity_bridge.launch"
 
 if [[ ! -f "$DRIVER_LAUNCH" ]]; then
     echo "[ERROR] 驱动 launch 文件不存在: $DRIVER_LAUNCH" >&2
@@ -90,6 +109,11 @@ fi
 
 if [[ ! -f "$FASTLIO_LAUNCH" ]]; then
     echo "[ERROR] 算法 launch 文件不存在: $FASTLIO_LAUNCH" >&2
+    if [[ $CHECK_ONLY -eq 1 ]]; then CHECK_FAILED=1; else exit 1; fi
+fi
+
+if [[ ! -f "$BRIDGE_LAUNCH" ]]; then
+    echo "[ERROR] 重力对齐桥接 launch 文件不存在: $BRIDGE_LAUNCH" >&2
     if [[ $CHECK_ONLY -eq 1 ]]; then CHECK_FAILED=1; else exit 1; fi
 fi
 
@@ -145,6 +169,9 @@ fi
 if pgrep -f "fastlio_mapping" >/dev/null 2>&1; then
     running_procs+=("fastlio_mapping")
 fi
+if pgrep -f "gravity_bridge_node" >/dev/null 2>&1; then
+    running_procs+=("gravity_bridge_node")
+fi
 
 if [[ ${#running_procs[@]} -gt 0 ]]; then
     if [[ $CHECK_ONLY -eq 1 ]]; then
@@ -177,6 +204,9 @@ if nc -z -w 1 "$EXPECTED_WIFI_IP" "$ROS_MASTER_PORT" >/dev/null 2>&1; then
     if echo "$active_nodes" | grep -qx "/laserMapping"; then
         node_conflicts+=("/laserMapping")
     fi
+    if echo "$active_nodes" | grep -qx "/gravity_bridge"; then
+        node_conflicts+=("/gravity_bridge")
+    fi
 
     if [[ ${#node_conflicts[@]} -gt 0 ]]; then
         echo "[ERROR] ROS Master 中已存在运行中的节点: ${node_conflicts[*]}" >&2
@@ -193,7 +223,9 @@ fi
 # ------------------------------------------------------------------------------
 cat <<'EOF' > "$COMBINED_LAUNCH"
 <launch>
-  <!-- 联合启动 MID-360S 驱动与 FAST-LIO2 -->
+  <!-- 联合启动 MID-360S 驱动、FAST-LIO2 与重力对齐桥接 -->
+  <arg name="send_to_mavros" default="false"/>
+
   <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360s.launch">
     <arg name="rviz_enable" value="false"/>
     <arg name="rosbag_enable" value="false"/>
@@ -201,6 +233,10 @@ cat <<'EOF' > "$COMBINED_LAUNCH"
 
   <include file="$(find fast_lio)/launch/mapping_mid360s.launch">
     <arg name="rviz" value="false"/>
+  </include>
+
+  <include file="$(find fastlio_gravity_bridge)/launch/gravity_bridge.launch">
+    <arg name="send_to_mavros" value="$(arg send_to_mavros)"/>
   </include>
 </launch>
 EOF
@@ -217,7 +253,14 @@ if [[ $CHECK_ONLY -eq 1 ]]; then
     echo "引用的 Launch 文件:"
     echo "$files_found"
 
-    if echo "$nodes_found" | grep -qx "/livox_lidar_publisher2" && echo "$nodes_found" | grep -qx "/laserMapping"; then
+    nodes_ok=1
+    for expected_node in /livox_lidar_publisher2 /laserMapping /gravity_bridge; do
+        if ! echo "$nodes_found" | grep -qx "$expected_node"; then
+            echo "[FAIL] 联合 launch 缺少节点: $expected_node"
+            nodes_ok=0
+        fi
+    done
+    if [[ $nodes_ok -eq 1 ]]; then
         echo "[PASS] 联合 launch 节点解析正确"
     else
         echo "[FAIL] 联合 launch 节点解析异常"
@@ -232,6 +275,13 @@ if [[ $CHECK_ONLY -eq 1 ]]; then
     exit 0
 fi
 
+if [[ $SEND_TO_MAVROS -eq 1 ]]; then
+    ROSLAUNCH_ARGS=(send_to_mavros:=true)
+    echo "[INFO] 带协方差位姿输出目的地: /mavros/vision_pose/pose_cov"
+else
+    ROSLAUNCH_ARGS=(send_to_mavros:=false)
+fi
+
 echo "============================================================"
 echo "[INFO] 启动 MID-360S 驱动与 FAST-LIO2 (前台模式)"
 echo "[INFO] ROS_MASTER_URI: $ROS_MASTER_URI"
@@ -239,4 +289,4 @@ echo "[INFO] ROS_IP:         $ROS_IP"
 echo "[INFO] 按 Ctrl+C 统一停止全部节点"
 echo "============================================================"
 
-exec roslaunch --screen --required "$COMBINED_LAUNCH"
+exec roslaunch --screen --required "$COMBINED_LAUNCH" "${ROSLAUNCH_ARGS[@]}"

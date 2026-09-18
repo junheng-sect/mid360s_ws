@@ -1,0 +1,478 @@
+// 消息测试：用真实节点类验证等待、输出一致性、非法输入、重复时间戳与重启处理。
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <string>
+
+#include <gtest/gtest.h>
+
+#include <ros/ros.h>
+
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
+#include <geometry_msgs/Vector3Stamped.h>
+#include <nav_msgs/Odometry.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+
+#include "fastlio_gravity_bridge/gravity_bridge.h"
+
+namespace fgb = fastlio_gravity_bridge;
+
+namespace
+{
+
+constexpr double kGravity = 9.81;
+constexpr double kPitchDeg = 20.12;
+
+Eigen::Matrix3d pitchRotation(double pitch_deg)
+{
+  return Eigen::AngleAxisd(pitch_deg * M_PI / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
+}
+
+/// 前倾 20.12 度时机体系测得的重力（camera_init 下）。
+Eigen::Vector3d tiltedGravity()
+{
+  return pitchRotation(kPitchDeg).transpose() * Eigen::Vector3d(0.0, 0.0, -kGravity);
+}
+
+/// 自旋等待，直到条件满足或超时。
+template <typename Predicate>
+bool spinUntil(Predicate predicate, double timeout_sec)
+{
+  const ros::Time deadline = ros::Time::now() + ros::Duration(timeout_sec);
+  ros::Rate rate(100);
+  while (ros::ok() && ros::Time::now() < deadline)
+  {
+    ros::spinOnce();
+    if (predicate()) return true;
+    rate.sleep();
+  }
+  ros::spinOnce();
+  return predicate();
+}
+
+}  // namespace
+
+class BridgeMessagesTest : public ::testing::Test
+{
+ protected:
+  void SetUp() override
+  {
+    static int counter = 0;
+    const std::string suffix = std::to_string(counter++);
+
+    ros::NodeHandle nh;
+    nh_ = ros::NodeHandlePtr(new ros::NodeHandle());
+
+    config_.odom_in = "/test_bridge/odom" + suffix;
+    config_.gravity_in = "/test_bridge/gravity" + suffix;
+    config_.odom_out = "/test_bridge/odom_world" + suffix;
+    config_.pose_cov_out = "/test_bridge/pose_cov" + suffix;
+    config_.publish_static_tf = false;  // 静态 TF 由单独的用例检查
+
+    pub_gravity_ = nh_->advertise<geometry_msgs::Vector3Stamped>(config_.gravity_in, 1, true);
+    pub_odom_ = nh_->advertise<nav_msgs::Odometry>(config_.odom_in, 10);
+    sub_odom_ = nh_->subscribe(config_.odom_out, 50, &BridgeMessagesTest::onOdom, this);
+    sub_pose_cov_ =
+        nh_->subscribe(config_.pose_cov_out, 50, &BridgeMessagesTest::onPoseCov, this);
+
+    odom_count_ = 0;
+    pose_cov_count_ = 0;
+  }
+
+  void onOdom(const nav_msgs::Odometry::ConstPtr &msg)
+  {
+    ++odom_count_;
+    last_odom_ = *msg;
+  }
+
+  void onPoseCov(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr &msg)
+  {
+    ++pose_cov_count_;
+    last_pose_cov_ = *msg;
+  }
+
+  /// 构造桥接节点并等待所有订阅/发布连接建立。
+  void startBridge()
+  {
+    bridge_.reset(new fgb::GravityBridge(*nh_, config_));
+    ASSERT_TRUE(spinUntil([this] { return pub_gravity_.getNumSubscribers() > 0; }, 10.0));
+    ASSERT_TRUE(spinUntil([this] { return pub_odom_.getNumSubscribers() > 0; }, 10.0));
+    ASSERT_TRUE(spinUntil([this] { return sub_odom_.getNumPublishers() > 0; }, 10.0));
+    ASSERT_TRUE(spinUntil([this] { return sub_pose_cov_.getNumPublishers() > 0; }, 10.0));
+  }
+
+  void publishGravity(const Eigen::Vector3d &gravity, double stamp_sec,
+                      const std::string &frame_id = "camera_init")
+  {
+    geometry_msgs::Vector3Stamped msg;
+    msg.header.stamp = ros::Time().fromSec(stamp_sec);
+    msg.header.frame_id = frame_id;
+    msg.vector.x = gravity.x();
+    msg.vector.y = gravity.y();
+    msg.vector.z = gravity.z();
+    pub_gravity_.publish(msg);
+  }
+
+  void publishOdom(double stamp_sec, const std::string &frame_id = "camera_init",
+                   const std::string &child_frame_id = "body")
+  {
+    nav_msgs::Odometry msg;
+    msg.header.stamp = ros::Time().fromSec(stamp_sec);
+    msg.header.frame_id = frame_id;
+    msg.child_frame_id = child_frame_id;
+    msg.pose.pose.position.x = 1.0;
+    msg.pose.pose.position.y = -2.0;
+    msg.pose.pose.position.z = 3.0;
+    const Eigen::Quaterniond q_cb(Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitX()));
+    msg.pose.pose.orientation.w = q_cb.w();
+    msg.pose.pose.orientation.x = q_cb.x();
+    msg.pose.pose.orientation.y = q_cb.y();
+    msg.pose.pose.orientation.z = q_cb.z();
+    msg.pose.covariance[0] = 1.0e-2;   // x 位置方差
+    msg.pose.covariance[7] = 4.0e-2;   // y 位置方差
+    msg.pose.covariance[14] = 9.0e-2;  // z 位置方差
+    msg.pose.covariance[21] = 1.0e-5;  // roll 方差
+    msg.pose.covariance[28] = 4.0e-5;  // pitch 方差
+    msg.pose.covariance[35] = 9.0e-5;  // yaw 方差
+    msg.pose.covariance[1] = msg.pose.covariance[6] = 3.0e-3;  // 交叉项
+    msg.pose.covariance[3] = msg.pose.covariance[18] = 2.0e-4;
+    pub_odom_.publish(msg);
+  }
+
+  ros::NodeHandlePtr nh_;
+  fgb::GravityBridge::Config config_;
+  std::unique_ptr<fgb::GravityBridge> bridge_;
+
+  ros::Publisher pub_gravity_;
+  ros::Publisher pub_odom_;
+  ros::Subscriber sub_odom_;
+  ros::Subscriber sub_pose_cov_;
+
+  int odom_count_ = 0;
+  int pose_cov_count_ = 0;
+  nav_msgs::Odometry last_odom_;
+  geometry_msgs::PoseWithCovarianceStamped last_pose_cov_;
+};
+
+/// 未收到有效初始化重力前只等待，不输出未对齐消息。
+TEST_F(BridgeMessagesTest, WaitsForGravityBeforePublishing)
+{
+  startBridge();
+  EXPECT_EQ(bridge_->state(), fgb::GravityBridge::State::kWaitingGravity);
+
+  publishOdom(100.0);
+  spinUntil([this] { return odom_count_ > 0; }, 0.3);
+
+  EXPECT_EQ(odom_count_, 0);
+  EXPECT_EQ(pose_cov_count_, 0);
+  EXPECT_EQ(bridge_->publishedCount(), 0u);
+}
+
+/// 初始化重力坐标系不符时继续等待，不会锁定错误的对齐旋转。
+TEST_F(BridgeMessagesTest, RejectsGravityWithWrongFrame)
+{
+  startBridge();
+
+  publishGravity(tiltedGravity(), 55.0, "odom");  // 坐标系错误
+  spinUntil([this] { return bridge_->hasAlignment(); }, 0.3);
+  EXPECT_FALSE(bridge_->hasAlignment());
+  EXPECT_EQ(bridge_->state(), fgb::GravityBridge::State::kWaitingGravity);
+
+  publishOdom(100.5);
+  spinUntil([this] { return odom_count_ > 0; }, 0.3);
+  EXPECT_EQ(odom_count_, 0);
+
+  publishGravity(tiltedGravity(), 56.0);  // 正确坐标系
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+  publishOdom(100.5);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+  EXPECT_EQ(odom_count_, 1);
+}
+
+/// latched 重力：桥接节点晚于发布者启动（订阅发生在发布之后）也能拿到初始化重力。
+TEST_F(BridgeMessagesTest, ReceivesLatchedGravityAfterLateSubscription)
+{
+  // 先发布（此时还没有订阅者），再构造桥接节点。
+  publishGravity(tiltedGravity(), 50.0);
+  spinUntil([this] { return false; }, 0.2);
+
+  startBridge();
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+  EXPECT_EQ(bridge_->state(), fgb::GravityBridge::State::kAligned);
+
+  publishOdom(101.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+  EXPECT_EQ(odom_count_, 1);
+  EXPECT_EQ(pose_cov_count_, 1);
+}
+
+/// 两路输出：位姿、协方差、时间戳一致；坐标系与时间戳按约定保留。
+TEST_F(BridgeMessagesTest, OutputsSharePoseCovarianceAndTimestamp)
+{
+  startBridge();
+  publishGravity(tiltedGravity(), 60.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  publishOdom(102.5);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0 && pose_cov_count_ > 0; }, 5.0));
+
+  const fgb::AlignmentTransform &alignment = bridge_->alignment();
+
+  // 时间戳保留输入测量时间，父坐标系为 world，子坐标系保持 body。
+  EXPECT_DOUBLE_EQ(last_odom_.header.stamp.toSec(), 102.5);
+  EXPECT_EQ(last_odom_.header.frame_id, "world");
+  EXPECT_EQ(last_odom_.child_frame_id, "body");
+  EXPECT_EQ(last_pose_cov_.header.frame_id, "world");
+  EXPECT_DOUBLE_EQ(last_pose_cov_.header.stamp.toSec(), 102.5);
+
+  // 位姿：p_W = R_a p_C，q_WB = q_a ⊗ q_CB。
+  const Eigen::Vector3d p_world = alignment.R * Eigen::Vector3d(1.0, -2.0, 3.0);
+  EXPECT_NEAR(last_odom_.pose.pose.position.x, p_world.x(), 1e-12);
+  EXPECT_NEAR(last_odom_.pose.pose.position.y, p_world.y(), 1e-12);
+  EXPECT_NEAR(last_odom_.pose.pose.position.z, p_world.z(), 1e-12);
+  const Eigen::Quaterniond q_cb(Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitX()));
+  const Eigen::Quaterniond q_expected = alignment.q * q_cb;
+  const Eigen::Quaterniond q_actual(last_odom_.pose.pose.orientation.w,
+                                    last_odom_.pose.pose.orientation.x,
+                                    last_odom_.pose.pose.orientation.y,
+                                    last_odom_.pose.pose.orientation.z);
+  EXPECT_LT((q_actual.toRotationMatrix() - q_expected.toRotationMatrix()).cwiseAbs().maxCoeff(),
+            1e-12);
+
+  // 对齐后重力沿 world 的 -Z。
+  const Eigen::Vector3d g_world = alignment.R * tiltedGravity().normalized();
+  EXPECT_LT(std::abs(g_world.x()), 1e-12);
+  EXPECT_LT(std::abs(g_world.y()), 1e-12);
+  EXPECT_NEAR(g_world.z(), -1.0, 1e-12);
+
+  // 两路输出的位姿与协方差逐位一致。
+  EXPECT_DOUBLE_EQ(last_odom_.pose.pose.position.x, last_pose_cov_.pose.pose.position.x);
+  EXPECT_DOUBLE_EQ(last_odom_.pose.pose.orientation.w, last_pose_cov_.pose.pose.orientation.w);
+  for (int i = 0; i < 36; ++i)
+  {
+    EXPECT_DOUBLE_EQ(last_odom_.pose.covariance[i], last_pose_cov_.pose.covariance[i])
+        << "covariance index " << i;
+  }
+
+  // twist 及其协方差原样保留（当前 FAST-LIO2 未提供有效速度，输入为零）。
+  EXPECT_DOUBLE_EQ(last_odom_.twist.twist.linear.x, 0.0);
+  EXPECT_DOUBLE_EQ(last_odom_.twist.twist.angular.x, 0.0);
+  for (int i = 0; i < 36; ++i)
+  {
+    EXPECT_DOUBLE_EQ(last_odom_.twist.covariance[i], 0.0);
+  }
+}
+
+/// 非法输入一律拒绝发布：坐标系错误、非有限位姿、无效四元数、非法协方差。
+TEST_F(BridgeMessagesTest, RejectsInvalidInputs)
+{
+  startBridge();
+  publishGravity(tiltedGravity(), 70.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  publishOdom(103.0, "odom", "body");  // 输入坐标系错误
+  spinUntil([this] { return odom_count_ > 0; }, 0.3);
+  EXPECT_EQ(odom_count_, 0);
+
+  publishOdom(103.0, "camera_init", "base_link");  // child_frame 错误
+  spinUntil([this] { return odom_count_ > 0; }, 0.3);
+  EXPECT_EQ(odom_count_, 0);
+
+  {
+    nav_msgs::Odometry msg;
+    msg.header.stamp = ros::Time().fromSec(103.0);
+    msg.header.frame_id = "camera_init";
+    msg.child_frame_id = "body";
+    msg.pose.pose.orientation.w = 1.0;
+    msg.pose.pose.position.x = std::numeric_limits<double>::quiet_NaN();
+    pub_odom_.publish(msg);
+  }
+  spinUntil([this] { return odom_count_ > 0; }, 0.3);
+  EXPECT_EQ(odom_count_, 0);
+
+  {
+    nav_msgs::Odometry msg;
+    msg.header.stamp = ros::Time().fromSec(103.0);
+    msg.header.frame_id = "camera_init";
+    msg.child_frame_id = "body";
+    msg.pose.pose.orientation.w = 0.0;  // 无效四元数
+    pub_odom_.publish(msg);
+  }
+  spinUntil([this] { return odom_count_ > 0; }, 0.3);
+  EXPECT_EQ(odom_count_, 0);
+
+  {
+    nav_msgs::Odometry msg;
+    msg.header.stamp = ros::Time().fromSec(103.0);
+    msg.header.frame_id = "camera_init";
+    msg.child_frame_id = "body";
+    msg.pose.pose.orientation.w = 1.0;
+    msg.pose.covariance[21] = -1.0;  // 负方差
+    pub_odom_.publish(msg);
+  }
+  spinUntil([this] { return odom_count_ > 0; }, 0.3);
+  EXPECT_EQ(odom_count_, 0);
+
+  // 同一时间戳的合法消息仍应正常输出（前面几条都被拒绝，未占用时间戳）。
+  publishOdom(103.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+  EXPECT_EQ(odom_count_, 1);
+}
+
+/// 早于本次初始化的 odom 丢弃（不算时间回退）：历史帧晚到时不会用本轮旋转处理。
+TEST_F(BridgeMessagesTest, DropsOdomEarlierThanGravityInit)
+{
+  startBridge();
+  publishGravity(tiltedGravity(), 200.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  // 首条输入就早于初始化时间（此前没有已发布帧，旧实现会直接输出）。
+  publishOdom(199.0);
+  spinUntil([this] { return odom_count_ > 0; }, 0.3);
+  EXPECT_EQ(odom_count_, 0);
+  EXPECT_EQ(pose_cov_count_, 0);
+  EXPECT_EQ(bridge_->state(), fgb::GravityBridge::State::kAligned);  // 只是丢弃，不是致命
+
+  // 与初始化同一时刻的帧允许通过。
+  publishOdom(200.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+  EXPECT_EQ(odom_count_, 1);
+
+  // 初始化之后、但早于已发布帧的输入：按“时间回退”处理（停止输出）。
+  publishOdom(205.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 1; }, 5.0));
+  publishOdom(202.0);
+  ASSERT_TRUE(spinUntil(
+      [this] { return bridge_->state() == fgb::GravityBridge::State::kFatal; }, 5.0));
+}
+
+/// 初始化前只等待：这段时间到达的 odom 不应被缓存后补发。
+TEST_F(BridgeMessagesTest, DoesNotReplayOdomBufferedBeforeInit)
+{
+  startBridge();
+  for (double stamp = 300.0; stamp < 300.5; stamp += 0.1)
+  {
+    publishOdom(stamp);
+  }
+  spinUntil([this] { return odom_count_ > 0; }, 0.3);
+  EXPECT_EQ(odom_count_, 0);
+
+  publishGravity(tiltedGravity(), 301.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+  spinUntil([this] { return odom_count_ > 0; }, 0.5);
+  EXPECT_EQ(odom_count_, 0);  // 初始化之前的历史帧不会补发
+
+  publishOdom(302.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+  EXPECT_EQ(odom_count_, 1);
+}
+
+/// 重复时间戳丢弃，后续正常时间戳继续输出。
+TEST_F(BridgeMessagesTest, DropsDuplicateTimestamps)
+{
+  startBridge();
+  publishGravity(tiltedGravity(), 80.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  publishOdom(104.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+  EXPECT_EQ(odom_count_, 1);
+
+  publishOdom(104.0);  // 重复时间戳
+  spinUntil([this] { return odom_count_ > 1; }, 0.3);
+  EXPECT_EQ(odom_count_, 1);
+  EXPECT_EQ(bridge_->state(), fgb::GravityBridge::State::kAligned);
+
+  publishOdom(104.1);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 1; }, 5.0));
+  EXPECT_EQ(odom_count_, 2);
+}
+
+/// 时间回退：停止输出并要求重启，之后的新消息也不再输出。
+TEST_F(BridgeMessagesTest, StopsOnTimestampRegression)
+{
+  startBridge();
+  publishGravity(tiltedGravity(), 90.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  publishOdom(105.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+
+  publishOdom(104.0);  // 时间回退
+  ASSERT_TRUE(spinUntil(
+      [this] { return bridge_->state() == fgb::GravityBridge::State::kFatal; }, 5.0));
+  const int count_after_fatal = odom_count_;
+
+  publishOdom(106.0);
+  spinUntil([this, count_after_fatal] { return odom_count_ > count_after_fatal; }, 0.3);
+  EXPECT_EQ(odom_count_, count_after_fatal);
+  EXPECT_EQ(pose_cov_count_, count_after_fatal);
+}
+
+/// 运行中出现另一轮初始化：停止输出。
+TEST_F(BridgeMessagesTest, StopsOnSecondGravityInitialization)
+{
+  startBridge();
+  publishGravity(tiltedGravity(), 95.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  publishOdom(107.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+  const int count_before = odom_count_;
+
+  publishGravity(tiltedGravity() * 1.001, 96.0);  // 另一轮初始化
+  ASSERT_TRUE(spinUntil(
+      [this] { return bridge_->state() == fgb::GravityBridge::State::kFatal; }, 5.0));
+
+  publishOdom(108.0);
+  spinUntil([this, count_before] { return odom_count_ > count_before; }, 0.3);
+  EXPECT_EQ(odom_count_, count_before);
+  EXPECT_FALSE(bridge_->fatalReason().empty());
+}
+
+/// 默认发布 world -> camera_init 静态 TF（latched，晚订阅也能查询到）。
+TEST_F(BridgeMessagesTest, PublishesStaticTransform)
+{
+  config_.publish_static_tf = true;
+  tf2_ros::Buffer tf_buffer;
+  tf2_ros::TransformListener tf_listener(tf_buffer);
+
+  startBridge();
+  publishGravity(tiltedGravity(), 97.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  geometry_msgs::TransformStamped transform;
+  ASSERT_TRUE(spinUntil(
+      [&] {
+        try
+        {
+          transform = tf_buffer.lookupTransform("world", "camera_init", ros::Time(0));
+          return true;
+        }
+        catch (const tf2::TransformException &)
+        {
+          return false;
+        }
+      },
+      5.0));
+
+  EXPECT_EQ(transform.header.frame_id, "world");
+  EXPECT_EQ(transform.child_frame_id, "camera_init");
+  EXPECT_NEAR(transform.transform.translation.x, 0.0, 1e-15);
+  EXPECT_NEAR(transform.transform.translation.y, 0.0, 1e-15);
+  EXPECT_NEAR(transform.transform.translation.z, 0.0, 1e-15);
+  const Eigen::Quaterniond q(transform.transform.rotation.w, transform.transform.rotation.x,
+                             transform.transform.rotation.y, transform.transform.rotation.z);
+  EXPECT_LT((q.toRotationMatrix() - bridge_->alignment().R).cwiseAbs().maxCoeff(), 1e-12);
+}
+
+int main(int argc, char **argv)
+{
+  ros::init(argc, argv, "test_bridge_messages");
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

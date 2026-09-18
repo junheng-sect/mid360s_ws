@@ -17,6 +17,10 @@ mid360s_ws/
 │   │   ├── config/mid360s.yaml    # MID-360S 传感器配置参数
 │   │   ├── include/ikd-Tree/      # ikd-Tree 数据结构源码（以普通目录纳入）
 │   │   └── launch/mapping_mid360s.launch
+│   ├── fastlio_gravity_bridge/    # 重力对齐桥接包（world 输出 + 带协方差位姿）
+│   │   ├── launch/gravity_bridge.launch
+│   │   ├── include/fastlio_gravity_bridge/   # 对齐旋转与协方差变换（纯数学 + 节点类）
+│   │   └── test/                  # 数学 / 协方差 / 消息测试
 │   └── livox_ros_driver2/         # Livox ROS 驱动（已适配 MID-360S 与本地 SDK 路径）
 │       ├── config/MID360s_config.json
 │       ├── launch_ROS1/msg_MID360s.launch
@@ -93,7 +97,7 @@ source devel/setup.bash
 
 ## 运行与启动
 
-使用一键启动脚本管理驱动与算法节点：
+使用一键启动脚本管理驱动、算法与重力对齐桥接节点：
 
 1. **仅前置诊断（不启动节点）**:
    ```bash
@@ -103,7 +107,66 @@ source devel/setup.bash
    ```bash
    ./scripts/start_mid360s_fastlio.sh
    ```
-   按 `Ctrl+C` 可同时安全停止驱动与算法节点，避免残留后台孤儿进程。
+   按 `Ctrl+C` 可同时安全停止驱动、算法与桥接节点，避免残留后台孤儿进程。
+3. **联合启动并把带协方差位姿发给 MAVROS**:
+   ```bash
+   ./scripts/start_mid360s_fastlio.sh --send-to-mavros
+   ```
+
+### 重力对齐桥接（fastlio_gravity_bridge）
+
+桥接节点订阅 FAST-LIO2 的输出，把 `camera_init` 下的里程计转换到重力对齐的 `world`（+Z 向上，
+原点与 `camera_init` 相同，只做最小旋转、不调整 yaw，不代表已对准地理东/北）：
+
+| 话题 | 类型 | 说明 |
+|---|---|---|
+| `/Odometry` | `nav_msgs/Odometry` | 输入（`camera_init` → `body`） |
+| `/fastlio/gravity_init` | `geometry_msgs/Vector3Stamped`，latched | 输入：本次初始化的重力（`camera_init` 下），由 FAST-LIO2 在 IMU 初始化完成时发布一次 |
+| `/fastlio/odom_world` | `nav_msgs/Odometry` | 输出（`world` → `body`，保留输入时间戳；`twist` 原样透传） |
+| `/fastlio/vision_pose_cov` | `geometry_msgs/PoseWithCovarianceStamped` | 输出（与上面同一位姿与协方差） |
+| `/tf_static` | — | `world → camera_init`，本次运行的固定对齐旋转，本工作空间内唯一发布者 |
+
+单独启动（FAST-LIO2 已在运行时）：
+
+```bash
+cd /home/orangepi/mid360s_ws && source devel/setup.bash
+roslaunch fastlio_gravity_bridge gravity_bridge.launch
+```
+
+切换带协方差位姿的输出目的地到 MAVROS：
+
+```bash
+roslaunch fastlio_gravity_bridge gravity_bridge.launch send_to_mavros:=true
+```
+
+`send_to_mavros:=true` 时输出改为 `/mavros/vision_pose/pose_cov`，并在 `/fastlio/vision_pose_cov`
+保留一路本地回显；MAVROS 侧需使用消息订阅模式（`vision_pose/tf/listen=false`），不要用 TF 监听。
+
+行为约定（与实现一致，详见包内 `launch/gravity_bridge.launch` 注释）：
+
+- 没收到有效初始化重力时只等待，不输出未对齐消息；latched 主题允许桥接节点晚于算法启动。
+- 早于 `gravity_init` 时间戳的输入丢弃（回放/排队晚到的历史帧不属于本轮世界系，不补发、不算时间回退）。
+- 非有限值、无效四元数、错误坐标系、非法 pose 协方差：拒绝发布并限频报错。
+  协方差按「有限 + 对角线非负 + 对称 + 半正定」判定（相对容差 1e-9），变换后的结果同样校验。
+- 重复时间戳丢弃；时间回退（已发布之后的更早帧）或运行中出现另一轮初始化：停止输出，需随 FAST-LIO 一起重启。
+- 对齐旋转与协方差只做本次运行的固定变换，不额外建模初始化重力的不确定度。
+- 本轮输出代表雷达 IMU 位姿，尚无有效速度；安装旋转与飞控航向策略属于后续机体接入步骤。
+
+### 测试
+
+```bash
+cd /home/orangepi/mid360s_ws
+source /opt/ros/noetic/setup.bash && source devel/setup.bash
+catkin build fastlio_gravity_bridge --no-deps --catkin-make-args tests
+catkin test fastlio_gravity_bridge --no-deps        # 47 个用例：数学 / 协方差 / 消息
+```
+
+回放验证（隔离 Master，回放 `bags/20260917_pitch20.bag`，录制并逐项核对）：
+
+```bash
+bash test_artifacts/run_gravity_bridge_replay.sh            # 需先确保无同名 ROS 节点在跑
+source /opt/ros/noetic/setup.bash && python3 test_artifacts/analyze_gravity_bridge_replay.py
+```
 
 ---
 

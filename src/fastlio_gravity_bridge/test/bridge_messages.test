@@ -1,0 +1,5 @@
+<launch>
+  <!-- 消息级测试：节点类在测试进程内构造，验证等待/输出/拒绝/停止规则。 -->
+  <test test-name="test_bridge_messages" pkg="fastlio_gravity_bridge" type="test_bridge_messages"
+        time-limit="120.0" />
+</launch>

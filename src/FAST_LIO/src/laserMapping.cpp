@@ -56,6 +56,7 @@
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <geometry_msgs/Vector3.h>
+#include <geometry_msgs/Vector3Stamped.h>
 #include <livox_ros_driver2/CustomMsg.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
@@ -592,18 +593,34 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped.publish(odomAftMapped);
+
+    /* Pose covariance of the current filter state.
+     * IKFoM keeps the first six error-state dofs as [pos, rot], with the rotation
+     * error being a right perturbation expressed in the current body frame, while
+     * nav_msgs/Odometry wants both blocks in the fixed frame of header.frame_id and
+     * in row-major order: rows/cols 0-2 position, 3-5 orientation.
+     * With A = diag(I3, R_CB), Sigma_camera_init = A * P6 * A^T rotates the
+     * orientation block and keeps every cross term. Fill before publishing so the
+     * message never carries a stale or empty covariance. */
     auto P = kf.get_P();
+    Eigen::Matrix<double, 6, 6> P6 = P.topLeftCorner<6, 6>();
+    Eigen::Matrix<double, 6, 6> A = Eigen::Matrix<double, 6, 6>::Identity();
+    A.block<3, 3>(3, 3) = state_point.rot.toRotationMatrix();
+    Eigen::Matrix<double, 6, 6> Sigma = A * P6 * A.transpose();
+    // Symmetrize through an explicit temporary: Sigma + Sigma.transpose() reads other
+    // coefficients of Sigma while the assignment writes them (Eigen aliasing), which
+    // leaves the published matrix slightly asymmetric.
+    const Eigen::Matrix<double, 6, 6> Sigma_transposed = Sigma.transpose();
+    Sigma = 0.5 * (Sigma + Sigma_transposed);
     for (int i = 0; i < 6; i ++)
     {
-        int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
+        for (int j = 0; j < 6; j ++)
+        {
+            odomAftMapped.pose.covariance[i*6 + j] = Sigma(i, j);
+        }
     }
+
+    pubOdomAftMapped.publish(odomAftMapped);
 
     static tf::TransformBroadcaster br;
     tf::Transform                   transform;
@@ -858,6 +875,11 @@ int main(int argc, char** argv)
             ("/Odometry", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
+    /* Latched gravity of this run, expressed in camera_init. Published once when the
+     * IMU initialization completes; a latched publisher lets the bridge node start
+     * later than this node and still receive it. */
+    ros::Publisher pubGravityInit = nh.advertise<geometry_msgs::Vector3Stamped>
+            ("/fastlio/gravity_init", 1, true);
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
     ros::Rate rate(5000);
@@ -888,6 +910,23 @@ int main(int argc, char** argv)
             p_imu->Process(Measures, kf, feats_undistort);
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+
+            /* Publish the initialization gravity once per run. The init frame itself
+             * produces no undistorted cloud, so this has to happen before the empty
+             * cloud check below. */
+            V3D grav_init_vec; double grav_init_time = 0.0;
+            if (p_imu->takeGravityInit(grav_init_vec, grav_init_time))
+            {
+                geometry_msgs::Vector3Stamped grav_msg;
+                grav_msg.header.stamp = ros::Time().fromSec(grav_init_time);
+                grav_msg.header.frame_id = "camera_init";
+                grav_msg.vector.x = grav_init_vec(0);
+                grav_msg.vector.y = grav_init_vec(1);
+                grav_msg.vector.z = grav_init_vec(2);
+                pubGravityInit.publish(grav_msg);
+                ROS_INFO("[ gravity ]: published gravity_init (camera_init): %.6f %.6f %.6f, t=%.6f",
+                         grav_init_vec(0), grav_init_vec(1), grav_init_vec(2), grav_init_time);
+            }
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {

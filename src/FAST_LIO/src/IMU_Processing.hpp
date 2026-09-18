@@ -52,6 +52,11 @@ class ImuProcess
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
+  /** Fetch the gravity vector (in camera_init) used by this IMU initialization,
+   *  with the measurement time it was derived from. Returns true only once per
+   *  initialization so the publish layer can emit it a single time. */
+  bool takeGravityInit(V3D &grav_out, double &stamp_out);
+
   ofstream fout_imu;
   V3D cov_acc;
   V3D cov_gyr;
@@ -82,6 +87,9 @@ class ImuProcess
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
+  V3D    init_grav_;
+  double init_grav_time_;
+  bool   init_grav_ready_;
 };
 
 ImuProcess::ImuProcess()
@@ -98,6 +106,9 @@ ImuProcess::ImuProcess()
   angvel_last     = Zero3d;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
+  init_grav_      = Zero3d;
+  init_grav_time_ = -1.0;
+  init_grav_ready_ = false;
   last_imu_.reset(new sensor_msgs::Imu());
 }
 
@@ -112,6 +123,7 @@ void ImuProcess::Reset()
   imu_need_init_    = true;
   start_timestamp_  = -1;
   init_iter_num     = 1;
+  init_grav_ready_  = false;
   v_imu_.clear();
   IMUpose.clear();
   last_imu_.reset(new sensor_msgs::Imu());
@@ -370,6 +382,11 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
 
       cov_acc = cov_acc_scale;
       cov_gyr = cov_gyr_scale;
+      // Latch the gravity estimate and the measurement time it comes from, so the
+      // publish layer can emit it once (latched topic) for the whole run.
+      init_grav_ << imu_state.grav[0], imu_state.grav[1], imu_state.grav[2];
+      init_grav_time_ = meas.imu.back()->header.stamp.toSec();
+      init_grav_ready_ = true;
       ROS_INFO("IMU Initial Done");
       // ROS_INFO("IMU Initial Done: Gravity: %.4f %.4f %.4f %.4f; state.bias_g: %.4f %.4f %.4f; acc covarience: %.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f",\
       //          imu_state.grav[0], imu_state.grav[1], imu_state.grav[2], mean_acc.norm(), cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2], cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1], cov_gyr[2]);
@@ -385,4 +402,13 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   t3 = omp_get_wtime();
   
   // cout<<"[ IMU Process ]: Time: "<<t3 - t1<<endl;
+}
+
+bool ImuProcess::takeGravityInit(V3D &grav_out, double &stamp_out)
+{
+  if (!init_grav_ready_) return false;
+  grav_out = init_grav_;
+  stamp_out = init_grav_time_;
+  init_grav_ready_ = false;
+  return true;
 }
