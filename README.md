@@ -122,9 +122,25 @@ source devel/setup.bash
 |---|---|---|
 | `/Odometry` | `nav_msgs/Odometry` | 输入（`camera_init` → `body`） |
 | `/fastlio/gravity_init` | `geometry_msgs/Vector3Stamped`，latched | 输入：本次初始化的重力（`camera_init` 下），由 FAST-LIO2 在 IMU 初始化完成时发布一次 |
-| `/fastlio/odom_world` | `nav_msgs/Odometry` | 输出（`world` → `body`，保留输入时间戳；`twist` 原样透传） |
+| `/fastlio/odom_world` | `nav_msgs/Odometry` | 输出（`world` → `base_link`，保留输入时间戳；`twist` 原样透传） |
 | `/fastlio/vision_pose_cov` | `geometry_msgs/PoseWithCovarianceStamped` | 输出（与上面同一位姿与协方差） |
-| `/tf_static` | — | `world → camera_init`，本次运行的固定对齐旋转，本工作空间内唯一发布者 |
+| `/tf_static` | — | `world → camera_init`（对齐旋转）与 `body → base_link`（机体安装旋转），本工作空间内唯一的发布者 |
+
+**姿态表示机体，位置基点仍是雷达 IMU。** 输出姿态已抵消雷达 IMU 的安装倾角（本机约 20°前倾），
+水平放置时 pitch ≈ 0；但位置仍是雷达 IMU 的原点，**杆臂没有补偿**，该平移偏移留给下游 / 飞控参数
+（例如 PX4 的 `EKF2_EV_POS_*`）处理。
+
+TF 树：
+
+```
+world ──静态(q_a)──> camera_init ──FAST-LIO──> body ──静态(q_IB)──> base_link
+                                                (雷达 IMU)        (机体，原点=IMU)
+```
+
+安装旋转 `q_IB` 由 `mounting_source` 决定：默认 `gravity` 取 `q_a` 的共轭，前提是
+**FAST-LIO 初始化时机体保持水平**；若初始化时机体本身倾斜，输出会把初始倾角一并当作安装角
+抵消，表现为读数偏小。设为 `mounting_source:=none` 可关闭安装补偿（此时把
+`output_child_frame:=body` 一起改回去更合适）。
 
 单独启动（FAST-LIO2 已在运行时）：
 
@@ -137,6 +153,10 @@ roslaunch fastlio_gravity_bridge gravity_bridge.launch
 
 ```bash
 roslaunch fastlio_gravity_bridge gravity_bridge.launch send_to_mavros:=true
+
+# 关闭机体安装补偿（输出恢复为雷达 IMU 姿态，child frame 一并改回 body）
+roslaunch fastlio_gravity_bridge gravity_bridge.launch \
+    mounting_source:=none output_child_frame:=body
 ```
 
 `send_to_mavros:=true` 时输出改为 `/mavros/vision_pose/pose_cov`，并在 `/fastlio/vision_pose_cov`
@@ -146,6 +166,7 @@ roslaunch fastlio_gravity_bridge gravity_bridge.launch send_to_mavros:=true
 
 - 没收到有效初始化重力时只等待，不输出未对齐消息；latched 主题允许桥接节点晚于算法启动。
 - 早于 `gravity_init` 时间戳的输入丢弃（回放/排队晚到的历史帧不属于本轮世界系，不补发、不算时间回退）。
+- 姿态输出 `q_a ⊗ q_CB ⊗ q_IB`；安装旋转是常量右乘，协方差传播 `J Σ Jᵀ` 不受影响（有单测固化）。
 - 非有限值、无效四元数、错误坐标系、非法 pose 协方差：拒绝发布并限频报错。
   协方差按「有限 + 对角线非负 + 对称 + 半正定」判定（相对容差 1e-9），变换后的结果同样校验。
 - 重复时间戳丢弃；时间回退（已发布之后的更早帧）或运行中出现另一轮初始化：停止输出，需随 FAST-LIO 一起重启。
@@ -158,7 +179,14 @@ roslaunch fastlio_gravity_bridge gravity_bridge.launch send_to_mavros:=true
 cd /home/orangepi/mid360s_ws
 source /opt/ros/noetic/setup.bash && source devel/setup.bash
 catkin build fastlio_gravity_bridge --no-deps --catkin-make-args tests
-catkin test fastlio_gravity_bridge --no-deps        # 47 个用例：数学 / 协方差 / 消息
+catkin test fastlio_gravity_bridge --no-deps        # 69 个用例：数学 / 协方差 / 消息
+```
+
+姿态是否真的不再前倾，可以用离线复算脚本直接从 bag 判定（不需要重跑 FAST-LIO）：
+
+```bash
+source /opt/ros/noetic/setup.bash
+python3 test_artifacts/check_base_link_attitude.py bags/20260918_pitch20_world.bag
 ```
 
 回放验证（隔离 Master，回放 `bags/20260917_pitch20.bag`，录制并逐项核对）：

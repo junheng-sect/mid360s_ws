@@ -6,8 +6,9 @@
   <description>
     把 FAST-LIO2 在 camera_init 下输出的里程计转换为重力对齐的 world 坐标系输出，
     并给出带协方差的位姿（可选直接发给 MAVROS 外部视觉位姿接口）。
-    本次运行的固定对齐旋转由 FAST-LIO2 初始化重力 (/fastlio/gravity_init) 自动确定，
-    同时发布 world -> camera_init 静态 TF。
+    本次运行的固定对齐旋转由 FAST-LIO2 初始化重力 (/fastlio/gravity_init) 自动确定；
+    输出姿态表示机体 base_link（抵消雷达 IMU 的安装倾角），位置基点仍是雷达 IMU。
+    同时发布 world -> camera_init 与 body -> base_link 两段静态 TF。
   </description>
 
   <maintainer email="orangepi@example.com">orangepi</maintainer>

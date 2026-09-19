@@ -28,9 +28,14 @@ GravityBridge::GravityBridge(ros::NodeHandle &nh, const Config &config) : config
            config_.send_to_mavros ? config_.mavros_pose_cov_topic.c_str()
                                   : config_.pose_cov_out.c_str(),
            config_.send_to_mavros ? " (+local echo)" : "");
-  ROS_INFO("[gravity_bridge] frames: %s -> %s -> %s, static_tf: %s",
-           config_.world_frame.c_str(), config_.input_frame.c_str(), config_.child_frame.c_str(),
+  ROS_INFO("[gravity_bridge] frames: %s -> %s -> %s -> %s, static_tf: %s",
+           config_.world_frame.c_str(), config_.input_frame.c_str(),
+           config_.input_child_frame.c_str(), config_.output_child_frame.c_str(),
            config_.publish_static_tf ? "on" : "off");
+  ROS_INFO("[gravity_bridge] mounting_source: %s%s", config_.mounting_source.c_str(),
+           config_.mounting_source == "gravity"
+               ? " (derive q_IB = q_a^-1 from init gravity; assumes body level at init)"
+               : " (no mounting compensation; output stays the LiDAR IMU attitude)");
 }
 
 GravityBridge::Config GravityBridge::loadConfig(ros::NodeHandle &pnh)
@@ -42,11 +47,29 @@ GravityBridge::Config GravityBridge::loadConfig(ros::NodeHandle &pnh)
   pnh.param<std::string>("pose_cov_out", config.pose_cov_out, config.pose_cov_out);
   pnh.param<std::string>("world_frame", config.world_frame, config.world_frame);
   pnh.param<std::string>("input_frame", config.input_frame, config.input_frame);
-  pnh.param<std::string>("child_frame", config.child_frame, config.child_frame);
+  pnh.param<std::string>("input_child_frame", config.input_child_frame,
+                         config.input_child_frame);
+  pnh.param<std::string>("output_child_frame", config.output_child_frame,
+                         config.output_child_frame);
+  pnh.param<std::string>("mounting_source", config.mounting_source, config.mounting_source);
   pnh.param<std::string>("mavros_pose_cov_topic", config.mavros_pose_cov_topic,
                          config.mavros_pose_cov_topic);
   pnh.param<bool>("publish_static_tf", config.publish_static_tf, config.publish_static_tf);
   pnh.param<bool>("send_to_mavros", config.send_to_mavros, config.send_to_mavros);
+
+  if (config.mounting_source != "gravity" && config.mounting_source != "none")
+  {
+    ROS_WARN("[gravity_bridge] mounting_source='%s' is invalid (only gravity / none); "
+             "falling back to none.",
+             config.mounting_source.c_str());
+    config.mounting_source = "none";
+  }
+  if (config.output_child_frame == config.input_child_frame)
+  {
+    ROS_WARN("[gravity_bridge] output_child_frame equals input_child_frame (%s): with mounting "
+             "compensation enabled the attitude will not match the frame name.",
+             config.output_child_frame.c_str());
+  }
   return config;
 }
 
@@ -65,7 +88,8 @@ void GravityBridge::enterFatalState(const std::string &reason)
   if (state_ == State::kFatal) return;
   state_ = State::kFatal;
   fatal_reason_ = reason;
-  ROS_ERROR("[gravity_bridge] %s；已停止输出，请随 FAST-LIO 一起重启本节点。", reason.c_str());
+  ROS_ERROR("[gravity_bridge] %s; stopping output, restart this node together with FAST-LIO.",
+            reason.c_str());
 }
 
 void GravityBridge::publishStaticTransform()
@@ -82,6 +106,25 @@ void GravityBridge::publishStaticTransform()
   tf_msg.transform.rotation.y = alignment_.q.y();
   tf_msg.transform.rotation.z = alignment_.q.z();
   static_tf_broadcaster_.sendTransform(tf_msg);
+
+  // 安装旋转另发一段静态 TF，使 TF 树与 odom 消息自洽：
+  //   world -> camera_init -> body(=雷达 IMU) -> base_link(=机体)
+  // 平移为零：base_link 的原点与雷达 IMU 重合，杆臂不在本节点补偿。
+  if (config_.mounting_source == "gravity" && config_.output_child_frame != config_.input_child_frame)
+  {
+    geometry_msgs::TransformStamped mount_msg;
+    mount_msg.header.stamp = latched_gravity_.header.stamp;
+    mount_msg.header.frame_id = config_.input_child_frame;
+    mount_msg.child_frame_id = config_.output_child_frame;
+    mount_msg.transform.translation.x = 0.0;
+    mount_msg.transform.translation.y = 0.0;
+    mount_msg.transform.translation.z = 0.0;
+    mount_msg.transform.rotation.w = mounting_.w();
+    mount_msg.transform.rotation.x = mounting_.x();
+    mount_msg.transform.rotation.y = mounting_.y();
+    mount_msg.transform.rotation.z = mounting_.z();
+    static_tf_broadcaster_.sendTransform(mount_msg);
+  }
 
   const Eigen::AngleAxisd minimal_rotation(alignment_.q);
   // 对齐后 grav 应恰好落在 world 的 -Z 上；残差只用于日志自检。
@@ -105,14 +148,15 @@ void GravityBridge::gravityCallback(const geometry_msgs::Vector3Stamped::ConstPt
   {
     // latched 主题只会投递一次；重复投递同一条消息按重复处理，否则视为另一轮初始化。
     if (isSameGravityMessage(*msg)) return;
-    enterFatalState("运行中出现另一轮初始化（收到与本次不同的初始化重力）");
+    enterFatalState("a second initialization appeared (gravity_init differs from this run's)");
     return;
   }
 
   if (msg->header.frame_id != config_.input_frame)
   {
     ROS_ERROR_THROTTLE(5.0,
-                       "[gravity_bridge] 拒绝使用：初始化重力坐标系为 '%s'，期望 '%s'，继续等待。",
+                       "[gravity_bridge] rejecting gravity_init: frame_id is '%s', expected "
+                       "'%s'; still waiting.",
                        msg->header.frame_id.c_str(), config_.input_frame.c_str());
     return;
   }
@@ -122,13 +166,16 @@ void GravityBridge::gravityCallback(const geometry_msgs::Vector3Stamped::ConstPt
   if (!computeAlignmentTransform(gravity, candidate))
   {
     ROS_ERROR_THROTTLE(5.0,
-                       "[gravity_bridge] 初始化重力无效（非有限值或模长过小: %.6f %.6f %.6f），"
-                       "继续等待。",
+                       "[gravity_bridge] invalid gravity_init (non-finite or too small: "
+                       "%.6f %.6f %.6f); still waiting.",
                        msg->vector.x, msg->vector.y, msg->vector.z);
     return;
   }
 
   alignment_ = candidate;
+  mounting_ = (config_.mounting_source == "gravity")
+                  ? mountingFromAlignment(alignment_)
+                  : Eigen::Quaterniond::Identity();
   latched_gravity_ = *msg;
   has_latched_gravity_ = true;
   state_ = State::kAligned;
@@ -136,6 +183,16 @@ void GravityBridge::gravityCallback(const geometry_msgs::Vector3Stamped::ConstPt
   ROS_INFO("[gravity_bridge] gravity_init (frame_id=%s, t=%.6f): %.6f %.6f %.6f |g|=%.6f",
            msg->header.frame_id.c_str(), msg->header.stamp.toSec(), msg->vector.x,
            msg->vector.y, msg->vector.z, gravity.norm());
+
+  if (config_.mounting_source == "gravity")
+  {
+    const Eigen::AngleAxisd mount_angle(mounting_);
+    ROS_INFO("[gravity_bridge] mounting %s->%s: cancels %.6f deg of sensor tilt about "
+             "(%.6f, %.6f, %.6f) (assumes body level at init)",
+             config_.input_child_frame.c_str(), config_.output_child_frame.c_str(),
+             mount_angle.angle() * 180.0 / M_PI, mount_angle.axis().x(), mount_angle.axis().y(),
+             mount_angle.axis().z());
+  }
 
   if (config_.publish_static_tf) publishStaticTransform();
 }
@@ -146,8 +203,7 @@ void GravityBridge::odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
 
   if (state_ == State::kWaitingGravity)
   {
-    ROS_INFO_THROTTLE(5.0,
-                      "[gravity_bridge] 尚未收到有效的 %s，先不输出未对齐消息。",
+    ROS_INFO_THROTTLE(5.0, "[gravity_bridge] no valid %s yet; not publishing unaligned data.",
                       config_.gravity_in.c_str());
     return;
   }
@@ -155,15 +211,16 @@ void GravityBridge::odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
   if (msg->header.frame_id != config_.input_frame)
   {
     ++rejected_count_;
-    ROS_ERROR_THROTTLE(5.0, "[gravity_bridge] 拒绝发布：输入坐标系为 '%s'，期望 '%s'。",
+    ROS_ERROR_THROTTLE(5.0, "[gravity_bridge] rejecting input: frame_id is '%s', expected '%s'.",
                        msg->header.frame_id.c_str(), config_.input_frame.c_str());
     return;
   }
-  if (msg->child_frame_id != config_.child_frame)
+  if (msg->child_frame_id != config_.input_child_frame)
   {
     ++rejected_count_;
-    ROS_ERROR_THROTTLE(5.0, "[gravity_bridge] 拒绝发布：child_frame_id 为 '%s'，期望 '%s'。",
-                       msg->child_frame_id.c_str(), config_.child_frame.c_str());
+    ROS_ERROR_THROTTLE(5.0,
+                       "[gravity_bridge] rejecting input: child_frame_id is '%s', expected '%s'.",
+                       msg->child_frame_id.c_str(), config_.input_child_frame.c_str());
     return;
   }
 
@@ -173,7 +230,8 @@ void GravityBridge::odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
   {
     ++rejected_count_;
     ROS_WARN_THROTTLE(5.0,
-                      "[gravity_bridge] 丢弃早于本次初始化的输入（%.9f < %.9f）。",
+                      "[gravity_bridge] dropping input older than this initialization "
+                      "(%.9f < %.9f).",
                       msg->header.stamp.toSec(), latched_gravity_.header.stamp.toSec());
     return;
   }
@@ -183,14 +241,15 @@ void GravityBridge::odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
     if (msg->header.stamp == last_published_stamp_)
     {
       ++rejected_count_;
-      ROS_WARN_THROTTLE(5.0, "[gravity_bridge] 丢弃重复时间戳 %.9f 的输入。",
+      ROS_WARN_THROTTLE(5.0, "[gravity_bridge] dropping duplicate timestamp %.9f.",
                         msg->header.stamp.toSec());
       return;
     }
     if (msg->header.stamp < last_published_stamp_)
     {
-      enterFatalState("输入时间戳回退（" + std::to_string(msg->header.stamp.toSec()) + " < " +
-                      std::to_string(last_published_stamp_.toSec()) + "）");
+      enterFatalState("input timestamp went backwards (" +
+                      std::to_string(msg->header.stamp.toSec()) + " < " +
+                      std::to_string(last_published_stamp_.toSec()) + ")");
       return;
     }
   }
@@ -198,29 +257,33 @@ void GravityBridge::odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
   if (!poseIsValid(msg->pose.pose))
   {
     ++rejected_count_;
-    ROS_ERROR_THROTTLE(5.0, "[gravity_bridge] 拒绝发布：输入位姿含非有限值或无效四元数。");
+    ROS_ERROR_THROTTLE(5.0,
+                       "[gravity_bridge] rejecting input: pose has non-finite values or an "
+                       "invalid quaternion.");
     return;
   }
   if (!poseCovarianceIsValid(msg->pose.covariance.elems))
   {
     ++rejected_count_;
     ROS_ERROR_THROTTLE(5.0,
-                       "[gravity_bridge] 拒绝发布：输入 pose 协方差含非有限值或负方差。");
+                       "[gravity_bridge] rejecting input: pose covariance is non-finite, "
+                       "asymmetric or not positive semi-definite.");
     return;
   }
 
   geometry_msgs::PoseWithCovariance transformed;
-  if (!transformPoseWithCovariance(alignment_, msg->pose, transformed))
+  if (!transformPoseWithCovariance(alignment_, mounting_, msg->pose, transformed))
   {
     ++rejected_count_;
-    ROS_ERROR_THROTTLE(5.0, "[gravity_bridge] 拒绝发布：位姿与协方差变换失败。");
+    ROS_ERROR_THROTTLE(5.0, "[gravity_bridge] rejecting input: pose/covariance transform failed.");
     return;
   }
 
-  // 只改变父坐标系：twist 及其协方差原样保留（当前 FAST-LIO2 未提供有效速度）。
+  // 只改变父/子坐标系：twist 及其协方差原样保留（当前 FAST-LIO2 未提供有效速度）。
+  // 位置基点仍是雷达 IMU，姿态已是机体（安装旋转见 publishStaticTransform）。
   nav_msgs::Odometry odom_out = *msg;
   odom_out.header.frame_id = config_.world_frame;
-  odom_out.child_frame_id = config_.child_frame;
+  odom_out.child_frame_id = config_.output_child_frame;
   odom_out.pose = transformed;
   pub_odom_.publish(odom_out);
 

@@ -20,6 +20,9 @@ namespace
 constexpr double kGravity = 9.81;
 constexpr double kPitchDeg = 20.12;
 
+/// 不做安装补偿时传给 transformPoseWithCovariance 的单位四元数。
+const Eigen::Quaterniond kNoMounting = Eigen::Quaterniond::Identity();
+
 Eigen::Matrix3d pitchRotation(double pitch_deg)
 {
   return Eigen::AngleAxisd(pitch_deg * M_PI / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
@@ -164,7 +167,7 @@ TEST(PoseCovarianceTransform, BridgeTransformMatchesJacobian)
   fgb::covarianceToMsg(cov_c, in.covariance.elems);
 
   geometry_msgs::PoseWithCovariance out;
-  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, in, out));
+  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, kNoMounting, in, out));
 
   // 位置左乘 R_a，姿态左乘 q_a。
   const Eigen::Vector3d p_w = transform.R * Eigen::Vector3d(1.0, -2.0, 3.0);
@@ -226,7 +229,7 @@ TEST(PoseCovarianceTransform, FiniteDifferenceAttitudeErrorMapping)
   fgb::covarianceToMsg(cov_c, nominal_in.covariance.elems);
 
   geometry_msgs::PoseWithCovariance nominal_out;
-  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, nominal_in, nominal_out));
+  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, kNoMounting, nominal_in, nominal_out));
 
   Eigen::Matrix<double, 6, 6> J = Eigen::Matrix<double, 6, 6>::Zero();
   J.block<3, 3>(0, 0) = transform.R;
@@ -261,7 +264,7 @@ TEST(PoseCovarianceTransform, FiniteDifferenceAttitudeErrorMapping)
     perturbed_in.pose.orientation.z = q_perturbed.z();
 
     geometry_msgs::PoseWithCovariance perturbed_out;
-    ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, perturbed_in, perturbed_out));
+    ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, kNoMounting, perturbed_in, perturbed_out));
 
     // 位置映射：δp_W = R_a δp（精确成立）。
     const Eigen::Vector3d dp_world(perturbed_out.pose.position.x - nominal_out.pose.position.x,
@@ -337,7 +340,7 @@ TEST(PoseCovarianceTransform, RejectsIndefiniteCovariance)
   EXPECT_FALSE(fgb::poseCovarianceIsValid(msg.covariance.elems));
 
   geometry_msgs::PoseWithCovariance out;
-  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, msg, out));
+  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, kNoMounting, msg, out));
 
   // 该矩阵绕 Y 转 45 度后 Z 方差为负；确认输入检查在变换前就拦住了它。
   Eigen::Matrix<double, 6, 6> rotated = Eigen::Matrix<double, 6, 6>::Zero();
@@ -385,10 +388,67 @@ TEST(PoseCovarianceTransform, TransformedCovarianceStaysValid)
   fgb::covarianceToMsg(cov, in.covariance.elems);
 
   geometry_msgs::PoseWithCovariance out;
-  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, in, out));
+  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, kNoMounting, in, out));
   const Eigen::Matrix<double, 6, 6> out_cov = fgb::covarianceFromMsg(out.covariance.elems);
   EXPECT_TRUE(fgb::covarianceIsValid(out_cov));
   EXPECT_LT((out_cov - out_cov.transpose()).cwiseAbs().maxCoeff(), 1e-18);
+}
+
+/// 安装旋转是常量右乘、姿态误差是固定轴左扰动，因此 δ_out = R_a·δ_C 与是否
+/// 做安装补偿无关 —— 协方差必须逐位相同，姿态只相差一个 q_IB。这条性质把
+/// "加安装旋转不需要改协方差传播"这个结论固化下来。
+TEST(PoseCovarianceTransform, MountingRotationKeepsCovariance)
+{
+  const Eigen::Vector3d gravity_camera =
+      pitchRotation(kPitchDeg).transpose() * Eigen::Vector3d(0.0, 0.0, -kGravity);
+  fgb::AlignmentTransform transform;
+  ASSERT_TRUE(fgb::computeAlignmentTransform(gravity_camera, transform));
+  const Eigen::Quaterniond q_ib = fgb::mountingFromAlignment(transform);
+
+  geometry_msgs::PoseWithCovariance in;
+  in.pose.position.x = 0.7;
+  in.pose.position.y = -1.1;
+  in.pose.position.z = 2.3;
+  const Eigen::Quaterniond q_cb(
+      Eigen::AngleAxisd(0.55, Eigen::Vector3d(1.0, -2.0, 0.5).normalized()));
+  in.pose.orientation.w = q_cb.w();
+  in.pose.orientation.x = q_cb.x();
+  in.pose.orientation.y = q_cb.y();
+  in.pose.orientation.z = q_cb.z();
+  const Eigen::Matrix<double, 6, 6> cov_c = makePositiveDefinite();
+  fgb::covarianceToMsg(cov_c, in.covariance.elems);
+
+  geometry_msgs::PoseWithCovariance with_mounting;
+  geometry_msgs::PoseWithCovariance without_mounting;
+  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, q_ib, in, with_mounting));
+  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, kNoMounting, in, without_mounting));
+
+  // 位置完全一致（安装旋转只作用于姿态）
+  EXPECT_DOUBLE_EQ(with_mounting.pose.position.x, without_mounting.pose.position.x);
+  EXPECT_DOUBLE_EQ(with_mounting.pose.position.y, without_mounting.pose.position.y);
+  EXPECT_DOUBLE_EQ(with_mounting.pose.position.z, without_mounting.pose.position.z);
+
+  // 协方差逐位相同
+  for (int i = 0; i < 36; ++i)
+  {
+    EXPECT_DOUBLE_EQ(with_mounting.covariance.elems[i], without_mounting.covariance.elems[i])
+        << "covariance index " << i;
+  }
+
+  // 姿态恰好相差一个 q_IB：q_mounting = q_raw ⊗ q_IB
+  const Eigen::Quaterniond q_out(
+      with_mounting.pose.orientation.w, with_mounting.pose.orientation.x,
+      with_mounting.pose.orientation.y, with_mounting.pose.orientation.z);
+  const Eigen::Quaterniond q_raw(without_mounting.pose.orientation.w,
+                                 without_mounting.pose.orientation.x,
+                                 without_mounting.pose.orientation.y,
+                                 without_mounting.pose.orientation.z);
+  const Eigen::Quaterniond q_expected = (q_raw * q_ib).normalized();
+  EXPECT_LT((q_out.toRotationMatrix() - q_expected.toRotationMatrix()).cwiseAbs().maxCoeff(),
+            1e-15);
+
+  // 且安装旋转确实改变了姿态（不是空操作）
+  EXPECT_GT((q_out.toRotationMatrix() - q_raw.toRotationMatrix()).cwiseAbs().maxCoeff(), 0.1);
 }
 
 /// 非法输入必须被拒绝：非有限位置、无效四元数、非法协方差。
@@ -405,27 +465,27 @@ TEST(PoseCovarianceTransform, InvalidInputsAreRejected)
 
   geometry_msgs::PoseWithCovariance bad_position = valid;
   bad_position.pose.position.z = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, bad_position, out));
+  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, kNoMounting, bad_position, out));
 
   geometry_msgs::PoseWithCovariance zero_quaternion = valid;
   zero_quaternion.pose.orientation.w = 0.0;
-  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, zero_quaternion, out));
+  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, kNoMounting, zero_quaternion, out));
 
   geometry_msgs::PoseWithCovariance tiny_quaternion = valid;
   tiny_quaternion.pose.orientation.w = 1e-9;
-  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, tiny_quaternion, out));
+  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, kNoMounting, tiny_quaternion, out));
 
   geometry_msgs::PoseWithCovariance nan_covariance = valid;
   nan_covariance.covariance[7] = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, nan_covariance, out));
+  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, kNoMounting, nan_covariance, out));
 
   geometry_msgs::PoseWithCovariance negative_variance = valid;
   negative_variance.covariance[14] = -1.0;
-  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, negative_variance, out));
+  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, kNoMounting, negative_variance, out));
 
   // 全零协方差（FAST-LIO2 未提供速度时的合法输入）应通过。
   geometry_msgs::PoseWithCovariance zero_covariance = valid;
-  EXPECT_TRUE(fgb::transformPoseWithCovariance(transform, zero_covariance, out));
+  EXPECT_TRUE(fgb::transformPoseWithCovariance(transform, kNoMounting, zero_covariance, out));
 }
 
 int main(int argc, char **argv)

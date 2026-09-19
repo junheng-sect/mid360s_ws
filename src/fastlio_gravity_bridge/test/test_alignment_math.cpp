@@ -198,7 +198,104 @@ TEST(GravityAlignmentMath, TransformRequiresLockedAlignment)
   geometry_msgs::PoseWithCovariance in;
   in.pose.orientation.w = 1.0;
   geometry_msgs::PoseWithCovariance out;
-  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, in, out));
+  EXPECT_FALSE(fgb::transformPoseWithCovariance(transform, Eigen::Quaterniond::Identity(), in,
+                                                out));
+}
+
+/// 安装旋转：初始化时机体水平时，q_IB = q_a⁻¹ 应把机体姿态还原成水平。
+TEST(GravityAlignmentMath, MountingCancelsInitialTilt)
+{
+  const double pitch_deg = 20.12;
+  // 机体水平、雷达前倾 20.12 度时，camera_init 下测到的重力
+  const Eigen::Vector3d gravity_camera =
+      pitchBodyToWorld(pitch_deg).transpose() * Eigen::Vector3d(0.0, 0.0, -kGravity);
+
+  fgb::AlignmentTransform transform;
+  ASSERT_TRUE(fgb::computeAlignmentTransform(gravity_camera, transform));
+
+  const Eigen::Quaterniond q_ib = fgb::mountingFromAlignment(transform);
+  EXPECT_NEAR(q_ib.norm(), 1.0, 1e-15);
+  // 安装旋转恰好抵消安装倾角：绕 +Y 转 -20.12 度
+  expectRotationNear(q_ib.toRotationMatrix(), pitchBodyToWorld(-pitch_deg), 1e-12);
+
+  // 初始化时刻 q_CI = I -> 输出姿态应为单位阵（机体水平），而不是前倾 20 度
+  geometry_msgs::PoseWithCovariance in;
+  in.pose.position.z = 1.0;
+  in.pose.orientation.w = 1.0;  // q_CI = I
+  geometry_msgs::PoseWithCovariance out;
+  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, q_ib, in, out));
+
+  const Eigen::Quaterniond q_out(out.pose.orientation.w, out.pose.orientation.x,
+                                 out.pose.orientation.y, out.pose.orientation.z);
+  expectQuaternionNear(q_out, Eigen::Quaterniond::Identity(), 1e-12);
+
+  // 不做安装补偿（单位四元数）时，输出仍是前倾 20.12 度的 IMU 姿态
+  geometry_msgs::PoseWithCovariance out_raw;
+  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, Eigen::Quaterniond::Identity(),
+                                               in, out_raw));
+  const Eigen::Quaterniond q_raw(out_raw.pose.orientation.w, out_raw.pose.orientation.x,
+                                 out_raw.pose.orientation.y, out_raw.pose.orientation.z);
+  expectQuaternionNear(q_raw, Eigen::Quaterniond(Eigen::AngleAxisd(
+                                  pitch_deg * M_PI / 180.0, Eigen::Vector3d::UnitY())),
+                       1e-12);
+  // 两者恰好相差一个安装旋转
+  expectRotationNear((q_raw.conjugate() * q_out).toRotationMatrix(), q_ib.toRotationMatrix(),
+                     1e-12);
+
+  // 位置只受世界对齐旋转影响，与安装旋转无关：加不加补偿结果相同
+  EXPECT_DOUBLE_EQ(out.pose.position.x, out_raw.pose.position.x);
+  EXPECT_DOUBLE_EQ(out.pose.position.y, out_raw.pose.position.y);
+  EXPECT_DOUBLE_EQ(out.pose.position.z, out_raw.pose.position.z);
+  // 而对齐旋转确实会把位置转到 world（z 不再是 1）
+  const Eigen::Vector3d p_expected = transform.R * Eigen::Vector3d(0.0, 0.0, 1.0);
+  EXPECT_NEAR(out.pose.position.z, p_expected.z(), 1e-15);
+  EXPECT_NEAR(out.pose.position.x, p_expected.x(), 1e-15);
+  EXPECT_GT(std::abs(out.pose.position.x), 0.3);
+}
+
+/// 安装补偿后，机体做纯俯仰 / 纯偏航时读数如实反映，不被安装角污染。
+TEST(GravityAlignmentMath, MountingKeepsBodyAttitudeFaithful)
+{
+  const double mount_deg = 20.12;
+  const Eigen::Vector3d gravity_camera =
+      pitchBodyToWorld(mount_deg).transpose() * Eigen::Vector3d(0.0, 0.0, -kGravity);
+
+  fgb::AlignmentTransform transform;
+  ASSERT_TRUE(fgb::computeAlignmentTransform(gravity_camera, transform));
+  const Eigen::Quaterniond q_ib = fgb::mountingFromAlignment(transform);
+
+  // 机体在水平基础上俯仰 φ：q_CI = q_a⁻¹ ⊗ q_WB ⊗ q_BI，这里直接构造 q_CI。
+  // q_WI = q_WB ⊗ q_BI，而 q_BI 的矩阵即是 q_a（机体水平时），故 q_CI = q_a⁻¹ ⊗ q_WI。
+  const Eigen::Quaterniond q_a = transform.q;
+  for (const auto &body_rotation :
+       {Eigen::AngleAxisd(10.0 * M_PI / 180.0, Eigen::Vector3d::UnitY()),   // 俯仰
+        Eigen::AngleAxisd(-7.0 * M_PI / 180.0, Eigen::Vector3d::UnitX()),   // 横滚
+        Eigen::AngleAxisd(25.0 * M_PI / 180.0, Eigen::Vector3d::UnitZ())})  // 偏航
+  {
+    const Eigen::Quaterniond q_wb(body_rotation);
+    const Eigen::Quaterniond q_wi = q_wb * q_a;
+    const Eigen::Quaterniond q_ci = q_a.conjugate() * q_wi;
+
+    geometry_msgs::PoseWithCovariance in;
+    in.pose.orientation.w = q_ci.w();
+    in.pose.orientation.x = q_ci.x();
+    in.pose.orientation.y = q_ci.y();
+    in.pose.orientation.z = q_ci.z();
+    geometry_msgs::PoseWithCovariance out;
+    ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, q_ib, in, out));
+
+    const Eigen::Quaterniond q_out(out.pose.orientation.w, out.pose.orientation.x,
+                                   out.pose.orientation.y, out.pose.orientation.z);
+    expectRotationNear(q_out.toRotationMatrix(), q_wb.toRotationMatrix(), 1e-12);
+  }
+}
+
+/// mountingFromAlignment 在未锁定时返回单位四元数。
+TEST(GravityAlignmentMath, MountingIsIdentityWhenUnlocked)
+{
+  fgb::AlignmentTransform transform;  // valid = false
+  expectQuaternionNear(fgb::mountingFromAlignment(transform), Eigen::Quaterniond::Identity(),
+                       0.0);
 }
 
 int main(int argc, char **argv)

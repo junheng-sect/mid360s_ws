@@ -4,37 +4,49 @@
 
     输入：/Odometry (nav_msgs/Odometry, camera_init -> body)
           /fastlio/gravity_init (geometry_msgs/Vector3Stamped, latched, camera_init 下的重力)
-    输出：/fastlio/odom_world (nav_msgs/Odometry, world -> body)
+    输出：/fastlio/odom_world (nav_msgs/Odometry, world -> base_link)
           /fastlio/vision_pose_cov (geometry_msgs/PoseWithCovarianceStamped)
-          /tf_static: world -> camera_init
+          /tf_static: world -> camera_init（对齐旋转）与 body -> base_link（机体安装旋转）
+
+    姿态表示机体（base_link）而不是雷达 IMU；位置基点仍是雷达 IMU（不做杆臂补偿，
+    该偏移由下游 / 飞控参数处理）。
+
+    mounting_source:=gravity（默认）由本次初始化重力推导安装旋转 q_IB = q_a⁻¹，
+    前提是 FAST-LIO 初始化时机体保持水平；若初始化时机体本身倾斜，输出会把初始倾角
+    一并当作安装角抵消，表现为读数偏小。设为 none 可关闭安装补偿（输出恢复为雷达
+    IMU 姿态，child frame 名也会跟着变成 body 更合适）。
 
     send_to_mavros:=true 时，带协方差位姿的输出目的地改为 /mavros/vision_pose/pose_cov，
     同时在 pose_cov_out 上保留一路本地回显（便于板端与 RViz 侧监视）。
     启用 MAVROS 时需在 MAVROS 侧设置 vision_pose/tf/listen=false（用消息订阅代替 TF 监听）。
   -->
 
-  <arg name="send_to_mavros"   default="false" />
-  <arg name="odom_in"          default="/Odometry" />
-  <arg name="gravity_in"       default="/fastlio/gravity_init" />
-  <arg name="odom_out"         default="/fastlio/odom_world" />
-  <arg name="pose_cov_out"     default="/fastlio/vision_pose_cov" />
-  <arg name="world_frame"      default="world" />
-  <arg name="input_frame"      default="camera_init" />
-  <arg name="child_frame"      default="body" />
-  <arg name="publish_static_tf" default="true" />
+  <arg name="send_to_mavros"     default="false" />
+  <arg name="odom_in"            default="/Odometry" />
+  <arg name="gravity_in"         default="/fastlio/gravity_init" />
+  <arg name="odom_out"           default="/fastlio/odom_world" />
+  <arg name="pose_cov_out"       default="/fastlio/vision_pose_cov" />
+  <arg name="world_frame"        default="world" />
+  <arg name="input_frame"        default="camera_init" />
+  <arg name="input_child_frame"  default="body" />
+  <arg name="output_child_frame" default="base_link" />
+  <arg name="mounting_source"    default="gravity" />
+  <arg name="publish_static_tf"  default="true" />
   <arg name="mavros_pose_cov_topic" default="/mavros/vision_pose/pose_cov" />
 
   <node pkg="fastlio_gravity_bridge" type="gravity_bridge_node" name="gravity_bridge"
         output="screen" required="false">
-    <param name="odom_in"          type="string" value="$(arg odom_in)" />
-    <param name="gravity_in"       type="string" value="$(arg gravity_in)" />
-    <param name="odom_out"         type="string" value="$(arg odom_out)" />
-    <param name="pose_cov_out"     type="string" value="$(arg pose_cov_out)" />
-    <param name="world_frame"      type="string" value="$(arg world_frame)" />
-    <param name="input_frame"      type="string" value="$(arg input_frame)" />
-    <param name="child_frame"      type="string" value="$(arg child_frame)" />
+    <param name="odom_in"            type="string" value="$(arg odom_in)" />
+    <param name="gravity_in"         type="string" value="$(arg gravity_in)" />
+    <param name="odom_out"           type="string" value="$(arg odom_out)" />
+    <param name="pose_cov_out"       type="string" value="$(arg pose_cov_out)" />
+    <param name="world_frame"        type="string" value="$(arg world_frame)" />
+    <param name="input_frame"        type="string" value="$(arg input_frame)" />
+    <param name="input_child_frame"  type="string" value="$(arg input_child_frame)" />
+    <param name="output_child_frame" type="string" value="$(arg output_child_frame)" />
+    <param name="mounting_source"    type="string" value="$(arg mounting_source)" />
     <param name="mavros_pose_cov_topic" type="string" value="$(arg mavros_pose_cov_topic)" />
-    <param name="publish_static_tf" type="bool"  value="$(arg publish_static_tf)" />
-    <param name="send_to_mavros"   type="bool"   value="$(arg send_to_mavros)" />
+    <param name="publish_static_tf"  type="bool"   value="$(arg publish_static_tf)" />
+    <param name="send_to_mavros"     type="bool"   value="$(arg send_to_mavros)" />
   </node>
 </launch>

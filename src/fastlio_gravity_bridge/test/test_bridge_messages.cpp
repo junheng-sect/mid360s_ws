@@ -127,7 +127,7 @@ class BridgeMessagesTest : public ::testing::Test
     msg.pose.pose.position.x = 1.0;
     msg.pose.pose.position.y = -2.0;
     msg.pose.pose.position.z = 3.0;
-    const Eigen::Quaterniond q_cb(Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitX()));
+    const Eigen::Quaterniond &q_cb = odom_orientation_;
     msg.pose.pose.orientation.w = q_cb.w();
     msg.pose.pose.orientation.x = q_cb.x();
     msg.pose.pose.orientation.y = q_cb.y();
@@ -146,6 +146,9 @@ class BridgeMessagesTest : public ::testing::Test
   ros::NodeHandlePtr nh_;
   fgb::GravityBridge::Config config_;
   std::unique_ptr<fgb::GravityBridge> bridge_;
+  /// publishOdom 使用的姿态，默认给一个非单位四元数以便区分变换前后。
+  Eigen::Quaterniond odom_orientation_ =
+      Eigen::Quaterniond(Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitX()));
 
   ros::Publisher pub_gravity_;
   ros::Publisher pub_odom_;
@@ -193,6 +196,63 @@ TEST_F(BridgeMessagesTest, RejectsGravityWithWrongFrame)
   EXPECT_EQ(odom_count_, 1);
 }
 
+/// 核心验收：初始化时机体水平，则此后输出姿态表示机体 —— 与初始化时刻相同的姿态
+/// 应当读成水平（pitch ≈ 0），而不是雷达的 20 度前倾。
+TEST_F(BridgeMessagesTest, MountingMakesAttitudeLevelAtInit)
+{
+  startBridge();
+  // 雷达前倾约 20 度安装、初始化时机体水平 -> 初始化重力带着这个倾角
+  publishGravity(tiltedGravity(), 400.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  const fgb::AlignmentTransform &alignment = bridge_->alignment();
+  // 对齐旋转本身就是那个安装倾角：未做补偿时初始化时刻的姿态读数即 19.85 度前倾（旧行为）
+  EXPECT_NEAR(alignment.q.angularDistance(Eigen::Quaterniond::Identity()) * 180.0 / M_PI,
+              kPitchDeg, 0.5);
+
+  // 与初始化时刻相同的姿态（q_CI = I）
+  odom_orientation_ = Eigen::Quaterniond::Identity();
+  publishOdom(400.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+
+  const Eigen::Quaterniond q_out(last_odom_.pose.pose.orientation.w,
+                                 last_odom_.pose.pose.orientation.x,
+                                 last_odom_.pose.pose.orientation.y,
+                                 last_odom_.pose.pose.orientation.z);
+  EXPECT_LT((q_out.toRotationMatrix() - Eigen::Matrix3d::Identity()).cwiseAbs().maxCoeff(), 1e-12);
+
+  // 安装旋转恰好是 20 度前倾的逆
+  const Eigen::Quaterniond &q_ib = bridge_->mounting();
+  EXPECT_NEAR(q_ib.norm(), 1.0, 1e-15);
+  EXPECT_GT(q_ib.angularDistance(Eigen::Quaterniond::Identity()) * 180.0 / M_PI, 19.0);
+}
+
+/// mounting_source:=none 时恢复旧行为：输出仍是雷达 IMU 姿态，child frame 也应是 body。
+TEST_F(BridgeMessagesTest, MountingSourceNoneKeepsImuAttitude)
+{
+  config_.mounting_source = "none";
+  config_.output_child_frame = "body";
+  startBridge();
+  publishGravity(tiltedGravity(), 410.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  EXPECT_LT(bridge_->mounting().angularDistance(Eigen::Quaterniond::Identity()), 1e-15);
+
+  odom_orientation_ = Eigen::Quaterniond::Identity();
+  publishOdom(410.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+
+  EXPECT_EQ(last_odom_.child_frame_id, "body");
+  // 输出姿态 = q_a（仍是 20 度前倾），没有被安装旋转抵消
+  const Eigen::Quaterniond q_out(last_odom_.pose.pose.orientation.w,
+                                 last_odom_.pose.pose.orientation.x,
+                                 last_odom_.pose.pose.orientation.y,
+                                 last_odom_.pose.pose.orientation.z);
+  const Eigen::Quaterniond &q_a = bridge_->alignment().q;
+  EXPECT_LT((q_out.toRotationMatrix() - q_a.toRotationMatrix()).cwiseAbs().maxCoeff(), 1e-12);
+  EXPECT_GT((q_out.toRotationMatrix() - Eigen::Matrix3d::Identity()).cwiseAbs().maxCoeff(), 0.1);
+}
+
 /// latched 重力：桥接节点晚于发布者启动（订阅发生在发布之后）也能拿到初始化重力。
 TEST_F(BridgeMessagesTest, ReceivesLatchedGravityAfterLateSubscription)
 {
@@ -222,20 +282,20 @@ TEST_F(BridgeMessagesTest, OutputsSharePoseCovarianceAndTimestamp)
 
   const fgb::AlignmentTransform &alignment = bridge_->alignment();
 
-  // 时间戳保留输入测量时间，父坐标系为 world，子坐标系保持 body。
+  // 时间戳保留输入测量时间，父坐标系为 world，子坐标系为 base_link（姿态已是机体）。
   EXPECT_DOUBLE_EQ(last_odom_.header.stamp.toSec(), 102.5);
   EXPECT_EQ(last_odom_.header.frame_id, "world");
-  EXPECT_EQ(last_odom_.child_frame_id, "body");
+  EXPECT_EQ(last_odom_.child_frame_id, "base_link");
   EXPECT_EQ(last_pose_cov_.header.frame_id, "world");
   EXPECT_DOUBLE_EQ(last_pose_cov_.header.stamp.toSec(), 102.5);
 
-  // 位姿：p_W = R_a p_C，q_WB = q_a ⊗ q_CB。
+  // 位姿：p_W = R_a p_C，q_out = q_a ⊗ q_CB ⊗ q_IB。
   const Eigen::Vector3d p_world = alignment.R * Eigen::Vector3d(1.0, -2.0, 3.0);
   EXPECT_NEAR(last_odom_.pose.pose.position.x, p_world.x(), 1e-12);
   EXPECT_NEAR(last_odom_.pose.pose.position.y, p_world.y(), 1e-12);
   EXPECT_NEAR(last_odom_.pose.pose.position.z, p_world.z(), 1e-12);
   const Eigen::Quaterniond q_cb(Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitX()));
-  const Eigen::Quaterniond q_expected = alignment.q * q_cb;
+  const Eigen::Quaterniond q_expected = alignment.q * q_cb * bridge_->mounting();
   const Eigen::Quaterniond q_actual(last_odom_.pose.pose.orientation.w,
                                     last_odom_.pose.pose.orientation.x,
                                     last_odom_.pose.pose.orientation.y,
@@ -278,7 +338,7 @@ TEST_F(BridgeMessagesTest, RejectsInvalidInputs)
   spinUntil([this] { return odom_count_ > 0; }, 0.3);
   EXPECT_EQ(odom_count_, 0);
 
-  publishOdom(103.0, "camera_init", "base_link");  // child_frame 错误
+  publishOdom(103.0, "camera_init", "base_link");  // 输入 child_frame 错误（应为 body）
   spinUntil([this] { return odom_count_ > 0; }, 0.3);
   EXPECT_EQ(odom_count_, 0);
 
@@ -468,6 +528,41 @@ TEST_F(BridgeMessagesTest, PublishesStaticTransform)
   const Eigen::Quaterniond q(transform.transform.rotation.w, transform.transform.rotation.x,
                              transform.transform.rotation.y, transform.transform.rotation.z);
   EXPECT_LT((q.toRotationMatrix() - bridge_->alignment().R).cwiseAbs().maxCoeff(), 1e-12);
+
+  // 同时发布 body -> base_link 的安装旋转，保证 TF 树与 odom 消息自洽
+  geometry_msgs::TransformStamped mount;
+  ASSERT_TRUE(spinUntil(
+      [&] {
+        try
+        {
+          mount = tf_buffer.lookupTransform("body", "base_link", ros::Time(0));
+          return true;
+        }
+        catch (const tf2::TransformException &)
+        {
+          return false;
+        }
+      },
+      5.0));
+  EXPECT_EQ(mount.header.frame_id, "body");
+  EXPECT_EQ(mount.child_frame_id, "base_link");
+  EXPECT_NEAR(mount.transform.translation.x, 0.0, 1e-15);  // 原点不动，杆臂不补偿
+  EXPECT_NEAR(mount.transform.translation.y, 0.0, 1e-15);
+  EXPECT_NEAR(mount.transform.translation.z, 0.0, 1e-15);
+  const Eigen::Quaterniond q_mount(mount.transform.rotation.w, mount.transform.rotation.x,
+                                   mount.transform.rotation.y, mount.transform.rotation.z);
+  const Eigen::Quaterniond &q_ib = bridge_->mounting();
+  EXPECT_LT((q_mount.toRotationMatrix() - q_ib.toRotationMatrix()).cwiseAbs().maxCoeff(), 1e-12);
+
+  // 完整的 world -> camera_init -> body -> base_link 链需要 FAST-LIO 提供 camera_init -> body
+  // 这一段，单测里没有该发布者，因此这里只验证两段静态 TF 的复合：
+  // world -> base_link 的旋转应等于 q_a ⊗ q_ib（回放验证里再查完整链路）。
+  const Eigen::Quaterniond q_composed = (bridge_->alignment().q * q_ib).normalized();
+  const Eigen::Quaterniond q_static_chain =
+      (q * q_mount).normalized();
+  EXPECT_LT((q_static_chain.toRotationMatrix() - q_composed.toRotationMatrix())
+                .cwiseAbs().maxCoeff(),
+            1e-12);
 }
 
 int main(int argc, char **argv)
