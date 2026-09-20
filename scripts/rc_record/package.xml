@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<!--
+  这个 package.xml 只为让 roslaunch 能解析 <node pkg="rc_record" .../> 而存在。
+
+  rc_record 仍然不是 catkin 包：它不在 src/ 下，不参与 catkin build，也不生成任何
+  可执行文件。roslaunch 要求 <node> 的 pkg 能被 rospack 找到、type 是包目录里的可
+  执行文件，这两条它都满足（type 就是同目录的 start_rc_record.sh）。
+
+  代价是启动前必须把 /home/orangepi/mid360s_ws/scripts 加进 ROS_PACKAGE_PATH：
+  scripts/fusion.sh 已经做了；手动 roslaunch scripts/launch/fusion.launch 时要自己
+  export，否则会报 "cannot find package rc_record"。
+-->
+<package format="2">
+  <name>rc_record</name>
+  <version>0.0.1</version>
+  <description>RC 通道开关触发录包节点（launch-only 包，不参与 catkin 构建）</description>
+  <maintainer email="orangepi@orangepi5max.local">orangepi</maintainer>
+  <license>BSD</license>
+</package>

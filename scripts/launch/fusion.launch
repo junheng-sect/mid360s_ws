@@ -1,0 +1,65 @@
+<launch>
+  <!--
+    融合启动：一条 roslaunch 拉起整条链路
+      MAVROS(飞控串口) + MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接(位姿送飞控)
+      + RC 开关触发录包节点
+
+    入口脚本（推荐，带前置检查与收尾）：/home/orangepi/mid360s_ws/scripts/fusion.sh
+    手动启动的完整命令见该脚本头部注释（关键是先把 scripts 加进 ROS_PACKAGE_PATH，
+    再用和 fusion.sh 相同的 roslaunch 选项启动本文件）。
+
+    本文件里的节点都不设 respawn：配合入口脚本给 roslaunch 传的 required 选项，
+    任一节点异常退出就停掉整条链路，让录包与视觉位姿同生共死，避免飞控拿到半截数据。
+    启动后机体保持静止水平，FAST-LIO 重力初始化通过后桥接才输出 /fastlio/odom_world。
+
+    板端一律关闭 RViz；飞控参数不在本文件里改（px4_config.yaml 的
+    vision_pose/tf/listen 已经是 false，桥接用消息订阅而不是 TF）。
+  -->
+
+  <arg name="fcu_url"        default="/dev/ttyS4:921600"/>
+  <arg name="fcu_protocol"   default="v1.0"/>
+  <arg name="tgt_system"     default="1"/>
+  <arg name="tgt_component"  default="1"/>
+  <arg name="send_to_mavros" default="true"/>
+  <arg name="record"         default="true"/>
+  <arg name="bag_prefix"     default="noprop"/>
+  <arg name="bag_dir"        default="/home/orangepi/bags"/>
+
+  <!-- 1) MAVROS：飞控串口 -->
+  <include file="$(find mavros)/launch/px4.launch">
+    <arg name="fcu_url"       value="$(arg fcu_url)"/>
+    <arg name="fcu_protocol"  value="$(arg fcu_protocol)"/>
+    <arg name="tgt_system"    value="$(arg tgt_system)"/>
+    <arg name="tgt_component" value="$(arg tgt_component)"/>
+    <arg name="gcs_url"       value=""/>
+    <arg name="log_output"    value="screen"/>
+  </include>
+
+  <!-- 2) MID-360S 驱动：关 RViz，也关驱动自带的 rosbag（录包统一交给通道 6 触发） -->
+  <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360s.launch">
+    <arg name="rviz_enable"   value="false"/>
+    <arg name="rosbag_enable" value="false"/>
+  </include>
+
+  <!-- 3) FAST-LIO2：关 RViz -->
+  <include file="$(find fast_lio)/launch/mapping_mid360s.launch">
+    <arg name="rviz" value="false"/>
+  </include>
+
+  <!-- 4) 重力对齐桥接：带协方差位姿送 /mavros/vision_pose/pose_cov -->
+  <include file="$(find fastlio_gravity_bridge)/launch/gravity_bridge.launch">
+    <arg name="send_to_mavros" value="$(arg send_to_mavros)"/>
+  </include>
+
+  <!--
+    5) RC 触发录包：type 就是 rc_record 目录里的启动包装脚本，它自己 rosparam load
+       rc_record.yaml 再 exec bag_recorder_node.py；前缀/目录用环境变量覆盖，
+       与 start_handheld_test.sh 走的是同一条路径，行为完全一致。
+  -->
+  <group if="$(arg record)">
+    <node name="rc_bag_recorder" pkg="rc_record" type="start_rc_record.sh" output="screen">
+      <env name="RC_BAG_PREFIX" value="$(arg bag_prefix)"/>
+      <env name="RC_BAG_DIR"    value="$(arg bag_dir)"/>
+    </node>
+  </group>
+</launch>
