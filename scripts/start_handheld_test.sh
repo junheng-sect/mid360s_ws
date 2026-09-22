@@ -458,7 +458,9 @@ if [ "$DO_LIDAR" -eq 1 ]; then
 
   hr; log "步骤 5/5：就绪自检"
   wait_for "桥接输出 /fastlio/vision_pose_cov" 60 topic_hz_ok /fastlio/vision_pose_cov || {
-    err "桥接未输出（多数是没收到 /fastlio/gravity_init：初始化时机体必须水平且静止）"
+    err "桥接未输出（多数是没收到 /fastlio/gravity_init：初始化时机体必须保持静止）"
+    err "初始化静止即可、无须水平（默认固定安装补偿 mounting_source:=fixed, 20 度）；"
+    err "只有显式改用旧的 mounting_source:=gravity 时才要求初始化时机体水平"
     err "看日志：$LOG_DIR/fastlio_${STAMP}.log"; stop_everything; exit 1
   }
   info="$(timeout 5 rostopic info /mavros/vision_pose/pose_cov 2>&1)"

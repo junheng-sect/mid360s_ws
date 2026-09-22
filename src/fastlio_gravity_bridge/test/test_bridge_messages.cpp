@@ -25,17 +25,27 @@ namespace
 {
 
 constexpr double kGravity = 9.81;
-constexpr double kPitchDeg = 20.12;
+/// 节点默认的固定安装角（mounting_pitch_deg）：雷达相对机体前倾 20 度。
+constexpr double kMountPitchDeg = 20.0;
+/// 旧 gravity 模式对照用例用的安装倾角，与默认的 20.0 度刻意区分。
+constexpr double kLegacyTiltDeg = 20.12;
 
 Eigen::Matrix3d pitchRotation(double pitch_deg)
 {
   return Eigen::AngleAxisd(pitch_deg * M_PI / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
 }
 
-/// 前倾 20.12 度时机体系测得的重力（camera_init 下）。
-Eigen::Vector3d tiltedGravity()
+/// 机体水平启动、雷达相对机体前倾 tilt_deg 时，camera_init 下测得的初始化重力。
+Eigen::Vector3d tiltedGravity(double tilt_deg = kMountPitchDeg)
 {
-  return pitchRotation(kPitchDeg).transpose() * Eigen::Vector3d(0.0, 0.0, -kGravity);
+  return pitchRotation(tilt_deg).transpose() * Eigen::Vector3d(0.0, 0.0, -kGravity);
+}
+
+/// fixed 模式在给定安装前倾角下的期望安装旋转：q_IB = R_y(-pitch_deg)。
+Eigen::Quaterniond expectedFixedMounting(double pitch_deg)
+{
+  return Eigen::Quaterniond(
+      Eigen::AngleAxisd(-pitch_deg * M_PI / 180.0, Eigen::Vector3d::UnitY()));
 }
 
 /// 自旋等待，直到条件满足或超时。
@@ -196,19 +206,19 @@ TEST_F(BridgeMessagesTest, RejectsGravityWithWrongFrame)
   EXPECT_EQ(odom_count_, 1);
 }
 
-/// 核心验收：初始化时机体水平，则此后输出姿态表示机体 —— 与初始化时刻相同的姿态
-/// 应当读成水平（pitch ≈ 0），而不是雷达的 20 度前倾。
+/// 默认固定安装补偿：初始化时机体水平，则此后输出姿态表示机体 —— 与初始化时刻相同的
+/// 姿态应当读成水平（pitch ≈ 0），而不是雷达的 20 度前倾。
 TEST_F(BridgeMessagesTest, MountingMakesAttitudeLevelAtInit)
 {
   startBridge();
-  // 雷达前倾约 20 度安装、初始化时机体水平 -> 初始化重力带着这个倾角
+  // 雷达前倾 20 度安装、初始化时机体水平 -> 初始化重力带着这个倾角
   publishGravity(tiltedGravity(), 400.0);
   ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
 
   const fgb::AlignmentTransform &alignment = bridge_->alignment();
-  // 对齐旋转本身就是那个安装倾角：未做补偿时初始化时刻的姿态读数即 19.85 度前倾（旧行为）
+  // 对齐旋转本身就是那个安装倾角：不做补偿时初始化时刻的姿态读数即 20 度前倾
   EXPECT_NEAR(alignment.q.angularDistance(Eigen::Quaterniond::Identity()) * 180.0 / M_PI,
-              kPitchDeg, 0.5);
+              kMountPitchDeg, 0.5);
 
   // 与初始化时刻相同的姿态（q_CI = I）
   odom_orientation_ = Eigen::Quaterniond::Identity();
@@ -221,10 +231,12 @@ TEST_F(BridgeMessagesTest, MountingMakesAttitudeLevelAtInit)
                                  last_odom_.pose.pose.orientation.z);
   EXPECT_LT((q_out.toRotationMatrix() - Eigen::Matrix3d::Identity()).cwiseAbs().maxCoeff(), 1e-12);
 
-  // 安装旋转恰好是 20 度前倾的逆
+  // 安装旋转恰好是 20 度前倾的逆（默认 fixed 模式，与初始化重力无关）
   const Eigen::Quaterniond &q_ib = bridge_->mounting();
   EXPECT_NEAR(q_ib.norm(), 1.0, 1e-15);
-  EXPECT_GT(q_ib.angularDistance(Eigen::Quaterniond::Identity()) * 180.0 / M_PI, 19.0);
+  EXPECT_LT((q_ib.toRotationMatrix() - expectedFixedMounting(kMountPitchDeg).toRotationMatrix())
+                .cwiseAbs().maxCoeff(),
+            1e-15);
 }
 
 /// mounting_source:=none 时恢复旧行为：输出仍是雷达 IMU 姿态，child frame 也应是 body。
@@ -251,6 +263,192 @@ TEST_F(BridgeMessagesTest, MountingSourceNoneKeepsImuAttitude)
   const Eigen::Quaterniond &q_a = bridge_->alignment().q;
   EXPECT_LT((q_out.toRotationMatrix() - q_a.toRotationMatrix()).cwiseAbs().maxCoeff(), 1e-12);
   EXPECT_GT((q_out.toRotationMatrix() - Eigen::Matrix3d::Identity()).cwiseAbs().maxCoeff(), 0.1);
+}
+
+/// 默认配置是固定安装补偿：安装旋转只由 mounting_pitch_deg（默认 20 度）决定，
+/// 启动时即已确定、与初始化重力无关；初始化时机体不水平时输出保留真实倾角。
+TEST_F(BridgeMessagesTest, DefaultMountingIsFixedAndDoesNotDependOnGravity)
+{
+  startBridge();  // config_ 用默认值：mounting_source=fixed，mounting_pitch_deg=20.0
+  EXPECT_EQ(config_.mounting_source, "fixed");
+  EXPECT_DOUBLE_EQ(config_.mounting_pitch_deg, kMountPitchDeg);
+
+  // 还没收到初始化重力，安装旋转已经就位（不依赖重力）
+  EXPECT_LT((bridge_->mounting().toRotationMatrix() -
+             expectedFixedMounting(kMountPitchDeg).toRotationMatrix())
+                .cwiseAbs().maxCoeff(),
+            1e-15);
+  EXPECT_FALSE(bridge_->hasAlignment());
+
+  // 初始化时雷达系相对世界竖直倾斜 30 度 -> 机体本身前倾 10 度
+  publishGravity(tiltedGravity(30.0), 500.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  // 安装旋转不随初始化重力改变
+  EXPECT_LT((bridge_->mounting().toRotationMatrix() -
+             expectedFixedMounting(kMountPitchDeg).toRotationMatrix())
+                .cwiseAbs().maxCoeff(),
+            1e-15);
+
+  // 与初始化时刻相同的 /Odometry 姿态（q_CI = I）：输出应是真实的 10 度前倾，
+  // 而不是像旧 gravity 模式那样被抵消成水平。
+  odom_orientation_ = Eigen::Quaterniond::Identity();
+  publishOdom(500.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+
+  const Eigen::Quaterniond q_out(last_odom_.pose.pose.orientation.w,
+                                 last_odom_.pose.pose.orientation.x,
+                                 last_odom_.pose.pose.orientation.y,
+                                 last_odom_.pose.pose.orientation.z);
+  const Eigen::Quaterniond q_expected(
+      Eigen::AngleAxisd(10.0 * M_PI / 180.0, Eigen::Vector3d::UnitY()));
+  EXPECT_LT((q_out.toRotationMatrix() - q_expected.toRotationMatrix()).cwiseAbs().maxCoeff(),
+            1e-12);
+  // 确实保留了倾角：不是单位姿态
+  EXPECT_GT((q_out.toRotationMatrix() - Eigen::Matrix3d::Identity()).cwiseAbs().maxCoeff(), 0.1);
+}
+
+/// 旧模式兼容：mounting_source:=gravity 仍由初始化重力推导 q_IB = q_a⁻¹，
+/// 初始化时机体水平时输出水平（与 fixed 在 20 度安装下的结果一致）。
+TEST_F(BridgeMessagesTest, MountingSourceGravityKeepsLegacyBehavior)
+{
+  config_.mounting_source = "gravity";
+  startBridge();
+  // 未锁定对齐旋转前不做安装补偿
+  EXPECT_LT(bridge_->mounting().angularDistance(Eigen::Quaterniond::Identity()), 1e-15);
+
+  publishGravity(tiltedGravity(kLegacyTiltDeg), 510.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  const Eigen::Quaterniond &q_ib = bridge_->mounting();
+  const Eigen::Quaterniond &q_a = bridge_->alignment().q;
+  EXPECT_LT((q_ib.toRotationMatrix() - q_a.conjugate().toRotationMatrix()).cwiseAbs().maxCoeff(),
+            1e-15);
+
+  odom_orientation_ = Eigen::Quaterniond::Identity();
+  publishOdom(510.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+
+  const Eigen::Quaterniond q_out(last_odom_.pose.pose.orientation.w,
+                                 last_odom_.pose.pose.orientation.x,
+                                 last_odom_.pose.pose.orientation.y,
+                                 last_odom_.pose.pose.orientation.z);
+  EXPECT_LT((q_out.toRotationMatrix() - Eigen::Matrix3d::Identity()).cwiseAbs().maxCoeff(), 1e-12);
+}
+
+/// 旧 gravity 模式的已知前提：初始化时机体本身倾斜时，初始倾角会被当作安装角一并
+/// 抵消（这正是默认改用固定安装补偿的原因）。fixed 模式不会这样，见上一个用例。
+TEST_F(BridgeMessagesTest, LegacyGravityModeCancelsTiltedStart)
+{
+  config_.mounting_source = "gravity";
+  startBridge();
+
+  // 初始化时雷达系相对竖直 30 度、安装 20 度 -> 机体真实前倾 10 度
+  publishGravity(tiltedGravity(30.0), 520.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  odom_orientation_ = Eigen::Quaterniond::Identity();
+  publishOdom(520.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+
+  const Eigen::Quaterniond q_out(last_odom_.pose.pose.orientation.w,
+                                 last_odom_.pose.pose.orientation.x,
+                                 last_odom_.pose.pose.orientation.y,
+                                 last_odom_.pose.pose.orientation.z);
+  // 10 度的真实倾角被归零（旧行为）
+  EXPECT_LT((q_out.toRotationMatrix() - Eigen::Matrix3d::Identity()).cwiseAbs().maxCoeff(), 1e-12);
+}
+
+/// 非法安装配置（未知来源 / 非有限角度）下不建立订阅与发布，也不输出任何姿态：
+/// 明确报错而不是静默兜底成"不补偿"。
+TEST_F(BridgeMessagesTest, InvalidMountingConfigurationStopsTheBridge)
+{
+  config_.mounting_source = "bogus";
+  bridge_.reset(new fgb::GravityBridge(*nh_, config_));
+  EXPECT_EQ(bridge_->state(), fgb::GravityBridge::State::kFatal);
+  EXPECT_FALSE(bridge_->fatalReason().empty());
+  EXPECT_FALSE(bridge_->hasAlignment());
+
+  publishGravity(tiltedGravity(), 530.0);
+  publishOdom(530.0);
+  spinUntil([this] { return odom_count_ > 0; }, 0.3);
+  EXPECT_EQ(odom_count_, 0);
+  EXPECT_EQ(pose_cov_count_, 0);
+  EXPECT_EQ(bridge_->publishedCount(), 0u);
+
+  // 非有限安装角同样拒绝
+  config_.mounting_source = "fixed";
+  config_.mounting_pitch_deg = std::numeric_limits<double>::quiet_NaN();
+  bridge_.reset(new fgb::GravityBridge(*nh_, config_));
+  EXPECT_EQ(bridge_->state(), fgb::GravityBridge::State::kFatal);
+  EXPECT_FALSE(bridge_->fatalReason().empty());
+}
+
+// ---------------------------------------------------------------------------
+// 参数校验：默认 fixed 20 度、旧模式仍可用、非法配置必须让启动失败。
+// ---------------------------------------------------------------------------
+namespace
+{
+
+fgb::GravityBridge::Config loadConfigFrom(const std::string &ns)
+{
+  ros::NodeHandle pnh(ns);
+  return fgb::GravityBridge::loadConfig(pnh);
+}
+
+}  // namespace
+
+TEST(BridgeConfigValidation, DefaultsToFixedTwentyDegrees)
+{
+  const fgb::GravityBridge::Config config = loadConfigFrom("/test_bridge_config_default");
+  EXPECT_TRUE(config.valid) << config.error;
+  EXPECT_EQ(config.mounting_source, "fixed");
+  EXPECT_DOUBLE_EQ(config.mounting_pitch_deg, kMountPitchDeg);
+}
+
+TEST(BridgeConfigValidation, ReadsExplicitMountingParameters)
+{
+  ros::param::set("/test_bridge_config_explicit/mounting_source", std::string("fixed"));
+  ros::param::set("/test_bridge_config_explicit/mounting_pitch_deg", 17.5);
+
+  const fgb::GravityBridge::Config config = loadConfigFrom("/test_bridge_config_explicit");
+  EXPECT_TRUE(config.valid) << config.error;
+  EXPECT_EQ(config.mounting_source, "fixed");
+  EXPECT_DOUBLE_EQ(config.mounting_pitch_deg, 17.5);
+}
+
+TEST(BridgeConfigValidation, KeepsLegacySourcesWorking)
+{
+  for (const std::string source : {"gravity", "none"})
+  {
+    const std::string ns = "/test_bridge_config_legacy_" + source;
+    ros::param::set(ns + "/mounting_source", source);
+
+    const fgb::GravityBridge::Config config = loadConfigFrom(ns);
+    EXPECT_TRUE(config.valid) << config.error;
+    EXPECT_EQ(config.mounting_source, source);
+    // mounting_pitch_deg 只在 fixed 模式生效，但默认值仍然是 20 度
+    EXPECT_DOUBLE_EQ(config.mounting_pitch_deg, kMountPitchDeg);
+  }
+}
+
+TEST(BridgeConfigValidation, RejectsUnknownSource)
+{
+  ros::param::set("/test_bridge_config_bad_source/mounting_source", std::string("gps"));
+  const fgb::GravityBridge::Config config = loadConfigFrom("/test_bridge_config_bad_source");
+  EXPECT_FALSE(config.valid);
+  EXPECT_FALSE(config.error.empty());
+  EXPECT_NE(config.error.find("gps"), std::string::npos) << config.error;
+}
+
+TEST(BridgeConfigValidation, RejectsNonFiniteMountingPitch)
+{
+  ros::param::set("/test_bridge_config_nan_pitch/mounting_source", std::string("fixed"));
+  ros::param::set("/test_bridge_config_nan_pitch/mounting_pitch_deg",
+                  std::numeric_limits<double>::quiet_NaN());
+  const fgb::GravityBridge::Config config = loadConfigFrom("/test_bridge_config_nan_pitch");
+  EXPECT_FALSE(config.valid);
+  EXPECT_FALSE(config.error.empty());
 }
 
 /// latched 重力：桥接节点晚于发布者启动（订阅发生在发布之后）也能拿到初始化重力。

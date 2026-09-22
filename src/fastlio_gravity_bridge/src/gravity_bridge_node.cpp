@@ -14,6 +14,14 @@ int main(int argc, char **argv)
 
   const fastlio_gravity_bridge::GravityBridge::Config config =
       fastlio_gravity_bridge::GravityBridge::loadConfig(pnh);
+  if (!config.valid)
+  {
+    // 非法安装配置（未知 mounting_source、非有限角度）：明确报错并停止启动，
+    // 绝不带着兜底值继续对外发布姿态。
+    ROS_FATAL("[gravity_bridge] invalid configuration: %s; refusing to start.",
+              config.error.c_str());
+    return 1;
+  }
 
   fastlio_gravity_bridge::GravityBridge bridge(nh, config);
   ros::spin();

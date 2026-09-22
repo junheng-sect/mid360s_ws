@@ -11,10 +11,18 @@
     姿态表示机体（base_link）而不是雷达 IMU；位置基点仍是雷达 IMU（不做杆臂补偿，
     该偏移由下游 / 飞控参数处理）。
 
-    mounting_source:=gravity（默认）由本次初始化重力推导安装旋转 q_IB = q_a⁻¹，
+    mounting_source:=fixed（默认）用固定安装角做补偿：q_IB = Ry(-mounting_pitch_deg)，
+    **与初始化重力无关**，因此初始化时机体保持静止即可、不要求水平，输出会如实保留
+    机体的真实倾角（不再把初始倾角当作安装角抵消）。改角度只需改 mounting_pitch_deg。
+    mounting_pitch_deg 是雷达相对机体的安装前倾角（正值 = 前倾），默认 20.0 度。
+
+    mounting_source:=gravity 为兼容旧调用保留：由本次初始化重力推导 q_IB = q_a⁻¹，
     前提是 FAST-LIO 初始化时机体保持水平；若初始化时机体本身倾斜，输出会把初始倾角
     一并当作安装角抵消，表现为读数偏小。设为 none 可关闭安装补偿（输出恢复为雷达
     IMU 姿态，child frame 名也会跟着变成 body 更合适）。
+
+    非法的 mounting_source 或非有限的 mounting_pitch_deg 会让节点明确报错并退出启动，
+    不再静默兜底成 none。
 
     send_to_mavros:=true 时，带协方差位姿的输出目的地改为 /mavros/vision_pose/pose_cov，
     同时在 pose_cov_out 上保留一路本地回显（便于板端与 RViz 侧监视）。
@@ -30,7 +38,8 @@
   <arg name="input_frame"        default="camera_init" />
   <arg name="input_child_frame"  default="body" />
   <arg name="output_child_frame" default="base_link" />
-  <arg name="mounting_source"    default="gravity" />
+  <arg name="mounting_source"    default="fixed" />
+  <arg name="mounting_pitch_deg" default="20.0" />
   <arg name="publish_static_tf"  default="true" />
   <arg name="mavros_pose_cov_topic" default="/mavros/vision_pose/pose_cov" />
 
@@ -45,6 +54,7 @@
     <param name="input_child_frame"  type="string" value="$(arg input_child_frame)" />
     <param name="output_child_frame" type="string" value="$(arg output_child_frame)" />
     <param name="mounting_source"    type="string" value="$(arg mounting_source)" />
+    <param name="mounting_pitch_deg" type="double" value="$(arg mounting_pitch_deg)" />
     <param name="mavros_pose_cov_topic" type="string" value="$(arg mavros_pose_cov_topic)" />
     <param name="publish_static_tf"  type="bool"   value="$(arg publish_static_tf)" />
     <param name="send_to_mavros"     type="bool"   value="$(arg send_to_mavros)" />

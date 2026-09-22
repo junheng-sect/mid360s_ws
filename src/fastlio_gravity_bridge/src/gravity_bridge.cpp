@@ -10,6 +10,10 @@ namespace fastlio_gravity_bridge
 
 GravityBridge::GravityBridge(ros::NodeHandle &nh, const Config &config) : config_(config)
 {
+  // 先把安装旋转定下来：fixed 只取决于参数，与初始化重力无关。配置非法时直接进入
+  // kFatal 并返回，连订阅/发布都不建立，避免静默发布错误姿态。
+  if (!resolveMounting()) return;
+
   sub_gravity_ = nh.subscribe(config_.gravity_in, 10, &GravityBridge::gravityCallback, this);
   sub_odom_ = nh.subscribe(config_.odom_in, 200, &GravityBridge::odomCallback, this);
 
@@ -32,10 +36,48 @@ GravityBridge::GravityBridge(ros::NodeHandle &nh, const Config &config) : config
            config_.world_frame.c_str(), config_.input_frame.c_str(),
            config_.input_child_frame.c_str(), config_.output_child_frame.c_str(),
            config_.publish_static_tf ? "on" : "off");
-  ROS_INFO("[gravity_bridge] mounting_source: %s%s", config_.mounting_source.c_str(),
-           config_.mounting_source == "gravity"
-               ? " (derive q_IB = q_a^-1 from init gravity; assumes body level at init)"
-               : " (no mounting compensation; output stays the LiDAR IMU attitude)");
+}
+
+bool GravityBridge::resolveMounting()
+{
+  if (!mountingSourceIsKnown(config_.mounting_source))
+  {
+    enterFatalState("mounting_source='" + config_.mounting_source +
+                    "' is invalid (expected fixed / gravity / none)");
+    return false;
+  }
+
+  if (config_.mounting_source == "fixed")
+  {
+    Eigen::Quaterniond q_ib;
+    if (!computeFixedMounting(config_.mounting_pitch_deg, q_ib))
+    {
+      enterFatalState("mounting_pitch_deg=" + std::to_string(config_.mounting_pitch_deg) +
+                      " is not a finite angle (fixed mounting)");
+      return false;
+    }
+    mounting_ = q_ib;
+    // fixed 模式只要求初始化时静止（FAST-LIO 需要静态段做重力初始化），不要求水平：
+    // 输出保留机体的真实倾角，不再把它当作安装角抵掉。
+    ROS_INFO("[gravity_bridge] mounting_source=fixed: LiDAR %.6f deg forward-tilted vs body, "
+             "applying q_IB = Ry(-%.6f deg) on the right; independent of init gravity "
+             "(init must be static, level is not required).",
+             config_.mounting_pitch_deg, config_.mounting_pitch_deg);
+    return true;
+  }
+
+  mounting_ = Eigen::Quaterniond::Identity();
+  if (config_.mounting_source == "gravity")
+  {
+    ROS_INFO("[gravity_bridge] mounting_source=gravity: derive q_IB = q_a^-1 from the init "
+             "gravity after alignment is locked (assumes the body is level at init).");
+  }
+  else
+  {
+    ROS_INFO("[gravity_bridge] mounting_source=none: no mounting compensation, the output "
+             "stays the LiDAR IMU attitude.");
+  }
+  return true;
 }
 
 GravityBridge::Config GravityBridge::loadConfig(ros::NodeHandle &pnh)
@@ -52,17 +94,33 @@ GravityBridge::Config GravityBridge::loadConfig(ros::NodeHandle &pnh)
   pnh.param<std::string>("output_child_frame", config.output_child_frame,
                          config.output_child_frame);
   pnh.param<std::string>("mounting_source", config.mounting_source, config.mounting_source);
+  pnh.param<double>("mounting_pitch_deg", config.mounting_pitch_deg, config.mounting_pitch_deg);
   pnh.param<std::string>("mavros_pose_cov_topic", config.mavros_pose_cov_topic,
                          config.mavros_pose_cov_topic);
   pnh.param<bool>("publish_static_tf", config.publish_static_tf, config.publish_static_tf);
   pnh.param<bool>("send_to_mavros", config.send_to_mavros, config.send_to_mavros);
 
-  if (config.mounting_source != "gravity" && config.mounting_source != "none")
+  // 安装旋转的非法配置不再静默回退（旧实现会退回 none 并发出一条告警），
+  // 而是标记配置非法；节点入口据此拒绝启动，避免对外发布错误姿态。
+  if (!mountingSourceIsKnown(config.mounting_source))
   {
-    ROS_WARN("[gravity_bridge] mounting_source='%s' is invalid (only gravity / none); "
-             "falling back to none.",
-             config.mounting_source.c_str());
-    config.mounting_source = "none";
+    config.valid = false;
+    config.error = "mounting_source='" + config.mounting_source +
+                   "' is invalid (expected fixed / gravity / none)";
+    ROS_ERROR("[gravity_bridge] %s; refusing to start.", config.error.c_str());
+    return config;
+  }
+  if (config.mounting_source == "fixed")
+  {
+    Eigen::Quaterniond q_ib;
+    if (!computeFixedMounting(config.mounting_pitch_deg, q_ib))
+    {
+      config.valid = false;
+      config.error = "mounting_pitch_deg=" + std::to_string(config.mounting_pitch_deg) +
+                     " is not a finite angle (fixed mounting)";
+      ROS_ERROR("[gravity_bridge] %s; refusing to start.", config.error.c_str());
+      return config;
+    }
   }
   if (config.output_child_frame == config.input_child_frame)
   {
@@ -110,7 +168,9 @@ void GravityBridge::publishStaticTransform()
   // 安装旋转另发一段静态 TF，使 TF 树与 odom 消息自洽：
   //   world -> camera_init -> body(=雷达 IMU) -> base_link(=机体)
   // 平移为零：base_link 的原点与雷达 IMU 重合，杆臂不在本节点补偿。
-  if (config_.mounting_source == "gravity" && config_.output_child_frame != config_.input_child_frame)
+  // 只要输出 child frame 与输入不同名就发布，旋转就是位姿输出用的同一个 mounting_
+  // （fixed / gravity 为安装旋转，none 为单位四元数），保证两者永远一致。
+  if (config_.output_child_frame != config_.input_child_frame)
   {
     geometry_msgs::TransformStamped mount_msg;
     mount_msg.header.stamp = latched_gravity_.header.stamp;
@@ -173,9 +233,11 @@ void GravityBridge::gravityCallback(const geometry_msgs::Vector3Stamped::ConstPt
   }
 
   alignment_ = candidate;
-  mounting_ = (config_.mounting_source == "gravity")
-                  ? mountingFromAlignment(alignment_)
-                  : Eigen::Quaterniond::Identity();
+  // fixed 的安装旋转已在构造时按参数确定，与初始化重力无关；none 保持单位四元数。
+  if (config_.mounting_source == "gravity")
+  {
+    mounting_ = mountingFromAlignment(alignment_);
+  }
   latched_gravity_ = *msg;
   has_latched_gravity_ = true;
   state_ = State::kAligned;
@@ -187,11 +249,21 @@ void GravityBridge::gravityCallback(const geometry_msgs::Vector3Stamped::ConstPt
   if (config_.mounting_source == "gravity")
   {
     const Eigen::AngleAxisd mount_angle(mounting_);
-    ROS_INFO("[gravity_bridge] mounting %s->%s: cancels %.6f deg of sensor tilt about "
-             "(%.6f, %.6f, %.6f) (assumes body level at init)",
+    ROS_INFO("[gravity_bridge] mounting %s->%s (legacy gravity mode, q_IB = q_a^-1): cancels "
+             "%.6f deg of sensor tilt about (%.6f, %.6f, %.6f) (assumes body level at init)",
              config_.input_child_frame.c_str(), config_.output_child_frame.c_str(),
              mount_angle.angle() * 180.0 / M_PI, mount_angle.axis().x(), mount_angle.axis().y(),
              mount_angle.axis().z());
+  }
+  else if (config_.mounting_source == "fixed")
+  {
+    // fixed 模式的安装旋转与初始化重力无关，真正的倾角由输出姿态如实保留。
+    const Eigen::AngleAxisd tilt(alignment_.q);
+    ROS_INFO("[gravity_bridge] fixed mounting %s->%s kept unchanged (Ry(-%.6f deg)); init gravity "
+             "tilt %.6f deg about (%.6f, %.6f, %.6f) is preserved in the output",
+             config_.input_child_frame.c_str(), config_.output_child_frame.c_str(),
+             config_.mounting_pitch_deg, tilt.angle() * 180.0 / M_PI, tilt.axis().x(),
+             tilt.axis().y(), tilt.axis().z());
   }
 
   if (config_.publish_static_tf) publishStaticTransform();

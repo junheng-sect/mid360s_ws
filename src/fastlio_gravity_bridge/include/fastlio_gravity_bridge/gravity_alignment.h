@@ -165,8 +165,14 @@ inline bool computeAlignmentTransform(const Eigen::Vector3d &gravity,
   return true;
 }
 
-/// 机体安装旋转 q_IB（base_link <- body），用来把输出姿态从雷达 IMU 换成机体。
+/// 机体安装旋转 q_IB（body <- base_link），作为常量右乘项把输出姿态从雷达 IMU 换成机体：
+///   q_out = q_a ⊗ q_CB ⊗ q_IB
+/// 方向说明：右乘的 q_IB 作用在雷达 IMU 一侧，把机体系（base_link）向量转换到雷达 IMU
+/// 系，即 q_IB = R_lidar<-base_link；TF 里发布的 body -> base_link 就是这个 q_IB
+/// （父 body、子 base_link，四元数表示子系在父系中的姿态）。旧注释写成
+/// "base_link <- body" 是把方向写反了。
 ///
+/// 【旧模式 mounting_source=gravity】由初始化重力推导：
 /// body 就是雷达 IMU 坐标系，安装时相对机体有固定倾角（本机约 20 度前倾）。
 /// FAST-LIO 初始化时机体保持水平的前提下，对齐旋转 q_a 恰好等于这个安装倾角的
 /// 反向，因此取 q_IB = q_a⁻¹：
@@ -175,6 +181,7 @@ inline bool computeAlignmentTransform(const Eigen::Vector3d &gravity,
 ///   之后纯偏航 ψ        ->  R_z(ψ)                 （偏航如实反映）
 /// 前提若被破坏（初始化时机体本身倾斜），输出会把初始倾角一并当作安装角抵消掉，
 /// 表现为"读数偏小"，这一点在使用说明与启动日志里都有提示。
+/// 已知固定安装角时改用 computeFixedMounting（mounting_source=fixed，默认）。
 ///
 /// 对齐未锁定时返回单位四元数（等价于不做安装补偿）。
 inline Eigen::Quaterniond mountingFromAlignment(const AlignmentTransform &alignment)
@@ -183,6 +190,25 @@ inline Eigen::Quaterniond mountingFromAlignment(const AlignmentTransform &alignm
   Eigen::Quaterniond q_ib = alignment.q.conjugate();
   q_ib.normalize();
   return q_ib;
+}
+
+/// 固定安装旋转（mounting_source=fixed，默认）：从参数指定的安装角直接构造 q_IB，
+/// 只由配置决定，**不依赖初始化重力**，因此允许初始化时机体不水平。
+///
+/// mounting_pitch_deg 是雷达相对机体的安装前倾角（度）：正值 = 前倾，即雷达系相对机体
+/// 系绕 +Y 转 +pitch（R_base<-lidar = R_y(+pitch)，机头向下）。右乘补偿取它的逆：
+///   q_IB = R_y(-mounting_pitch_deg)
+/// 装配后雷达系看到的"水平前推"因此回到机体系；安装横滚、偏航为 0。
+/// 非有限角度（含换算成弧度后溢出的极端值）返回 false 且不修改 out。
+inline bool computeFixedMounting(double mounting_pitch_deg, Eigen::Quaterniond &out)
+{
+  if (!std::isfinite(mounting_pitch_deg)) return false;
+  const double pitch_rad = mounting_pitch_deg * (M_PI / 180.0);
+  if (!std::isfinite(pitch_rad)) return false;
+  const Eigen::Quaterniond q(Eigen::AngleAxisd(-pitch_rad, Eigen::Vector3d::UnitY()));
+  if (!quaternionIsValid(q)) return false;
+  out = q.normalized();
+  return true;
 }
 
 /// 参考实现：把 IKFoM 前六维状态误差协方差 P6 = [pos, rot] 转换到固定坐标系下
@@ -210,19 +236,20 @@ inline Eigen::Matrix<double, 6, 6> ikfomPoseCovarianceToRosFrame(
 ///   Σ_W   = J Σ_C Jᵀ，J = diag(R_a, R_a)
 /// 变换后只做舍入层面的对称化。
 ///
-/// q_base_from_body 是 base_link <- body 的安装旋转（用 mountingFromAlignment 得到；
-/// 不需要安装补偿时传单位四元数）。它是常量右乘，而姿态误差是固定轴左扰动，
+/// q_ib 是 body <- base_link 的安装旋转：mountingFromAlignment（旧 gravity 模式）或
+/// computeFixedMounting（fixed 模式，默认）；不需要安装补偿时传单位四元数。
+/// 它是常量右乘，而姿态误差是固定轴左扰动，
 /// 因此 δ_out = R_a·δ_C，与加安装旋转之前完全一致 —— 协方差传播不需要改动，
 /// 这一点由 PoseCovarianceTransform.MountingRotationKeepsCovariance 固化。
 ///
 /// 输入无效（非有限值、无效四元数、非法协方差）或对齐旋转未锁定时返回 false。
 inline bool transformPoseWithCovariance(const AlignmentTransform &transform,
-                                       const Eigen::Quaterniond &q_base_from_body,
+                                       const Eigen::Quaterniond &q_ib,
                                        const geometry_msgs::PoseWithCovariance &in,
                                        geometry_msgs::PoseWithCovariance &out)
 {
   if (!transform.valid) return false;
-  if (!isFiniteQuaternion(q_base_from_body)) return false;
+  if (!isFiniteQuaternion(q_ib)) return false;
   if (!positionIsValid(in.pose.position)) return false;
 
   Eigen::Quaterniond q_cb(in.pose.orientation.w, in.pose.orientation.x,
@@ -235,7 +262,7 @@ inline bool transformPoseWithCovariance(const AlignmentTransform &transform,
   const Eigen::Vector3d p_c(in.pose.position.x, in.pose.position.y, in.pose.position.z);
   const Eigen::Vector3d p_w = transform.R * p_c;
   // 位置不受安装旋转影响（本轮不做杆臂平移补偿，基点仍是雷达 IMU）。
-  const Eigen::Quaterniond q_wb = (transform.q * q_cb * q_base_from_body.normalized()).normalized();
+  const Eigen::Quaterniond q_wb = (transform.q * q_cb * q_ib.normalized()).normalized();
   if (!isFiniteQuaternion(q_wb)) return false;
 
   out.pose.position.x = p_w.x();

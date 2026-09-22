@@ -1,5 +1,9 @@
 // 数学测试：重力对齐旋转的构造、左乘方向，以及"重力最终沿 -Z"。
 #include <cmath>
+#include <limits>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -15,6 +19,9 @@ namespace
 
 constexpr double kGravity = 9.81;
 constexpr double kTol = 1e-12;
+/// 节点默认的 mounting_pitch_deg（雷达相对机体前倾角），fixed 模式用它做安装补偿。
+constexpr double kMountPitchDeg = 20.0;
+constexpr double kDeg = M_PI / 180.0;
 
 /// 20.12 度前倾：机体系到世界系绕 +Y 转 +20.12 度（前倾 = 机头向下）。
 Eigen::Matrix3d pitchBodyToWorld(double pitch_deg)
@@ -39,6 +46,59 @@ void expectQuaternionNear(const Eigen::Quaterniond &actual, const Eigen::Quatern
 void expectRotationNear(const Eigen::Matrix3d &actual, const Eigen::Matrix3d &expected, double tol)
 {
   EXPECT_LT((actual - expected).cwiseAbs().maxCoeff(), tol);
+}
+
+// --------------------------------------------------------------------------
+// 固定安装补偿（mounting_source=fixed）用的"真实姿态"生成器。
+// 它们只按物理关系独立推导，不调用实现里的安装/对齐公式，用来避免"复写实现"。
+// --------------------------------------------------------------------------
+
+/// 真实安装：雷达相对机体前倾 mount_deg（机头向下），R_base<-lidar = R_y(+mount_deg)。
+Eigen::Matrix3d baseFromLidar(double mount_deg)
+{
+  return Eigen::AngleAxisd(mount_deg * kDeg, Eigen::Vector3d::UnitY()).toRotationMatrix();
+}
+
+/// 独立生成相机系（camera_init）下的雷达姿态：
+/// camera_init 与初始化时刻的雷达系重合，且 R_W<-lidar = R_wb · R_base<-lidar，于是
+///   R_C<-lidar(t) = (R_W<-lidar(t0))ᵀ · R_W<-lidar(t)
+Eigen::Quaterniond cameraInitFromLidar(const Eigen::Matrix3d &R_wb_init,
+                                       const Eigen::Matrix3d &R_wb_now, double mount_deg)
+{
+  const Eigen::Matrix3d R_w_lidar_init = R_wb_init * baseFromLidar(mount_deg);
+  const Eigen::Matrix3d R_w_lidar_now = R_wb_now * baseFromLidar(mount_deg);
+  return Eigen::Quaterniond(R_w_lidar_init.transpose() * R_w_lidar_now).normalized();
+}
+
+/// 同一物理模型下的初始化重力（camera_init 下）：静止时机体只受重力，FAST-LIO 发布的
+/// grav 就是世界重力 (0,0,-g) 在初始化时刻雷达系里的表达。
+Eigen::Vector3d gravityFromBodyAttitude(const Eigen::Matrix3d &R_wb_init, double mount_deg)
+{
+  return (R_wb_init * baseFromLidar(mount_deg)).transpose() *
+         Eigen::Vector3d(0.0, 0.0, -kGravity);
+}
+
+/// 姿态相对真实世界竖直方向（+Z）的倾角（度）：绕竖直轴的偏航不影响它。
+double tiltFromVerticalDeg(const Eigen::Vector3d &up)
+{
+  const Eigen::Vector3d n = up.normalized();
+  return std::acos(std::max(-1.0, std::min(1.0, n.z()))) * 180.0 / M_PI;
+}
+
+/// 走一遍实现的位姿变换，只取输出姿态。
+Eigen::Quaterniond transformOrientation(const fgb::AlignmentTransform &transform,
+                                        const Eigen::Quaterniond &q_ib,
+                                        const Eigen::Quaterniond &q_cb)
+{
+  geometry_msgs::PoseWithCovariance in;
+  in.pose.orientation.w = q_cb.w();
+  in.pose.orientation.x = q_cb.x();
+  in.pose.orientation.y = q_cb.y();
+  in.pose.orientation.z = q_cb.z();
+  geometry_msgs::PoseWithCovariance out;
+  EXPECT_TRUE(fgb::transformPoseWithCovariance(transform, q_ib, in, out));
+  return Eigen::Quaterniond(out.pose.orientation.w, out.pose.orientation.x,
+                            out.pose.orientation.y, out.pose.orientation.z);
 }
 
 }  // namespace
@@ -202,7 +262,9 @@ TEST(GravityAlignmentMath, TransformRequiresLockedAlignment)
                                                 out));
 }
 
-/// 安装旋转：初始化时机体水平时，q_IB = q_a⁻¹ 应把机体姿态还原成水平。
+/// 【旧 gravity 模式】安装旋转：初始化时机体水平时，q_IB = q_a⁻¹ 应把机体姿态还原成水平。
+/// 该模式把初始化时测到的安装倾角（这里取 20.12 度）整体抵消，前提是初始化时机体水平；
+/// 默认已改为固定安装补偿（q_IB = Ry(-mounting_pitch_deg)），见下面的 FixedMounting* 用例。
 TEST(GravityAlignmentMath, MountingCancelsInitialTilt)
 {
   const double pitch_deg = 20.12;
@@ -253,7 +315,7 @@ TEST(GravityAlignmentMath, MountingCancelsInitialTilt)
   EXPECT_GT(std::abs(out.pose.position.x), 0.3);
 }
 
-/// 安装补偿后，机体做纯俯仰 / 纯偏航时读数如实反映，不被安装角污染。
+/// 【旧 gravity 模式】安装补偿后，机体做纯俯仰 / 纯偏航时读数如实反映，不被安装角污染。
 TEST(GravityAlignmentMath, MountingKeepsBodyAttitudeFaithful)
 {
   const double mount_deg = 20.12;
@@ -296,6 +358,238 @@ TEST(GravityAlignmentMath, MountingIsIdentityWhenUnlocked)
   fgb::AlignmentTransform transform;  // valid = false
   expectQuaternionNear(fgb::mountingFromAlignment(transform), Eigen::Quaterniond::Identity(),
                        0.0);
+}
+
+// ---------------------------------------------------------------------------
+// 以下为固定安装补偿（mounting_source=fixed，默认）的验收用例。
+// ---------------------------------------------------------------------------
+
+/// 固定安装旋转就是"雷达前倾角"的逆：q_IB = R_y(-mounting_pitch_deg)。
+TEST(GravityAlignmentMath, FixedMountingInvertsLidarForwardTilt)
+{
+  Eigen::Quaterniond q_ib;
+  ASSERT_TRUE(fgb::computeFixedMounting(kMountPitchDeg, q_ib));
+  EXPECT_NEAR(q_ib.norm(), 1.0, 1e-15);
+  // 雷达绕 +Y 前倾 20 度 -> 右乘补偿绕 +Y 转 -20 度
+  expectRotationNear(q_ib.toRotationMatrix(), pitchBodyToWorld(-kMountPitchDeg), 1e-15);
+
+  // 0 度等于不做补偿；后仰安装（负角度）取相反的逆。
+  Eigen::Quaterniond zero;
+  ASSERT_TRUE(fgb::computeFixedMounting(0.0, zero));
+  expectQuaternionNear(zero, Eigen::Quaterniond::Identity(), 1e-15);
+  Eigen::Quaterniond tilted_back;
+  ASSERT_TRUE(fgb::computeFixedMounting(-8.0, tilted_back));
+  expectRotationNear(tilted_back.toRotationMatrix(), pitchBodyToWorld(8.0), 1e-15);
+
+  // 非有限角度必须被拒绝，且不修改输出。
+  const Eigen::Quaterniond keep = zero;
+  EXPECT_FALSE(fgb::computeFixedMounting(std::numeric_limits<double>::quiet_NaN(), zero));
+  EXPECT_FALSE(fgb::computeFixedMounting(std::numeric_limits<double>::infinity(), zero));
+  EXPECT_FALSE(fgb::computeFixedMounting(-std::numeric_limits<double>::infinity(), zero));
+  expectQuaternionNear(zero, keep, 0.0);
+}
+
+/// 核心验收：初始化时机体不水平时，输出必须保留真实倾角，不再像旧 gravity 模式那样
+/// 把初始倾角当作安装角一并抵消（统一归零）。
+/// 真实姿态、初始化重力与 /Odometry 姿态都由上面的物理模型独立生成。
+TEST(GravityAlignmentMath, FixedMountingKeepsActualTiltAtTiltedStart)
+{
+  struct StartCase
+  {
+    std::string name;
+    Eigen::Matrix3d R_wb;    ///< 初始化时机体在真实世界系下的姿态
+    bool gauge_is_identity;  ///< 该初始姿态下 world 的偏航基准恰好等于真实世界
+  };
+  const std::vector<StartCase> cases = {
+      {"机体水平", Eigen::Matrix3d::Identity(), true},
+      {"前倾 10 度", pitchBodyToWorld(10.0), true},
+      {"后仰 10 度", pitchBodyToWorld(-10.0), true},
+      {"横滚 15 度", Eigen::AngleAxisd(15.0 * kDeg, Eigen::Vector3d::UnitX()).toRotationMatrix(),
+       false},
+  };
+
+  Eigen::Quaterniond q_ib;
+  ASSERT_TRUE(fgb::computeFixedMounting(kMountPitchDeg, q_ib));
+
+  for (const StartCase &c : cases)
+  {
+    fgb::AlignmentTransform transform;
+    ASSERT_TRUE(fgb::computeAlignmentTransform(
+        gravityFromBodyAttitude(c.R_wb, kMountPitchDeg), transform));
+
+    // 初始化时刻 q_CI = I（camera_init 就是初始化时刻的雷达系）。
+    const Eigen::Matrix3d R_out =
+        transformOrientation(transform, q_ib, Eigen::Quaterniond::Identity()).toRotationMatrix();
+
+    // (1) 保留真实倾角：输出相对世界竖直的倾角 == 机体真实倾角（旧模式这里恒为 0）。
+    EXPECT_NEAR(tiltFromVerticalDeg(R_out * Eigen::Vector3d::UnitZ()),
+                tiltFromVerticalDeg(c.R_wb * Eigen::Vector3d::UnitZ()), 1e-12)
+        << c.name;
+    if (!c.gauge_is_identity)
+    {
+      EXPECT_GT(tiltFromVerticalDeg(R_out * Eigen::Vector3d::UnitZ()), 1.0) << c.name;
+    }
+
+    // (2) 重力对齐定不了航向，唯一的不确定量是绕竖直轴的固定偏航：R_out = R_z(psi)·R_wb。
+    const Eigen::Matrix3d gauge = R_out * c.R_wb.transpose();
+    EXPECT_LT((gauge * Eigen::Vector3d::UnitZ() - Eigen::Vector3d::UnitZ()).norm(), 1e-12)
+        << c.name;
+    EXPECT_LT(std::abs(gauge(2, 0)) + std::abs(gauge(2, 1)) + std::abs(gauge(0, 2)) +
+                  std::abs(gauge(1, 2)),
+              1e-12)
+        << c.name;
+    if (c.gauge_is_identity) expectRotationNear(gauge, Eigen::Matrix3d::Identity(), 1e-12);
+  }
+}
+
+/// 纯俯仰启动（world 偏航基准与真实世界一致）时，输出完全跟随真实机体姿态：
+/// 之后恢复水平、纯偏航、纯俯仰、纯横滚、组合旋转都要逐一复现。
+TEST(GravityAlignmentMath, FixedMountingTracksTrueAttitudeAfterPitchStart)
+{
+  const Eigen::Matrix3d R_wb_init = pitchBodyToWorld(10.0);
+  fgb::AlignmentTransform transform;
+  ASSERT_TRUE(
+      fgb::computeAlignmentTransform(gravityFromBodyAttitude(R_wb_init, kMountPitchDeg), transform));
+  Eigen::Quaterniond q_ib;
+  ASSERT_TRUE(fgb::computeFixedMounting(kMountPitchDeg, q_ib));
+
+  const std::vector<std::pair<std::string, Eigen::Matrix3d>> later = {
+      {"倾斜启动后恢复水平", Eigen::Matrix3d::Identity()},
+      {"纯偏航 25 度", Eigen::AngleAxisd(25.0 * kDeg, Eigen::Vector3d::UnitZ()).toRotationMatrix()},
+      {"纯俯仰 -10 度", pitchBodyToWorld(-10.0)},
+      {"纯横滚 12 度", Eigen::AngleAxisd(12.0 * kDeg, Eigen::Vector3d::UnitX()).toRotationMatrix()},
+      {"偏航-俯仰-横滚组合",
+       (Eigen::AngleAxisd(-40.0 * kDeg, Eigen::Vector3d::UnitZ()) *
+        Eigen::AngleAxisd(8.0 * kDeg, Eigen::Vector3d::UnitY()) *
+        Eigen::AngleAxisd(-6.0 * kDeg, Eigen::Vector3d::UnitX()))
+           .toRotationMatrix()},
+  };
+
+  for (const auto &c : later)
+  {
+    const Eigen::Quaterniond q_out = transformOrientation(
+        transform, q_ib, cameraInitFromLidar(R_wb_init, c.second, kMountPitchDeg));
+    expectRotationNear(q_out.toRotationMatrix(), c.second, 1e-12);
+  }
+}
+
+/// 横滚倾斜启动时 world 的偏航基准与真实世界有一个固定偏差，但：
+///  - 输出的真实倾角仍然保留；
+///  - 任意两次输出之间的相对旋转（含偏航）与真实机体的相对旋转完全一致；
+///  - 该偏差在整个过程中保持不变（不会漂移）。
+TEST(GravityAlignmentMath, FixedMountingReproducesRelativeRotationFromRollStart)
+{
+  const Eigen::Matrix3d R_wb_init =
+      Eigen::AngleAxisd(15.0 * kDeg, Eigen::Vector3d::UnitX()).toRotationMatrix();
+  fgb::AlignmentTransform transform;
+  ASSERT_TRUE(
+      fgb::computeAlignmentTransform(gravityFromBodyAttitude(R_wb_init, kMountPitchDeg), transform));
+  Eigen::Quaterniond q_ib;
+  ASSERT_TRUE(fgb::computeFixedMounting(kMountPitchDeg, q_ib));
+
+  const Eigen::Quaterniond q_out_init =
+      transformOrientation(transform, q_ib, Eigen::Quaterniond::Identity());
+  const Eigen::Matrix3d gauge = q_out_init.toRotationMatrix() * R_wb_init.transpose();
+  // 初始偏航偏差非零（横滚启动时最小对齐旋转会带出航向偏差），只能是绕竖直轴的旋转。
+  EXPECT_GT(std::abs(std::atan2(gauge(1, 0), gauge(0, 0))), 1e-3);
+
+  const std::vector<std::pair<std::string, Eigen::Matrix3d>> later = {
+      {"保持横滚", R_wb_init},
+      {"横滚基础上偏航 30 度",
+       Eigen::AngleAxisd(30.0 * kDeg, Eigen::Vector3d::UnitZ()) * R_wb_init},
+      {"恢复水平", Eigen::Matrix3d::Identity()},
+      {"组合旋转",
+       (Eigen::AngleAxisd(20.0 * kDeg, Eigen::Vector3d::UnitZ()) *
+        Eigen::AngleAxisd(-9.0 * kDeg, Eigen::Vector3d::UnitY()) *
+        Eigen::AngleAxisd(14.0 * kDeg, Eigen::Vector3d::UnitX()))
+           .toRotationMatrix()},
+  };
+
+  for (const auto &c : later)
+  {
+    const Eigen::Quaterniond q_out = transformOrientation(
+        transform, q_ib, cameraInitFromLidar(R_wb_init, c.second, kMountPitchDeg));
+    const Eigen::Matrix3d R_out = q_out.toRotationMatrix();
+
+    // 相对旋转忠实复现（偏航也在内）：世界侧相对量 = R_out(t0)ᵀ R_out(t)。
+    expectRotationNear((q_out_init.conjugate() * q_out).toRotationMatrix(),
+                       R_wb_init.transpose() * c.second, 1e-12);
+    // 偏航基准固定不变。
+    expectRotationNear(R_out * c.second.transpose(), gauge, 1e-12);
+    // 倾角如实反映真实机体姿态。
+    EXPECT_NEAR(tiltFromVerticalDeg(R_out * Eigen::Vector3d::UnitZ()),
+                tiltFromVerticalDeg(c.second * Eigen::Vector3d::UnitZ()), 1e-12);
+  }
+}
+
+/// 回归检查：同一份重力与位置/姿态/协方差输入下，只换安装补偿不改变输出位置与协方差；
+/// 姿态只相差一个右乘的安装旋转；三种来源（fixed / gravity / none）都给出合法协方差。
+TEST(GravityAlignmentMath, MountingChoiceDoesNotChangePositionOrCovariance)
+{
+  // 用 20.12 度的安装倾角生成初始化重力：与本机固定补偿的 20.0 度刻意不同，
+  // 保证 fixed 与旧 gravity 模式给出的安装旋转确实不一样。
+  const Eigen::Matrix3d R_wb_init = Eigen::Matrix3d::Identity();
+  fgb::AlignmentTransform transform;
+  ASSERT_TRUE(fgb::computeAlignmentTransform(gravityFromBodyAttitude(R_wb_init, 20.12), transform));
+
+  Eigen::Quaterniond q_fixed;
+  ASSERT_TRUE(fgb::computeFixedMounting(kMountPitchDeg, q_fixed));
+  const Eigen::Quaterniond q_gravity = fgb::mountingFromAlignment(transform);
+  const Eigen::Quaterniond q_none = Eigen::Quaterniond::Identity();
+  EXPECT_GT((q_fixed.toRotationMatrix() - q_gravity.toRotationMatrix()).cwiseAbs().maxCoeff(),
+            0.1 * kDeg);
+  EXPECT_LT(
+      Eigen::AngleAxisd(q_fixed.conjugate() * q_gravity).angle() * 180.0 / M_PI, 1.0);
+
+  geometry_msgs::PoseWithCovariance in;
+  in.pose.position.x = 1.5;
+  in.pose.position.y = -0.25;
+  in.pose.position.z = 2.0;
+  const Eigen::Quaterniond q_cb(Eigen::AngleAxisd(0.35, Eigen::Vector3d(1.0, -2.0, 0.5).normalized()));
+  in.pose.orientation.w = q_cb.w();
+  in.pose.orientation.x = q_cb.x();
+  in.pose.orientation.y = q_cb.y();
+  in.pose.orientation.z = q_cb.z();
+  Eigen::Matrix<double, 6, 6> cov = Eigen::Matrix<double, 6, 6>::Zero();
+  cov.diagonal() << 1.0e-2, 4.0e-2, 9.0e-2, 1.0e-5, 4.0e-5, 9.0e-5;
+  cov(0, 1) = cov(1, 0) = 3.0e-3;
+  cov(2, 5) = cov(5, 2) = 1.0e-4;
+  fgb::covarianceToMsg(cov, in.covariance.elems);
+
+  geometry_msgs::PoseWithCovariance out_fixed;
+  geometry_msgs::PoseWithCovariance out_gravity;
+  geometry_msgs::PoseWithCovariance out_none;
+  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, q_fixed, in, out_fixed));
+  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, q_gravity, in, out_gravity));
+  ASSERT_TRUE(fgb::transformPoseWithCovariance(transform, q_none, in, out_none));
+
+  // 位置与协方差与安装补偿无关（逐位相同），协方差依旧合法。
+  EXPECT_DOUBLE_EQ(out_fixed.pose.position.x, out_none.pose.position.x);
+  EXPECT_DOUBLE_EQ(out_fixed.pose.position.y, out_none.pose.position.y);
+  EXPECT_DOUBLE_EQ(out_fixed.pose.position.z, out_none.pose.position.z);
+  EXPECT_DOUBLE_EQ(out_fixed.pose.position.x, out_gravity.pose.position.x);
+  for (int i = 0; i < 36; ++i)
+  {
+    EXPECT_DOUBLE_EQ(out_fixed.covariance.elems[i], out_none.covariance.elems[i]) << "index " << i;
+    EXPECT_DOUBLE_EQ(out_fixed.covariance.elems[i], out_gravity.covariance.elems[i])
+        << "index " << i;
+  }
+  EXPECT_TRUE(fgb::covarianceIsValid(fgb::covarianceFromMsg(out_fixed.covariance.elems)));
+  EXPECT_TRUE(fgb::covarianceIsValid(fgb::covarianceFromMsg(out_gravity.covariance.elems)));
+
+  // 三个姿态互为右乘一个安装旋转的关系：q_X = q_none ⊗ q_IB(X)。
+  const Eigen::Quaterniond q_out_none(out_none.pose.orientation.w, out_none.pose.orientation.x,
+                                      out_none.pose.orientation.y, out_none.pose.orientation.z);
+  const Eigen::Quaterniond q_out_fixed(out_fixed.pose.orientation.w, out_fixed.pose.orientation.x,
+                                       out_fixed.pose.orientation.y, out_fixed.pose.orientation.z);
+  const Eigen::Quaterniond q_out_gravity(out_gravity.pose.orientation.w,
+                                         out_gravity.pose.orientation.x,
+                                         out_gravity.pose.orientation.y,
+                                         out_gravity.pose.orientation.z);
+  expectRotationNear(q_out_fixed.toRotationMatrix(),
+                     (q_out_none * q_fixed).normalized().toRotationMatrix(), 1e-15);
+  expectRotationNear(q_out_gravity.toRotationMatrix(),
+                     (q_out_none * q_gravity).normalized().toRotationMatrix(), 1e-15);
 }
 
 int main(int argc, char **argv)

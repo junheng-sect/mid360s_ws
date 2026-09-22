@@ -6,6 +6,10 @@ set -euo pipefail
 # 路径: /home/orangepi/mid360s_ws/scripts/start_mid360s_fastlio.sh
 # 用法: ./start_mid360s_fastlio.sh [--check] [--send-to-mavros]
 #   --send-to-mavros   把带协方差位姿输出改为 /mavros/vision_pose/pose_cov
+#
+# 提示：桥接默认用固定安装补偿（mounting_source:=fixed，雷达相对机体前倾 20 度），
+# 初始化时机体保持静止即可、**无须水平**；改安装角用 gravity_bridge.launch 的
+# mounting_pitch_deg 参数。旧的 mounting_source:=gravity 才要求初始化时机体水平。
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -460,7 +460,9 @@ elif [ "$NODES_RC" -eq 0 ]; then
     warn "等首帧期间 roslaunch 已经退出（见上面的日志）"
   else
     warn "${READY_TIMEOUT} s 内没等到 /fastlio/odom_world 首帧，链路仍在运行"
-    warn "多数是初始化时机体没静止/没放平（重力初始化不过），或雷达无数据"
+    warn "多数是初始化时机体没静止（重力初始化不过），或雷达无数据"
+    warn "初始化保持静止即可，无须水平（桥接默认固定安装补偿 20 度）"
+    warn "仅当显式改用旧的 mounting_source:=gravity 才要求初始化时机体水平"
   fi
 else
   warn "${NODES_TIMEOUT} s 内未等到全部节点注册，缺：${MISSING_NODES:-未知}（链路仍在运行，见上面日志）"

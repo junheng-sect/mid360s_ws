@@ -10,7 +10,9 @@
 
     本文件里的节点都不设 respawn：配合入口脚本给 roslaunch 传的 required 选项，
     任一节点异常退出就停掉整条链路，让录包与视觉位姿同生共死，避免飞控拿到半截数据。
-    启动后机体保持静止水平，FAST-LIO 重力初始化通过后桥接才输出 /fastlio/odom_world。
+    启动后机体保持静止，FAST-LIO 重力初始化通过后桥接才输出 /fastlio/odom_world。
+    桥接默认用固定安装补偿（mounting_source:=fixed，前倾 20 度），初始化时机体
+    **静止即可、无须水平**；只有显式改用旧的 mounting_source:=gravity 才要求水平。
 
     板端一律关闭 RViz；飞控参数不在本文件里改（px4_config.yaml 的
     vision_pose/tf/listen 已经是 false，桥接用消息订阅而不是 TF）。

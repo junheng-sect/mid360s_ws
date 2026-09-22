@@ -126,9 +126,9 @@ source devel/setup.bash
 | `/fastlio/vision_pose_cov` | `geometry_msgs/PoseWithCovarianceStamped` | 输出（与上面同一位姿与协方差） |
 | `/tf_static` | — | `world → camera_init`（对齐旋转）与 `body → base_link`（机体安装旋转），本工作空间内唯一的发布者 |
 
-**姿态表示机体，位置基点仍是雷达 IMU。** 输出姿态已抵消雷达 IMU 的安装倾角（本机约 20°前倾），
-水平放置时 pitch ≈ 0；但位置仍是雷达 IMU 的原点，**杆臂没有补偿**，该平移偏移留给下游 / 飞控参数
-（例如 PX4 的 `EKF2_EV_POS_*`）处理。
+**姿态表示机体，位置基点仍是雷达 IMU。** 输出姿态已抵消雷达 IMU 的安装倾角（本机 20° 前倾），
+水平放置时 pitch ≈ 0；初始化时机体本身倾斜时，输出会如实保留该倾角，不再被归零。位置仍是雷达
+IMU 的原点，**杆臂没有补偿**，该平移偏移留给下游 / 飞控参数（例如 PX4 的 `EKF2_EV_POS_*`）处理。
 
 TF 树：
 
@@ -137,10 +137,16 @@ world ──静态(q_a)──> camera_init ──FAST-LIO──> body ──静�
                                                 (雷达 IMU)        (机体，原点=IMU)
 ```
 
-安装旋转 `q_IB` 由 `mounting_source` 决定：默认 `gravity` 取 `q_a` 的共轭，前提是
-**FAST-LIO 初始化时机体保持水平**；若初始化时机体本身倾斜，输出会把初始倾角一并当作安装角
-抵消，表现为读数偏小。设为 `mounting_source:=none` 可关闭安装补偿（此时把
-`output_child_frame:=body` 一起改回去更合适）。
+安装旋转 `q_IB`（`body ← base_link`，即把机体系向量转到雷达 IMU 系）由 `mounting_source` 决定：
+
+- `fixed`（**默认**）：固定安装角 `q_IB = Ry(-mounting_pitch_deg)`，`mounting_pitch_deg` 默认
+  `20.0`，含义是**雷达相对机体的安装前倾角**（正值 = 前倾）。它只由参数决定、**与初始化重力无关**，
+  所以初始化时机体保持静止即可、**不要求水平**；换装或改角度只改这一个参数。
+- `gravity`（兼容旧调用）：由本次初始化重力推导 `q_IB = q_a⁻¹`，前提是 **FAST-LIO 初始化时机体
+  保持水平**；若初始化时机体本身倾斜，输出会把初始倾角一并当作安装角抵消，表现为读数偏小。
+- `none`：不做安装补偿（输出仍是雷达 IMU 姿态，此时把 `output_child_frame:=body` 一起改回去更合适）。
+
+非法的 `mounting_source` 或非有限的 `mounting_pitch_deg` 会让节点明确报错并拒绝启动，不会静默兜底。
 
 单独启动（FAST-LIO2 已在运行时）：
 
@@ -153,6 +159,12 @@ roslaunch fastlio_gravity_bridge gravity_bridge.launch
 
 ```bash
 roslaunch fastlio_gravity_bridge gravity_bridge.launch send_to_mavros:=true
+
+# 改固定安装角（默认 20 度前倾）
+roslaunch fastlio_gravity_bridge gravity_bridge.launch mounting_pitch_deg:=20.0
+
+# 走旧的自动推导模式（要求初始化时机体水平）
+roslaunch fastlio_gravity_bridge gravity_bridge.launch mounting_source:=gravity
 
 # 关闭机体安装补偿（输出恢复为雷达 IMU 姿态，child frame 一并改回 body）
 roslaunch fastlio_gravity_bridge gravity_bridge.launch \
@@ -171,7 +183,9 @@ roslaunch fastlio_gravity_bridge gravity_bridge.launch \
   协方差按「有限 + 对角线非负 + 对称 + 半正定」判定（相对容差 1e-9），变换后的结果同样校验。
 - 重复时间戳丢弃；时间回退（已发布之后的更早帧）或运行中出现另一轮初始化：停止输出，需随 FAST-LIO 一起重启。
 - 对齐旋转与协方差只做本次运行的固定变换，不额外建模初始化重力的不确定度。
-- 本轮输出代表雷达 IMU 位姿，尚无有效速度；安装旋转与飞控航向策略属于后续机体接入步骤。
+- 默认 `fixed` 模式的安装旋转在启动时按参数确定，不依赖初始化重力；初始化只需保持静止
+  （FAST-LIO 静态初始化），机体是否水平只表现为输出姿态里如实体现的倾角。
+- 位置基点仍是雷达 IMU 原点，尚无有效速度与杆臂补偿；飞控航向策略属于后续机体接入步骤。
 
 ### 测试
 
@@ -179,10 +193,10 @@ roslaunch fastlio_gravity_bridge gravity_bridge.launch \
 cd /home/orangepi/mid360s_ws
 source /opt/ros/noetic/setup.bash && source devel/setup.bash
 catkin build fastlio_gravity_bridge --no-deps --catkin-make-args tests
-catkin test fastlio_gravity_bridge --no-deps        # 69 个用例：数学 / 协方差 / 消息
+catkin test fastlio_gravity_bridge --no-deps        # 数学 16 / 协方差 10 / 消息 22（catkin 汇总 97）
 ```
 
-姿态是否真的不再前倾，可以用离线复算脚本直接从 bag 判定（不需要重跑 FAST-LIO）：
+姿态是否真的保留（或抵消）安装倾角，可以用离线复算脚本直接从 bag 判定（不需要重跑 FAST-LIO）：
 
 ```bash
 source /opt/ros/noetic/setup.bash
@@ -192,6 +206,9 @@ python3 test_artifacts/check_base_link_attitude.py bags/20260918_pitch20_world.b
 回放验证（隔离 Master，回放 `bags/20260917_pitch20.bag`，录制并逐项核对）：
 
 ```bash
+# 注意：这两个脚本仍按旧的 gravity 模式判据（安装旋转 = q_a 的共轭），
+# run_gravity_bridge_replay.sh 里已显式传 mounting_source:=gravity；要验证默认的
+# fixed 模式需另加 mounting_pitch_deg 口径，留待下一轮实机/回放验收。
 bash test_artifacts/run_gravity_bridge_replay.sh            # 需先确保无同名 ROS 节点在跑
 source /opt/ros/noetic/setup.bash && python3 test_artifacts/analyze_gravity_bridge_replay.py
 ```
