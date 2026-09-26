@@ -1,8 +1,14 @@
 # MID-360S 工作空间 (mid360s_ws)
 
 本项目为 Orange Pi 5 Max（RK3588，Ubuntu 20.04 + ROS Noetic）平台定制的 Livox MID-360S 激光雷达驱动与 FAST-LIO2 算法工作空间，采用单一独立仓库管理全部源码与内联依赖，构建不再依赖外部源码克隆。
-## 本地运行rviz
-/home/zjh/docker/ros-noetic-rviz/scripts/run_rviz.sh
+## 本地运行 RViz
+
+```bash
+./scripts/run_rviz.sh
+```
+
+本机 Docker 显示入口及依赖已纳入本仓库，详见 [桌面 RViz 说明](docker/ros-noetic-rviz/README.md)。
+沿用 host IPC 面板重绘修复，不自动最大化；与板端 `fusion.sh` 分工独立。
 ---
 
 ## 目录结构
