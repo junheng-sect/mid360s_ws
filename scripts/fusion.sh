@@ -3,11 +3,13 @@
 # 融合快速启动（fusion）：一条 roslaunch 拉起整条链路
 #   MAVROS(飞控串口) + MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接(位姿送飞控)
 #   + RC 开关触发录包节点（遥控器通道 6 拨到触发位即开始录 bag）
+#   + 系留绕线器自动控制（默认开启，非系留使用 --no-winch）
 #
 # 路径: /home/orangepi/mid360s_ws/scripts/fusion.sh
 # launch: /home/orangepi/mid360s_ws/scripts/launch/fusion.launch
 # 用法: ./fusion.sh [选项]
 #   --no-record         不启动 RC 触发录包节点（本次不会有 bag）
+#   --no-winch          不启动绕线器控制（非系留测试）
 #   --bag-prefix NAME   包名前缀（默认 noprop，产出 NAME_000001.bag）
 #   --bag-dir PATH      包输出目录（默认 /home/orangepi/bags）
 #   -h|--help           帮助
@@ -20,6 +22,7 @@
 # 手动启动（不经本脚本，launch 里的注释指的就是这段）：
 #   cd /home/orangepi/mid360s_ws
 #   source /opt/ros/noetic/setup.bash && source devel/setup.bash
+#   source /home/orangepi/orange/devel/setup.bash --extend
 #   export ROS_PACKAGE_PATH="$PWD/scripts:$ROS_PACKAGE_PATH"   # rc_record 靠它定位
 #   roslaunch --screen --required scripts/launch/fusion.launch
 #
@@ -38,6 +41,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS="$(cd "$DIR/.." && pwd)"
 ROS_SETUP="/opt/ros/noetic/setup.bash"
 WS_SETUP="$WS/devel/setup.bash"
+ORANGE_SETUP="/home/orangepi/orange/devel/setup.bash"
 FUSION_LAUNCH="$DIR/launch/fusion.launch"
 RC_RECORD_DIR="$DIR/rc_record"
 LOG_DIR="$WS/logs/fusion"
@@ -56,15 +60,17 @@ READY_POLL=3          # 等首帧时每轮阻塞上限（秒）：短轮询，�
 STOP_TIMEOUT=30       # 收尾时等 roslaunch 退出的上限（秒）
 
 DO_RECORD=1
+DO_WINCH=1
 BAG_PREFIX="noprop"
 BAG_DIR="/home/orangepi/bags"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-record) DO_RECORD=0 ;;
+    --no-winch) DO_WINCH=0 ;;
     --bag-prefix) BAG_PREFIX="${2:-}"; shift ;;
     --bag-dir) BAG_DIR="${2:-}"; shift ;;
-    -h|--help) sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1（-h 看用法）" >&2; exit 2 ;;
   esac
   shift
@@ -89,6 +95,7 @@ err()  { printf '[%s] [FAIL] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE" 
 hr()   { printf '%s\n' "----------------------------------------------------------------" | tee -a "$LOGFILE"; }
 
 EXPECT_NODES="/mavros /livox_lidar_publisher2 /laserMapping /gravity_bridge"
+[ "$DO_WINCH" -eq 1 ] && EXPECT_NODES="$EXPECT_NODES /tether_winch_control"
 
 # pgrep -f 会匹配到「命令行里恰好含关键词」的祖先进程（例如通过 ssh/bash -c 调用本
 # 脚本时），先算出自身进程树并排除，避免把父 shell 误判成残留节点。
@@ -234,9 +241,12 @@ verify_clean() {
   alive "fastlio_mappin[g]"      && _left="$_left fastlio_mapping"
   alive "gravity_bridge_nod[e]"  && _left="$_left gravity_bridge_node"
   alive "bag_recorder_node.p[y]" && _left="$_left bag_recorder_node.py"
+  if [ "$DO_WINCH" -eq 1 ] && alive "tether_winch_nod[e]"; then
+    _left="$_left tether_winch_node"
+  fi
   if [ -n "$_left" ]; then
     warn "仍有节点进程残留：$_left"
-    warn "核对：ps -eo pid,args | grep -E 'mavros_node|livox_ros_driver2_node|fastlio_mapping|gravity_bridge_node|bag_recorder_node'"
+    warn "核对：ps -eo pid,args | grep -E 'mavros_node|livox_ros_driver2_node|fastlio_mapping|gravity_bridge_node|bag_recorder_node|tether_winch_node'"
   else
     ok "链路节点已全部退出"
   fi
@@ -319,6 +329,10 @@ hr; log "步骤 1/3：前置检查（环境 / 串口 / 防重复启动）"
 ok "脚本、launch 与 rc_record 包文件齐全（工作空间 $WS）"
 
 set +u; source "$ROS_SETUP"; source "$WS_SETUP"; set -u
+if [ "$DO_WINCH" -eq 1 ]; then
+  [ -f "$ORANGE_SETUP" ] || { err "缺少 $ORANGE_SETUP；请构建 orange 或使用 --no-winch"; exit 1; }
+  set +u; source "$ORANGE_SETUP" --extend; set -u
+fi
 # rc_record 不是 catkin 包，把 scripts 挂进 ROS_PACKAGE_PATH，roslaunch 才解析得到它
 export ROS_PACKAGE_PATH="$DIR${ROS_PACKAGE_PATH:+:$ROS_PACKAGE_PATH}"
 
@@ -328,7 +342,11 @@ done
 for p in mavros livox_ros_driver2 fast_lio fastlio_gravity_bridge rc_record; do
   rospack find "$p" >/dev/null 2>&1 || { err "rospack 找不到包 $p"; exit 1; }
 done
-ok "ROS Noetic 与 5 个包齐备（含 rc_record）"
+if [ "$DO_WINCH" -eq 1 ]; then
+  rospack find tether_winch_control >/dev/null 2>&1 || { err "找不到 tether_winch_control，请在 orange 构建"; exit 1; }
+  python3 -c 'from tether_winch_control.msg import WinchStatus' || { err "绕线器消息不可用，请重新构建 tether_winch_control"; exit 1; }
+fi
+ok "ROS Noetic 与所选功能包齐备"
 
 [ -c "$TTY" ] || { err "飞控串口 $TTY 不存在"; exit 1; }
 if [ -w "$TTY" ]; then
@@ -342,6 +360,9 @@ for pat in "rosmaste[r]" "roslaunc[h]" "mavros_nod[e]" "livox_ros_driver2_nod[e]
            "fastlio_mappin[g]" "gravity_bridge_nod[e]" "bag_recorder_node.p[y]"; do
   alive "$pat" && stale="$stale ${pat//[\[\]]/}"
 done
+if [ "$DO_WINCH" -eq 1 ] && alive "tether_winch_nod[e]"; then
+  stale="$stale tether_winch_node"
+fi
 if [ -n "$stale" ]; then
   err "检测到残留进程：$stale"
   err "上一次实例可能没退干净，先收尾（Ctrl+C 或 kill -INT <roslaunch pid>）再启动"
@@ -375,6 +396,15 @@ else
   REC_ARG=false
 fi
 
+if [ "$DO_WINCH" -eq 1 ]; then
+  WINCH_ARG=true
+  log "绕线器：开启，使用 orange/src/tether_winch_control/config/winch.yaml"
+  warn "绕线器启动即发送备用 DUTY；定位通信就绪后按 YAML 自动启用；退出会尝试发送备用 DUTY"
+else
+  WINCH_ARG=false
+  log "已指定 --no-winch：不启动绕线器控制，不由 fusion 发送 DUTY"
+fi
+
 # roslaunch 放进独立会话（setsid）：终端信号不会绕过本脚本直接打到它，由 on_signal
 # 统一发一次 SIGINT，避免重复信号打断 roslaunch 的收尾流程。真实 PID 由子进程自己
 # 写进 PIDFILE，不依赖 setsid 有没有 fork。
@@ -392,7 +422,7 @@ setsid --wait bash -c '
 ' _ "$PIDFILE" \
   roslaunch --screen --required "$FUSION_LAUNCH" \
     fcu_url:="$FCU_URL" fcu_protocol:=v1.0 tgt_system:=1 tgt_component:=1 \
-    send_to_mavros:=true "record:=$REC_ARG" bag_prefix:="$BAG_PREFIX" bag_dir:="$BAG_DIR" \
+    send_to_mavros:=true "record:=$REC_ARG" "winch:=$WINCH_ARG" bag_prefix:="$BAG_PREFIX" bag_dir:="$BAG_DIR" \
   </dev/null > >( trap '' INT; exec tee -a "$LOGFILE" ) 2>&1 &
 SETSID_PID=$!
 SETSID_ST="$(proc_starttime "$SETSID_PID" 2>/dev/null)"

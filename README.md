@@ -227,3 +227,35 @@ source /opt/ros/noetic/setup.bash && python3 test_artifacts/analyze_gravity_brid
 - 主分支: `main`
 - 拉取策略: `git config pull.ff only`（强制快进合并）
 - 提交与构建均在板端完成，构建产物、本地安装的 SDK、运行日志、bag 包及 PCD 文件默认被 `.gitignore` 忽略，不污染代码仓库。
+
+
+## fusion 系留控制开关
+
+板端默认启动定位、MAVROS、RC录包以及绕线器控制：
+
+```bash
+cd /home/orangepi/mid360s_ws/scripts
+./fusion.sh
+```
+
+非系留测试关闭绕线器；仍保留定位、MAVROS和RC录包：
+
+```bash
+./fusion.sh --no-winch
+```
+
+也可以独立关闭录包：`./fusion.sh --no-winch --no-record`。
+直接调用launch时，对应开关为 `winch:=false`（默认true）。
+
+绕线器开启时，入口追加加载 `/home/orangepi/orange/devel/setup.bash --extend`，
+保留MID360S环境；关闭时不检查绕线器包、不等待绕线器节点。
+录制器为识别WinchStatus而加载消息环境，不会因此启动电机控制。
+默认使用 `/home/orangepi/orange/src/tether_winch_control/config/winch.yaml`，
+本次接入不修改其中的DUTY或自动启用参数。启动会先发送备用值，随后按配置自动启用。
+请勿同时运行独立的绕线器launch或本机DUTY测试脚本；本入口检测板端重复节点，
+无法检测其他电脑上的发送程序。`--no-winch` 不会替你停止另一个独立发送程序。
+
+Ctrl+C会统一结束本次fusion启动的节点，绕线器正常退出尝试发送YAML的fallback_duty，
+不会套用本机脉冲脚本Ctrl+C发送300的规则；网络断开时不能保证备用指令送达。
+沿用原有 `roslaunch --required` 规则：绕线器进程异常退出会结束本次整条链路；
+绕线器报告FAULT但进程仍在时不会触发整链退出。

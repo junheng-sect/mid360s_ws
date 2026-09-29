@@ -2,7 +2,7 @@
   <!--
     融合启动：一条 roslaunch 拉起整条链路
       MAVROS(飞控串口) + MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接(位姿送飞控)
-      + RC 开关触发录包节点
+      + RC 开关触发录包节点 + 可关闭的系留绕线器控制
 
     入口脚本（推荐，带前置检查与收尾）：/home/orangepi/mid360s_ws/scripts/fusion.sh
     手动启动的完整命令见该脚本头部注释（关键是先把 scripts 加进 ROS_PACKAGE_PATH，
@@ -24,6 +24,7 @@
   <arg name="tgt_component"  default="1"/>
   <arg name="send_to_mavros" default="true"/>
   <arg name="record"         default="true"/>
+  <arg name="winch"          default="true"/>
   <arg name="bag_prefix"     default="noprop"/>
   <arg name="bag_dir"        default="/home/orangepi/bags"/>
 
@@ -63,5 +64,9 @@
       <env name="RC_BAG_PREFIX" value="$(arg bag_prefix)"/>
       <env name="RC_BAG_DIR"    value="$(arg bag_dir)"/>
     </node>
+  </group>
+  <!-- 6) 默认启用绕线器；winch:=false 完全跳过该包解析与节点启动。 -->
+  <group if="$(arg winch)">
+    <include file="$(find tether_winch_control)/launch/tether_winch.launch" />
   </group>
 </launch>
