@@ -8,7 +8,11 @@ PORT="${1:-11377}"
 export ROS_MASTER_URI="http://127.0.0.1:${PORT}"
 export ROS_IP="127.0.0.1"
 export ROS_HOSTNAME="127.0.0.1"
-set +u; source /opt/ros/noetic/setup.bash; set -u
+set +u
+source /opt/ros/noetic/setup.bash
+source /home/orangepi/mid360s_ws/devel/setup.bash
+source /home/orangepi/orange/devel/setup.bash --extend
+set -u
 
 BAGDIR="$(mktemp -d /tmp/rc_record_e2e.XXXXXX)"
 CORE_PID=""; NODE_PID=""; PUB_PID=""
@@ -38,11 +42,11 @@ rc_bag_recorder:
   active_high: true
   confirm_samples: 2
   release_tail_s: 1.0
-  topics: [/mavros/local_position/pose]
+  topics: [/mavros/local_position/pose, /tether_winch_control/status]
 YAML
 rosparam load "$BAGDIR/config.yaml" || { echo "[FAIL] rosparam load 失败"; exit 1; }
 
-python3 -u "$DIR/bag_recorder_node.py" __name:=rc_bag_recorder >"$BAGDIR/node.log" 2>&1 &
+RC_RECORD_CONFIG="$BAGDIR/config.yaml" bash "$DIR/start_rc_record.sh" __name:=rc_bag_recorder >"$BAGDIR/node.log" 2>&1 &
 NODE_PID=$!
 sleep 3
 if ! pgrep -f "bag_recorder_node.p[y]" >/dev/null 2>&1; then
@@ -53,11 +57,13 @@ python3 - "$BAGDIR" <<'PYEOF' >"$BAGDIR/publisher.log" 2>&1 &
 import sys, time, rospy
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import RCIn
+from tether_winch_control.msg import WinchStatus
 
 rospy.init_node('fake_rc_and_pose', anonymous=True, disable_signals=True)
 bagdir = sys.argv[1]
 pose_pub = rospy.Publisher('/mavros/local_position/pose', PoseStamped, queue_size=10)
 rc_pub = rospy.Publisher('/test/rc_in', RCIn, queue_size=10)
+winch_pub = rospy.Publisher('/tether_winch_control/status', WinchStatus, queue_size=10)
 time.sleep(1.0)   # 等订阅者连上
 
 script = [(1000, 2.0), (2000, 3.0), (1000, 2.5), (2000, 2.0), (1000, 1.5)]
@@ -77,6 +83,16 @@ for pwm, duration in script:
         pose.header.frame_id = 'map'
         pose.pose.position.z = 0.63
         pose_pub.publish(pose)
+        winch = WinchStatus()
+        winch.header.stamp = pose.header.stamp
+        winch.header.frame_id = 'world'
+        winch.mode = 'HIGH' if pwm == 2000 else 'LOW'
+        winch.enabled = True
+        winch.command_valid = True
+        winch.target_duty = 220 if pwm == 2000 else 10
+        winch.last_sent_duty = winch.target_duty
+        winch.hardware_feedback_valid = False
+        winch_pub.publish(winch)
         pose_count += 1
         print('t=%.2f ch6=%d pose_msgs=%d' % (time.monotonic() - start, pwm, pose_count), flush=True)
         time.sleep(0.05)         # 20 Hz
@@ -111,6 +127,28 @@ for b in "$BAGDIR"/e2e_*.bag; do
   n=$(rosbag info "$b" | awk '/\/mavros\/local_position\/pose/{print $3}')
   [ "${n:-0}" -gt 10 ] || { echo "[FAIL] $b 里 pose 消息太少（$n）"; FAILED=1; }
 done
+RC_RECORD_TEST_DIR="$DIR" PYTHONPATH="$DIR:${PYTHONPATH:-}" python3 - "$BAGDIR" <<'CHECK_WINCH' || FAILED=1
+import glob, os, sys
+import rosbag, yaml
+from bag_recorder_node import DEFAULT_TOPICS, topic_type_registry
+expected = '/tether_winch_control/status'
+assert expected in DEFAULT_TOPICS
+assert expected in topic_type_registry()
+with open(os.path.join(os.environ['RC_RECORD_TEST_DIR'], 'rc_record.yaml')) as stream:
+    assert expected in yaml.safe_load(stream)['rc_bag_recorder']['topics']
+for path in glob.glob(os.path.join(sys.argv[1], 'e2e_*.bag')):
+    with rosbag.Bag(path) as bag:
+        rows = list(bag.read_messages(topics=[expected]))
+    assert len(rows) > 10, (path, len(rows))
+    for _, msg, stamp in rows:
+        assert msg._type == 'tether_winch_control/WinchStatus'
+        assert msg.mode in ('LOW', 'HIGH')
+        assert msg.target_duty == (220 if msg.mode == 'HIGH' else 10)
+        assert msg.last_sent_duty == msg.target_duty
+        assert not msg.hardware_feedback_valid
+        assert stamp == msg.header.stamp
+    print('[PASS] WinchStatus bag readback:', path, len(rows), 'messages')
+CHECK_WINCH
 echo
 if [ "$FAILED" -eq 0 ]; then echo "=== E2E 通过 ==="; else echo "=== E2E 失败 ==="; fi
 echo "（bag 留在 $BAGDIR，便于人工检查）"

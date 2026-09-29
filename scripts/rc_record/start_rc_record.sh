@@ -12,6 +12,9 @@ WS="$(cd "$DIR/../.." && pwd)"
 set +u
 source /opt/ros/noetic/setup.bash
 [ -f "$WS/devel/setup.bash" ] && source "$WS/devel/setup.bash"   # /livox/lidar 的 CustomMsg 需要
+# Extend rather than replace the MID360S environment: keep Livox messages available.
+ORANGE_SETUP="/home/orangepi/orange/devel/setup.bash"
+[ -f "$ORANGE_SETUP" ] && source "$ORANGE_SETUP" --extend
 set -u
 
 command -v rosparam >/dev/null 2>&1 || { echo "[FAIL] 找不到 rosparam（ROS 环境未就绪）" >&2; exit 1; }

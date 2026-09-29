@@ -104,7 +104,19 @@ rostopic echo /rc_record/bag_path    # latched："OPEN <path>" / "CLOSED <path>"
 | `bag_directory` / `bag_prefix` | `/home/orangepi/bags` / `handheld` | 输出位置与包名前缀 |
 | `record_raw_cloud` | `false` | true 额外录 `/livox/lidar`（约 +5 MB/s，需先 source mid360s_ws/devel） |
 | `status_rate` | `2.0` | `/rc_record/status` 频率 |
-| `topics` | 13 个（见 yaml） | 录制话题；类型必须在节点的登记表里，否则启动时跳过并报错 |
+| `topics` | 14 个（见 yaml） | 录制话题；类型必须在节点的登记表里，否则启动时跳过并报错 |
+
+## 绕线器状态记录
+
+默认话题列表已加入 `/tether_winch_control/status`，类型为
+`tether_winch_control/WinchStatus`。包含档位、距离、径向速度、目标DUTY、
+最近发送DUTY/时间和通信错误；这些是控制/发送状态，不是电机实际反馈。
+
+`start_rc_record.sh` 会在 MID360S 环境后追加加载
+`/home/orangepi/orange/devel/setup.bash --extend`，保留 Livox 消息环境。
+需要板端已经构建 `tether_winch_control` 消息；缺失时会明确告警并跳过此话题。
+录制器可先启动，绕线器状态发布者稍后出现时也能订阅；只有录包期间收到的消息会写入bag。
+配置修改后需重启录制器生效，不影响原来的RC触发规则，不启动绕线器节点。
 
 ## 行为约定
 
@@ -125,7 +137,7 @@ python3 test_rc_record_policy.py     # 纯逻辑，27 项断言
 ```
 
 E2E 脚本会在临时目录里用 `channels[5] = 1000/2000/1000/2000/1000` 的脚本翻转开关，
-期望得到 **2 个** bag，各含 pose 消息且都已正常收尾（无残留 `.bag.active`）。
+期望得到 **2 个** bag，各含 pose 和 WinchStatus 消息且都已正常收尾（无残留 `.bag.active`）。
 换端口跑：`./test_rc_record_e2e.sh 11378`（避免和别的 Master 撞）。
 
 ## 备注

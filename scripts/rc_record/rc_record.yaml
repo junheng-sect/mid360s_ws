@@ -28,6 +28,7 @@ rc_bag_recorder:
     - /mavros/vision_pose/pose_cov
     - /fastlio/vision_pose_cov
     - /fastlio/odom_world
+    - /tether_winch_control/status
     - /Odometry
     - /livox/imu
     - /tf

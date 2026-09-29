@@ -56,6 +56,7 @@ DEFAULT_TOPICS = [
     '/mavros/vision_pose/pose_cov',
     '/fastlio/vision_pose_cov',
     '/fastlio/odom_world',
+    '/tether_winch_control/status',
     '/Odometry',
     '/livox/imu',
     '/tf',
@@ -79,6 +80,12 @@ def topic_type_registry():
         '/tf': TFMessage,
         '/tf_static': TFMessage,
     }
+    try:
+        from tether_winch_control.msg import WinchStatus
+        registry['/tether_winch_control/status'] = WinchStatus
+    except ImportError:
+        rospy.logwarn('无法导入 tether_winch_control/WinchStatus；'
+                      '请构建 orange 工作空间并 source orange/devel/setup.bash --extend')
     try:
         from livox_ros_driver2.msg import CustomMsg
         registry['/livox/lidar'] = CustomMsg
