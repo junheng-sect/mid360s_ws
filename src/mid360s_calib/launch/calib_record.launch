@@ -1,0 +1,57 @@
+<launch>
+  <!--
+    外参标定录包：MAVROS + MID-360S 驱动 + 标定录包节点（遥控器通道 6 触发）。
+    只录 iKalibr 需要的原始数据：/livox/lidar、/livox/imu、/mavros/imu/data_raw、
+    /mavros/timesync_status；包在 bag_dir/bag_prefix_000001.bag。
+    录包期间把飞控 IMU（HIGHRES_IMU）临时请求到 imu_raw_rate（实测约 190 Hz），关包后恢复默认。
+
+      cd /home/orangepi/mid360s_ws && source devel/setup.bash
+      roslaunch mid360s_calib calib_record.launch              （可加 fastlio:=true）
+
+    不要和 scripts/fusion.sh、start_handheld_test.sh 同时运行：同一个 ROS Master 上
+    同名节点会把正在运行的 /mavros 踢掉，飞控串口也会冲突。
+    fastlio:=true 只额外起 FAST-LIO 用来现场确认雷达正常，不起桥接、不把位姿送飞控。
+  -->
+
+  <arg name="fcu_url"        default="/dev/ttyS4:921600"/>
+  <arg name="fcu_protocol"   default="v1.0"/>
+  <arg name="tgt_system"     default="1"/>
+  <arg name="tgt_component"  default="1"/>
+  <arg name="bag_dir"        default="/home/orangepi/bags/calib"/>
+  <arg name="bag_prefix"     default="calib"/>
+  <!-- 录包期间请求的飞控 IMU 频率；0 = 不改（保持默认 50 Hz） -->
+  <arg name="imu_raw_rate"   default="400"/>
+  <arg name="fastlio"        default="false"/>
+
+  <!-- 1) MAVROS：飞控串口（与 fusion.launch 相同参数） -->
+  <include file="$(find mavros)/launch/px4.launch">
+    <arg name="fcu_url"       value="$(arg fcu_url)"/>
+    <arg name="fcu_protocol"  value="$(arg fcu_protocol)"/>
+    <arg name="tgt_system"    value="$(arg tgt_system)"/>
+    <arg name="tgt_component" value="$(arg tgt_component)"/>
+    <arg name="gcs_url"       value=""/>
+    <arg name="log_output"    value="screen"/>
+  </include>
+
+  <!-- 2) MID-360S 驱动：CustomMsg（xfer_format=1），关 RViz、关驱动自带的录包 -->
+  <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360s.launch">
+    <arg name="rviz_enable"   value="false"/>
+    <arg name="rosbag_enable" value="false"/>
+  </include>
+
+  <!-- 3) 可选：FAST-LIO，只用于现场确认雷达数据正常 -->
+  <group if="$(arg fastlio)">
+    <include file="$(find fast_lio)/launch/mapping_mid360s.launch">
+      <arg name="rviz" value="false"/>
+    </include>
+  </group>
+
+  <!-- 4) 标定录包节点：退出即结束整个 launch -->
+  <node name="calib_bag_recorder" pkg="mid360s_calib" type="calib_bag_recorder.py"
+        output="screen" required="true">
+    <rosparam command="load" file="$(find mid360s_calib)/config/calib_record.yaml"/>
+    <param name="bag_directory"   value="$(arg bag_dir)"/>
+    <param name="bag_prefix"      value="$(arg bag_prefix)"/>
+    <param name="fcu_imu_rate_hz" value="$(arg imu_raw_rate)"/>
+  </node>
+</launch>

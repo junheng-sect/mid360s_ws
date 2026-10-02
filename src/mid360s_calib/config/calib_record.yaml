@@ -1,0 +1,23 @@
+# 标定录包节点 calib_bag_recorder 的私有参数（launch 里用 <rosparam> 加载到节点命名空间下）。
+# bag_directory / bag_prefix / fcu_imu_rate_hz 会被 calib_record.launch 的同名参数覆盖。
+
+# ---- 触发源：与平时飞行的 rc_record 相同，还是遥控器通道 6 ----
+rc_topic: /mavros/rc/in
+rc_channel: 6              # 1-based；飞控 RC_MAP_AUX1 也是 6，SDLOG_MODE=3 时 ulog 同起同停
+rc_threshold: 1650         # us；PX4 判据 aux1>0.3 约合 PWM>1650
+active_high: true          # true: PWM>=阈值 为触发位
+confirm_samples: 3         # 连续 N 拍一致才认账（去抖）
+release_tail_s: 1.0        # 松手后再录多久（期间重新拨下则继续同一个包）
+rc_warn_timeout_s: 5.0     # 多久收不到 RC 就告警
+stop_on_rc_loss: false     # false: RC 丢失不截断正在录的包
+
+# ---- 输出 ----
+bag_directory: /home/orangepi/bags/calib
+bag_prefix: calib          # calib_000001.bag，序号文件 .calib_sequence
+status_rate: 2.0           # /calib_record/status 发布频率
+status_topic: /calib_record/status
+bag_path_topic: /calib_record/bag_path
+
+# ---- 飞控 IMU（/mavros/imu/data_raw）----
+fcu_imu_rate_hz: 400.0     # 录包期间请求 HIGHRES_IMU 的频率；实测约 190 Hz（请求 200 只有约 158 Hz）；0 = 不改
+min_fcu_imu_hz: 150.0      # 关包体检：低于它就告警

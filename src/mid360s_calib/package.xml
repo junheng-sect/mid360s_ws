@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>mid360s_calib</name>
+  <version>0.1.0</version>
+  <description>
+    MID-360S 与飞控外参标定的数据采集：遥控器通道 6 触发录标定专用 bag
+    （原始点云 + 雷达 IMU + 飞控 IMU + 时间同步），录包期间临时提高飞控 IMU 频率。
+  </description>
+  <maintainer email="orangepi@orangepi5max.local">orangepi</maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>rosbag</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>mavros_msgs</exec_depend>
+  <exec_depend>mavros</exec_depend>
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>fast_lio</exec_depend>
+
+  <test_depend>python3-nose</test_depend>
+</package>

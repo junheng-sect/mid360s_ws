@@ -27,6 +27,8 @@ mid360s_ws/
 │   │   ├── launch/gravity_bridge.launch
 │   │   ├── include/fastlio_gravity_bridge/   # 对齐旋转与协方差变换（纯数学 + 节点类）
 │   │   └── test/                  # 数学 / 协方差 / 消息测试
+│   ├── mid360s_calib/             # 外参标定录包（通道 6 触发，原始点云 + 两路 IMU，详见包内 README）
+│   │   └── launch/calib_record.launch
 │   └── livox_ros_driver2/         # Livox ROS 驱动（已适配 MID-360S 与本地 SDK 路径）
 │       ├── config/MID360s_config.json
 │       ├── launch_ROS1/msg_MID360s.launch
@@ -227,6 +229,19 @@ python3 test_artifacts/check_base_link_attitude.py bags/20260918_pitch20_world.b
 bash test_artifacts/run_gravity_bridge_replay.sh            # 需先确保无同名 ROS 节点在跑
 source /opt/ros/noetic/setup.bash && python3 test_artifacts/analyze_gravity_bridge_replay.py
 ```
+
+### 外参标定录包（mid360s_calib）
+
+标定 MID-360S 与飞控 IMU 外参（iKalibr）时单独启动，不要与 `fusion.sh` 同时运行：
+
+```bash
+cd /home/orangepi/mid360s_ws && source devel/setup.bash
+roslaunch mid360s_calib calib_record.launch
+```
+
+通道 6 拨下开始录 `/home/orangepi/bags/calib/calib_*.bag`（`/livox/lidar`、`/livox/imu`、
+`/mavros/imu/data_raw`、`/mavros/timesync_status`），录包期间飞控 IMU 临时提到约 190 Hz，
+关包后恢复默认并打印体检摘要。平时飞行的录包不受影响。详见 `src/mid360s_calib/README.md`。
 
 ---
 
