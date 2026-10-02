@@ -145,14 +145,19 @@ world ──静态(q_a)──> camera_init ──FAST-LIO──> body ──静�
 
 安装旋转 `q_IB`（`body ← base_link`，即把机体系向量转到雷达 IMU 系）由 `mounting_source` 决定：
 
-- `fixed`（**默认**）：固定安装角 `q_IB = Ry(-mounting_pitch_deg)`，`mounting_pitch_deg` 默认
-  `20.0`，含义是**雷达相对机体的安装前倾角**（正值 = 前倾）。它只由参数决定、**与初始化重力无关**，
-  所以初始化时机体保持静止即可、**不要求水平**；换装或改角度只改这一个参数。
+- `fixed`（**默认**）：固定安装旋转。`mounting_roll_deg` / `mounting_pitch_deg` / `mounting_yaw_deg`
+  （度）描述**雷达 IMU 在机体系（base_link，FLU）中的姿态**，按 ROS 固定轴 RPY 组合：
+  `R_base←lidar = Rz(yaw)·Ry(pitch)·Rx(roll)`，节点内部取逆得到 `q_IB`。符号：pitch 正值 = 前倾
+  （机头向下，默认 `20.0`）；roll 正值 = 雷达右侧向下（默认 `0.0`）；yaw 正值 = 雷达前向朝左偏
+  （默认 `0.0`）。roll、yaw 为 0 时就是纯俯仰 `q_IB = Ry(-mounting_pitch_deg)`。它只由参数决定、
+  **与初始化重力无关**，所以初始化时机体保持静止即可、**不要求水平**。
+  标定结果的填法：iKalibr 以飞控 IMU（`/mavros/imu/data_raw`，MAVROS 已转 FLU）为 `ReferIMU` 时，
+  Livox IMU 的 `SO3_BiToBr` 就是 `R_base←lidar`，按 ZYX 欧拉角换算成 roll/pitch/yaw 填入。
 - `gravity`（兼容旧调用）：由本次初始化重力推导 `q_IB = q_a⁻¹`，前提是 **FAST-LIO 初始化时机体
   保持水平**；若初始化时机体本身倾斜，输出会把初始倾角一并当作安装角抵消，表现为读数偏小。
 - `none`：不做安装补偿（输出仍是雷达 IMU 姿态，此时把 `output_child_frame:=body` 一起改回去更合适）。
 
-非法的 `mounting_source` 或非有限的 `mounting_pitch_deg` 会让节点明确报错并拒绝启动，不会静默兜底。
+非法的 `mounting_source` 或非有限的安装角（roll / pitch / yaw）会让节点明确报错并拒绝启动，不会静默兜底。
 
 单独启动（FAST-LIO2 已在运行时）：
 
@@ -168,6 +173,10 @@ roslaunch fastlio_gravity_bridge gravity_bridge.launch send_to_mavros:=true
 
 # 改固定安装角（默认 20 度前倾）
 roslaunch fastlio_gravity_bridge gravity_bridge.launch mounting_pitch_deg:=20.0
+
+# 填完整安装旋转（例如标定结果）
+roslaunch fastlio_gravity_bridge gravity_bridge.launch \
+    mounting_roll_deg:=0.35 mounting_pitch_deg:=20.12 mounting_yaw_deg:=-0.80
 
 # 走旧的自动推导模式（要求初始化时机体水平）
 roslaunch fastlio_gravity_bridge gravity_bridge.launch mounting_source:=gravity

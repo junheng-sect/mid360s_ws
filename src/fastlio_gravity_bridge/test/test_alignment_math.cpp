@@ -59,23 +59,57 @@ Eigen::Matrix3d baseFromLidar(double mount_deg)
   return Eigen::AngleAxisd(mount_deg * kDeg, Eigen::Vector3d::UnitY()).toRotationMatrix();
 }
 
+/// 真实安装（完整旋转）：R_base<-lidar = R_z(yaw)·R_y(pitch)·R_x(roll)。
+/// 三个基本旋转按教科书公式逐元素手写，不经过 AngleAxis，避免复写实现。
+Eigen::Matrix3d baseFromLidarRpy(double roll_deg, double pitch_deg, double yaw_deg)
+{
+  const double cr = std::cos(roll_deg * kDeg), sr = std::sin(roll_deg * kDeg);
+  const double cp = std::cos(pitch_deg * kDeg), sp = std::sin(pitch_deg * kDeg);
+  const double cy = std::cos(yaw_deg * kDeg), sy = std::sin(yaw_deg * kDeg);
+  Eigen::Matrix3d Rx;
+  Rx << 1.0, 0.0, 0.0,
+        0.0, cr, -sr,
+        0.0, sr, cr;
+  Eigen::Matrix3d Ry;
+  Ry << cp, 0.0, sp,
+        0.0, 1.0, 0.0,
+        -sp, 0.0, cp;
+  Eigen::Matrix3d Rz;
+  Rz << cy, -sy, 0.0,
+        sy, cy, 0.0,
+        0.0, 0.0, 1.0;
+  return Rz * Ry * Rx;
+}
+
 /// 独立生成相机系（camera_init）下的雷达姿态：
 /// camera_init 与初始化时刻的雷达系重合，且 R_W<-lidar = R_wb · R_base<-lidar，于是
 ///   R_C<-lidar(t) = (R_W<-lidar(t0))ᵀ · R_W<-lidar(t)
 Eigen::Quaterniond cameraInitFromLidar(const Eigen::Matrix3d &R_wb_init,
+                                       const Eigen::Matrix3d &R_wb_now,
+                                       const Eigen::Matrix3d &R_base_lidar)
+{
+  const Eigen::Matrix3d R_w_lidar_init = R_wb_init * R_base_lidar;
+  const Eigen::Matrix3d R_w_lidar_now = R_wb_now * R_base_lidar;
+  return Eigen::Quaterniond(R_w_lidar_init.transpose() * R_w_lidar_now).normalized();
+}
+
+Eigen::Quaterniond cameraInitFromLidar(const Eigen::Matrix3d &R_wb_init,
                                        const Eigen::Matrix3d &R_wb_now, double mount_deg)
 {
-  const Eigen::Matrix3d R_w_lidar_init = R_wb_init * baseFromLidar(mount_deg);
-  const Eigen::Matrix3d R_w_lidar_now = R_wb_now * baseFromLidar(mount_deg);
-  return Eigen::Quaterniond(R_w_lidar_init.transpose() * R_w_lidar_now).normalized();
+  return cameraInitFromLidar(R_wb_init, R_wb_now, baseFromLidar(mount_deg));
 }
 
 /// 同一物理模型下的初始化重力（camera_init 下）：静止时机体只受重力，FAST-LIO 发布的
 /// grav 就是世界重力 (0,0,-g) 在初始化时刻雷达系里的表达。
+Eigen::Vector3d gravityFromBodyAttitude(const Eigen::Matrix3d &R_wb_init,
+                                        const Eigen::Matrix3d &R_base_lidar)
+{
+  return (R_wb_init * R_base_lidar).transpose() * Eigen::Vector3d(0.0, 0.0, -kGravity);
+}
+
 Eigen::Vector3d gravityFromBodyAttitude(const Eigen::Matrix3d &R_wb_init, double mount_deg)
 {
-  return (R_wb_init * baseFromLidar(mount_deg)).transpose() *
-         Eigen::Vector3d(0.0, 0.0, -kGravity);
+  return gravityFromBodyAttitude(R_wb_init, baseFromLidar(mount_deg));
 }
 
 /// 姿态相对真实世界竖直方向（+Z）的倾角（度）：绕竖直轴的偏航不影响它。
@@ -590,6 +624,128 @@ TEST(GravityAlignmentMath, MountingChoiceDoesNotChangePositionOrCovariance)
                      (q_out_none * q_fixed).normalized().toRotationMatrix(), 1e-15);
   expectRotationNear(q_out_gravity.toRotationMatrix(),
                      (q_out_none * q_gravity).normalized().toRotationMatrix(), 1e-15);
+}
+
+// ---------------------------------------------------------------------------
+// 完整安装旋转（fixed 模式的 roll / pitch / yaw）的验收用例。
+// ---------------------------------------------------------------------------
+
+/// roll = yaw = 0 时三参版本严格退化为原来的纯俯仰补偿 q_IB = R_y(-pitch)。
+TEST(GravityAlignmentMath, FixedMountingRpyReducesToPitchOnly)
+{
+  for (const double pitch_deg : {kMountPitchDeg, 0.0, -8.0})
+  {
+    Eigen::Quaterniond q_pitch_only;
+    Eigen::Quaterniond q_rpy;
+    ASSERT_TRUE(fgb::computeFixedMounting(pitch_deg, q_pitch_only));
+    ASSERT_TRUE(fgb::computeFixedMounting(0.0, pitch_deg, 0.0, q_rpy));
+    expectQuaternionNear(q_rpy, q_pitch_only, 0.0);
+    expectRotationNear(q_rpy.toRotationMatrix(), pitchBodyToWorld(-pitch_deg), 1e-15);
+  }
+}
+
+/// 完整安装旋转：q_IB 的逆就是 R_base<-lidar = R_z(yaw)·R_y(pitch)·R_x(roll)，
+/// 并逐轴核对正负号的物理含义。
+TEST(GravityAlignmentMath, FixedMountingRpyInvertsFullLidarRotation)
+{
+  struct RpyCase
+  {
+    double roll, pitch, yaw;
+  };
+  for (const RpyCase &c : {RpyCase{0.35, 20.12, -0.80}, RpyCase{5.0, -12.0, 30.0}})
+  {
+    Eigen::Quaterniond q_ib;
+    ASSERT_TRUE(fgb::computeFixedMounting(c.roll, c.pitch, c.yaw, q_ib));
+    EXPECT_NEAR(q_ib.norm(), 1.0, 1e-15);
+    expectRotationNear(q_ib.toRotationMatrix().transpose(),
+                       baseFromLidarRpy(c.roll, c.pitch, c.yaw), 1e-14);
+  }
+
+  // 单轴符号：q_IB 的逆把雷达系的轴表达到机体系（FLU）里。
+  Eigen::Quaterniond q_ib;
+  // roll 正值 = 雷达右侧向下：雷达 +Y（左）在机体系里抬高。
+  ASSERT_TRUE(fgb::computeFixedMounting(10.0, 0.0, 0.0, q_ib));
+  EXPECT_GT((q_ib.conjugate() * Eigen::Vector3d::UnitY()).z(), 0.1);
+  // pitch 正值 = 前倾：雷达 +X（前）在机体系里朝下。
+  ASSERT_TRUE(fgb::computeFixedMounting(0.0, 10.0, 0.0, q_ib));
+  EXPECT_LT((q_ib.conjugate() * Eigen::Vector3d::UnitX()).z(), -0.1);
+  // yaw 正值 = 雷达前向朝左偏：雷达 +X 在机体系里带 +Y（左）分量。
+  ASSERT_TRUE(fgb::computeFixedMounting(0.0, 0.0, 10.0, q_ib));
+  EXPECT_GT((q_ib.conjugate() * Eigen::Vector3d::UnitX()).y(), 0.1);
+}
+
+/// 完整旋转安装下，水平 / 前倾 / 横滚三种启动都满足：输出 = 恒定的纯竖直轴偏航基准 ·
+/// 真实机体姿态，因此倾角如实、任意两次输出之间的相对旋转与真实机体一致。
+/// 安装 roll / yaw 刻意取得较大，旋转顺序或方向写错都会明显超差。
+TEST(GravityAlignmentMath, FixedMountingRpyTracksTrueAttitude)
+{
+  const double kRoll = 3.0;
+  const double kPitch = 20.12;
+  const double kYaw = -5.0;
+  const Eigen::Matrix3d R_base_lidar = baseFromLidarRpy(kRoll, kPitch, kYaw);
+  Eigen::Quaterniond q_ib;
+  ASSERT_TRUE(fgb::computeFixedMounting(kRoll, kPitch, kYaw, q_ib));
+
+  const std::vector<std::pair<std::string, Eigen::Matrix3d>> starts = {
+      {"机体水平", Eigen::Matrix3d::Identity()},
+      {"前倾 10 度", pitchBodyToWorld(10.0)},
+      {"横滚 15 度", Eigen::AngleAxisd(15.0 * kDeg, Eigen::Vector3d::UnitX()).toRotationMatrix()},
+  };
+  const std::vector<std::pair<std::string, Eigen::Matrix3d>> later = {
+      {"水平", Eigen::Matrix3d::Identity()},
+      {"纯偏航 25 度", Eigen::AngleAxisd(25.0 * kDeg, Eigen::Vector3d::UnitZ()).toRotationMatrix()},
+      {"纯俯仰 -10 度", pitchBodyToWorld(-10.0)},
+      {"偏航-俯仰-横滚组合",
+       (Eigen::AngleAxisd(-40.0 * kDeg, Eigen::Vector3d::UnitZ()) *
+        Eigen::AngleAxisd(8.0 * kDeg, Eigen::Vector3d::UnitY()) *
+        Eigen::AngleAxisd(-6.0 * kDeg, Eigen::Vector3d::UnitX()))
+           .toRotationMatrix()},
+  };
+
+  for (const auto &s : starts)
+  {
+    fgb::AlignmentTransform transform;
+    ASSERT_TRUE(fgb::computeAlignmentTransform(gravityFromBodyAttitude(s.second, R_base_lidar),
+                                               transform));
+    const Eigen::Quaterniond q_out_init =
+        transformOrientation(transform, q_ib, Eigen::Quaterniond::Identity());
+    // 重力对齐定不了航向：偏航基准只能是绕竖直轴的旋转。
+    const Eigen::Matrix3d gauge = q_out_init.toRotationMatrix() * s.second.transpose();
+    EXPECT_LT((gauge * Eigen::Vector3d::UnitZ() - Eigen::Vector3d::UnitZ()).norm(), 1e-12)
+        << s.first;
+
+    for (const auto &c : later)
+    {
+      const Eigen::Quaterniond q_out = transformOrientation(
+          transform, q_ib, cameraInitFromLidar(s.second, c.second, R_base_lidar));
+      const Eigen::Matrix3d R_out = q_out.toRotationMatrix();
+      // 偏航基准恒定：R_out = gauge · R_wb。
+      expectRotationNear(R_out * c.second.transpose(), gauge, 1e-12);
+      // 相对旋转忠实复现。
+      expectRotationNear((q_out_init.conjugate() * q_out).toRotationMatrix(),
+                         s.second.transpose() * c.second, 1e-12);
+      // 倾角如实：机体 +Z 的竖直分量（倾角余弦）一致。
+      EXPECT_NEAR((R_out * Eigen::Vector3d::UnitZ()).z(), (c.second * Eigen::Vector3d::UnitZ()).z(),
+                  1e-12)
+          << s.first << " / " << c.first;
+    }
+  }
+}
+
+/// roll / pitch / yaw 任一非有限都必须被拒绝，且不修改输出。
+TEST(GravityAlignmentMath, FixedMountingRpyRejectsNonFiniteAngles)
+{
+  Eigen::Quaterniond out;
+  ASSERT_TRUE(fgb::computeFixedMounting(0.35, 20.12, -0.80, out));
+  const Eigen::Quaterniond keep = out;
+  const double kInf = std::numeric_limits<double>::infinity();
+  for (const double bad : {std::numeric_limits<double>::quiet_NaN(), kInf, -kInf})
+  {
+    EXPECT_FALSE(fgb::computeFixedMounting(bad, 20.0, 0.0, out));
+    EXPECT_FALSE(fgb::computeFixedMounting(0.0, bad, 0.0, out));
+    EXPECT_FALSE(fgb::computeFixedMounting(0.0, 20.0, bad, out));
+  }
+  expectQuaternionNear(out, keep, 0.0);
 }
 
 int main(int argc, char **argv)

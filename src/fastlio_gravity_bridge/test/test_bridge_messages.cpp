@@ -48,6 +48,15 @@ Eigen::Quaterniond expectedFixedMounting(double pitch_deg)
       Eigen::AngleAxisd(-pitch_deg * M_PI / 180.0, Eigen::Vector3d::UnitY()));
 }
 
+/// fixed 模式完整安装旋转的真值：R_base<-lidar = R_z(yaw)·R_y(pitch)·R_x(roll)（矩阵相乘）。
+Eigen::Matrix3d baseFromLidarRpy(double roll_deg, double pitch_deg, double yaw_deg)
+{
+  const double deg = M_PI / 180.0;
+  return Eigen::AngleAxisd(yaw_deg * deg, Eigen::Vector3d::UnitZ()).toRotationMatrix() *
+         Eigen::AngleAxisd(pitch_deg * deg, Eigen::Vector3d::UnitY()).toRotationMatrix() *
+         Eigen::AngleAxisd(roll_deg * deg, Eigen::Vector3d::UnitX()).toRotationMatrix();
+}
+
 /// 自旋等待，直到条件满足或超时。
 template <typename Predicate>
 bool spinUntil(Predicate predicate, double timeout_sec)
@@ -382,6 +391,20 @@ TEST_F(BridgeMessagesTest, InvalidMountingConfigurationStopsTheBridge)
   bridge_.reset(new fgb::GravityBridge(*nh_, config_));
   EXPECT_EQ(bridge_->state(), fgb::GravityBridge::State::kFatal);
   EXPECT_FALSE(bridge_->fatalReason().empty());
+
+  // 非有限的安装横滚 / 偏航也拒绝
+  config_.mounting_pitch_deg = kMountPitchDeg;
+  config_.mounting_roll_deg = std::numeric_limits<double>::quiet_NaN();
+  bridge_.reset(new fgb::GravityBridge(*nh_, config_));
+  EXPECT_EQ(bridge_->state(), fgb::GravityBridge::State::kFatal);
+  EXPECT_NE(bridge_->fatalReason().find("mounting_roll_deg"), std::string::npos)
+      << bridge_->fatalReason();
+
+  config_.mounting_roll_deg = 0.0;
+  config_.mounting_yaw_deg = std::numeric_limits<double>::infinity();
+  bridge_.reset(new fgb::GravityBridge(*nh_, config_));
+  EXPECT_EQ(bridge_->state(), fgb::GravityBridge::State::kFatal);
+  EXPECT_FALSE(bridge_->fatalReason().empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -404,17 +427,24 @@ TEST(BridgeConfigValidation, DefaultsToFixedTwentyDegrees)
   EXPECT_TRUE(config.valid) << config.error;
   EXPECT_EQ(config.mounting_source, "fixed");
   EXPECT_DOUBLE_EQ(config.mounting_pitch_deg, kMountPitchDeg);
+  // 默认安装横滚、偏航为 0：保持纯俯仰的旧行为
+  EXPECT_DOUBLE_EQ(config.mounting_roll_deg, 0.0);
+  EXPECT_DOUBLE_EQ(config.mounting_yaw_deg, 0.0);
 }
 
 TEST(BridgeConfigValidation, ReadsExplicitMountingParameters)
 {
   ros::param::set("/test_bridge_config_explicit/mounting_source", std::string("fixed"));
+  ros::param::set("/test_bridge_config_explicit/mounting_roll_deg", 0.35);
   ros::param::set("/test_bridge_config_explicit/mounting_pitch_deg", 17.5);
+  ros::param::set("/test_bridge_config_explicit/mounting_yaw_deg", -0.8);
 
   const fgb::GravityBridge::Config config = loadConfigFrom("/test_bridge_config_explicit");
   EXPECT_TRUE(config.valid) << config.error;
   EXPECT_EQ(config.mounting_source, "fixed");
+  EXPECT_DOUBLE_EQ(config.mounting_roll_deg, 0.35);
   EXPECT_DOUBLE_EQ(config.mounting_pitch_deg, 17.5);
+  EXPECT_DOUBLE_EQ(config.mounting_yaw_deg, -0.8);
 }
 
 TEST(BridgeConfigValidation, KeepsLegacySourcesWorking)
@@ -449,6 +479,19 @@ TEST(BridgeConfigValidation, RejectsNonFiniteMountingPitch)
   const fgb::GravityBridge::Config config = loadConfigFrom("/test_bridge_config_nan_pitch");
   EXPECT_FALSE(config.valid);
   EXPECT_FALSE(config.error.empty());
+}
+
+TEST(BridgeConfigValidation, RejectsNonFiniteMountingRollOrYaw)
+{
+  for (const std::string name : {"mounting_roll_deg", "mounting_yaw_deg"})
+  {
+    const std::string ns = "/test_bridge_config_nan_" + name;
+    ros::param::set(ns + "/mounting_source", std::string("fixed"));
+    ros::param::set(ns + "/" + name, std::numeric_limits<double>::quiet_NaN());
+    const fgb::GravityBridge::Config config = loadConfigFrom(ns);
+    EXPECT_FALSE(config.valid) << name;
+    EXPECT_NE(config.error.find(name), std::string::npos) << config.error;
+  }
 }
 
 /// latched 重力：桥接节点晚于发布者启动（订阅发生在发布之后）也能拿到初始化重力。
@@ -759,6 +802,81 @@ TEST_F(BridgeMessagesTest, PublishesStaticTransform)
   const Eigen::Quaterniond q_static_chain =
       (q * q_mount).normalized();
   EXPECT_LT((q_static_chain.toRotationMatrix() - q_composed.toRotationMatrix())
+                .cwiseAbs().maxCoeff(),
+            1e-12);
+}
+
+/// fixed 模式的完整安装旋转（roll / pitch / yaw）：安装旋转、body -> base_link 静态 TF、
+/// 输出姿态 q_a ⊗ q_cb ⊗ q_IB 三者一致。坐标系名与其它用例分开，避免静态 TF 互相干扰。
+TEST_F(BridgeMessagesTest, FixedMountingUsesFullRpy)
+{
+  config_.mounting_roll_deg = 0.35;
+  config_.mounting_pitch_deg = 20.12;
+  config_.mounting_yaw_deg = -0.80;
+  config_.world_frame = "world_rpy";
+  config_.input_frame = "camera_init_rpy";
+  config_.input_child_frame = "body_rpy";
+  config_.output_child_frame = "base_link_rpy";
+  config_.publish_static_tf = true;
+  tf2_ros::Buffer tf_buffer;
+  tf2_ros::TransformListener tf_listener(tf_buffer);
+
+  startBridge();
+  // 构造时即按三个角度确定安装旋转：q_IB = (R_base<-lidar)⁻¹，与初始化重力无关
+  const Eigen::Matrix3d R_base_lidar = baseFromLidarRpy(0.35, 20.12, -0.80);
+  EXPECT_LT((bridge_->mounting().toRotationMatrix() - R_base_lidar.transpose())
+                .cwiseAbs().maxCoeff(),
+            1e-14);
+
+  // 机体水平启动：初始化重力是世界重力在雷达系里的表达
+  publishGravity(R_base_lidar.transpose() * Eigen::Vector3d(0.0, 0.0, -kGravity), 700.0,
+                 "camera_init_rpy");
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  publishOdom(700.5, "camera_init_rpy", "body_rpy");
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 0; }, 5.0));
+  EXPECT_EQ(last_odom_.header.frame_id, "world_rpy");
+  EXPECT_EQ(last_odom_.child_frame_id, "base_link_rpy");
+  const Eigen::Quaterniond q_out(last_odom_.pose.pose.orientation.w,
+                                 last_odom_.pose.pose.orientation.x,
+                                 last_odom_.pose.pose.orientation.y,
+                                 last_odom_.pose.pose.orientation.z);
+  const Eigen::Quaterniond q_expected =
+      (bridge_->alignment().q * odom_orientation_ * bridge_->mounting()).normalized();
+  EXPECT_LT((q_out.toRotationMatrix() - q_expected.toRotationMatrix()).cwiseAbs().maxCoeff(),
+            1e-12);
+
+  // 与初始化时刻相同的雷达姿态（q_CI = I）：机体水平，输出只剩绕竖直轴的偏航基准
+  odom_orientation_ = Eigen::Quaterniond::Identity();
+  publishOdom(701.0, "camera_init_rpy", "body_rpy");
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ > 1; }, 5.0));
+  const Eigen::Quaterniond q_level(last_odom_.pose.pose.orientation.w,
+                                   last_odom_.pose.pose.orientation.x,
+                                   last_odom_.pose.pose.orientation.y,
+                                   last_odom_.pose.pose.orientation.z);
+  EXPECT_NEAR((q_level * Eigen::Vector3d::UnitZ()).z(), 1.0, 1e-12);
+
+  // body -> base_link 静态 TF 就是同一个安装旋转，平移为零
+  geometry_msgs::TransformStamped mount;
+  ASSERT_TRUE(spinUntil(
+      [&] {
+        try
+        {
+          mount = tf_buffer.lookupTransform("body_rpy", "base_link_rpy", ros::Time(0));
+          return true;
+        }
+        catch (const tf2::TransformException &)
+        {
+          return false;
+        }
+      },
+      5.0));
+  EXPECT_NEAR(mount.transform.translation.x, 0.0, 1e-15);
+  EXPECT_NEAR(mount.transform.translation.y, 0.0, 1e-15);
+  EXPECT_NEAR(mount.transform.translation.z, 0.0, 1e-15);
+  const Eigen::Quaterniond q_mount(mount.transform.rotation.w, mount.transform.rotation.x,
+                                   mount.transform.rotation.y, mount.transform.rotation.z);
+  EXPECT_LT((q_mount.toRotationMatrix() - bridge_->mounting().toRotationMatrix())
                 .cwiseAbs().maxCoeff(),
             1e-12);
 }

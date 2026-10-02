@@ -30,7 +30,7 @@ inline bool mountingSourceIsKnown(const std::string &source)
 /// （本轮不做杆臂补偿，由下游/飞控参数处理）。
 ///
 /// 安装旋转 q_IB（body <- base_link）由 mounting_source 决定：
-///  - fixed（默认）：用 mounting_pitch_deg 指定的固定安装角，不依赖初始化重力，
+///  - fixed（默认）：用 mounting_roll/pitch/yaw_deg 指定的固定安装旋转，不依赖初始化重力，
 ///    因此初始化时机体**保持静止即可，不要求水平**；
 ///  - gravity：由初始化重力推导 q_IB = q_a⁻¹，前提是初始化时机体水平；
 ///  - none：不做安装补偿，输出仍是雷达 IMU 姿态。
@@ -61,9 +61,13 @@ class GravityBridge
     /// "gravity" = 由初始化重力推导 q_IB = q_a⁻¹（前提：初始化时机体水平）；
     /// "none" = 不做安装补偿（输出仍是雷达 IMU 姿态）。
     std::string mounting_source = "fixed";
-    /// 雷达相对机体的安装前倾角（度，正值 = 前倾），仅 mounting_source=fixed 生效。
-    /// 内部取逆作为右乘补偿，即 q_IB = R_y(-mounting_pitch_deg)。
+    /// 雷达 IMU 相对机体的安装姿态（度），仅 mounting_source=fixed 生效：
+    /// R_base<-lidar = R_z(yaw)·R_y(pitch)·R_x(roll)，内部取逆作为右乘补偿 q_IB。
+    /// pitch 正值 = 前倾；roll 正值 = 雷达右侧向下；yaw 正值 = 雷达前向朝左偏。
+    /// roll、yaw 默认 0，即纯俯仰 q_IB = R_y(-mounting_pitch_deg)。
+    double mounting_roll_deg = 0.0;
     double mounting_pitch_deg = 20.0;
+    double mounting_yaw_deg = 0.0;
     std::string mavros_pose_cov_topic = "/mavros/vision_pose/pose_cov";
     bool publish_static_tf = true;
     bool send_to_mavros = false;

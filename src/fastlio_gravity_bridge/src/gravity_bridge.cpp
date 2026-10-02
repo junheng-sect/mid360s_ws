@@ -8,6 +8,20 @@
 namespace fastlio_gravity_bridge
 {
 
+namespace
+{
+
+/// fixed 模式安装角非法时的统一报错文本（构造与参数加载两处共用）。
+std::string fixedMountingError(const GravityBridge::Config &config)
+{
+  return "mounting_roll_deg=" + std::to_string(config.mounting_roll_deg) +
+         ", mounting_pitch_deg=" + std::to_string(config.mounting_pitch_deg) +
+         ", mounting_yaw_deg=" + std::to_string(config.mounting_yaw_deg) +
+         " contains a non-finite angle (fixed mounting)";
+}
+
+}  // namespace
+
 GravityBridge::GravityBridge(ros::NodeHandle &nh, const Config &config) : config_(config)
 {
   // 先把安装旋转定下来：fixed 只取决于参数，与初始化重力无关。配置非法时直接进入
@@ -50,19 +64,21 @@ bool GravityBridge::resolveMounting()
   if (config_.mounting_source == "fixed")
   {
     Eigen::Quaterniond q_ib;
-    if (!computeFixedMounting(config_.mounting_pitch_deg, q_ib))
+    if (!computeFixedMounting(config_.mounting_roll_deg, config_.mounting_pitch_deg,
+                              config_.mounting_yaw_deg, q_ib))
     {
-      enterFatalState("mounting_pitch_deg=" + std::to_string(config_.mounting_pitch_deg) +
-                      " is not a finite angle (fixed mounting)");
+      enterFatalState(fixedMountingError(config_));
       return false;
     }
     mounting_ = q_ib;
     // fixed 模式只要求初始化时静止（FAST-LIO 需要静态段做重力初始化），不要求水平：
     // 输出保留机体的真实倾角，不再把它当作安装角抵掉。
-    ROS_INFO("[gravity_bridge] mounting_source=fixed: LiDAR %.6f deg forward-tilted vs body, "
-             "applying q_IB = Ry(-%.6f deg) on the right; independent of init gravity "
-             "(init must be static, level is not required).",
-             config_.mounting_pitch_deg, config_.mounting_pitch_deg);
+    ROS_INFO("[gravity_bridge] mounting_source=fixed: LiDAR vs body roll=%.6f pitch=%.6f "
+             "yaw=%.6f deg (R_base<-lidar = Rz*Ry*Rx), applying its inverse q_IB=(%.12f, %.12f, "
+             "%.12f, %.12f) [xyzw] on the right; independent of init gravity (init must be "
+             "static, level is not required).",
+             config_.mounting_roll_deg, config_.mounting_pitch_deg, config_.mounting_yaw_deg,
+             mounting_.x(), mounting_.y(), mounting_.z(), mounting_.w());
     return true;
   }
 
@@ -94,7 +110,9 @@ GravityBridge::Config GravityBridge::loadConfig(ros::NodeHandle &pnh)
   pnh.param<std::string>("output_child_frame", config.output_child_frame,
                          config.output_child_frame);
   pnh.param<std::string>("mounting_source", config.mounting_source, config.mounting_source);
+  pnh.param<double>("mounting_roll_deg", config.mounting_roll_deg, config.mounting_roll_deg);
   pnh.param<double>("mounting_pitch_deg", config.mounting_pitch_deg, config.mounting_pitch_deg);
+  pnh.param<double>("mounting_yaw_deg", config.mounting_yaw_deg, config.mounting_yaw_deg);
   pnh.param<std::string>("mavros_pose_cov_topic", config.mavros_pose_cov_topic,
                          config.mavros_pose_cov_topic);
   pnh.param<bool>("publish_static_tf", config.publish_static_tf, config.publish_static_tf);
@@ -113,11 +131,11 @@ GravityBridge::Config GravityBridge::loadConfig(ros::NodeHandle &pnh)
   if (config.mounting_source == "fixed")
   {
     Eigen::Quaterniond q_ib;
-    if (!computeFixedMounting(config.mounting_pitch_deg, q_ib))
+    if (!computeFixedMounting(config.mounting_roll_deg, config.mounting_pitch_deg,
+                              config.mounting_yaw_deg, q_ib))
     {
       config.valid = false;
-      config.error = "mounting_pitch_deg=" + std::to_string(config.mounting_pitch_deg) +
-                     " is not a finite angle (fixed mounting)";
+      config.error = fixedMountingError(config);
       ROS_ERROR("[gravity_bridge] %s; refusing to start.", config.error.c_str());
       return config;
     }
@@ -259,11 +277,12 @@ void GravityBridge::gravityCallback(const geometry_msgs::Vector3Stamped::ConstPt
   {
     // fixed 模式的安装旋转与初始化重力无关，真正的倾角由输出姿态如实保留。
     const Eigen::AngleAxisd tilt(alignment_.q);
-    ROS_INFO("[gravity_bridge] fixed mounting %s->%s kept unchanged (Ry(-%.6f deg)); init gravity "
-             "tilt %.6f deg about (%.6f, %.6f, %.6f) is preserved in the output",
+    ROS_INFO("[gravity_bridge] fixed mounting %s->%s kept unchanged (roll=%.6f pitch=%.6f "
+             "yaw=%.6f deg); init gravity tilt %.6f deg about (%.6f, %.6f, %.6f) is preserved "
+             "in the output",
              config_.input_child_frame.c_str(), config_.output_child_frame.c_str(),
-             config_.mounting_pitch_deg, tilt.angle() * 180.0 / M_PI, tilt.axis().x(),
-             tilt.axis().y(), tilt.axis().z());
+             config_.mounting_roll_deg, config_.mounting_pitch_deg, config_.mounting_yaw_deg,
+             tilt.angle() * 180.0 / M_PI, tilt.axis().x(), tilt.axis().y(), tilt.axis().z());
   }
 
   if (config_.publish_static_tf) publishStaticTransform();

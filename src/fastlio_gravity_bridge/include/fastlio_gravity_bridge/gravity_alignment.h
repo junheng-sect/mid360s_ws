@@ -195,20 +195,36 @@ inline Eigen::Quaterniond mountingFromAlignment(const AlignmentTransform &alignm
 /// 固定安装旋转（mounting_source=fixed，默认）：从参数指定的安装角直接构造 q_IB，
 /// 只由配置决定，**不依赖初始化重力**，因此允许初始化时机体不水平。
 ///
-/// mounting_pitch_deg 是雷达相对机体的安装前倾角（度）：正值 = 前倾，即雷达系相对机体
-/// 系绕 +Y 转 +pitch（R_base<-lidar = R_y(+pitch)，机头向下）。右乘补偿取它的逆：
-///   q_IB = R_y(-mounting_pitch_deg)
-/// 装配后雷达系看到的"水平前推"因此回到机体系；安装横滚、偏航为 0。
-/// 非有限角度（含换算成弧度后溢出的极端值）返回 false 且不修改 out。
-inline bool computeFixedMounting(double mounting_pitch_deg, Eigen::Quaterniond &out)
+/// 三个角度（度）描述雷达 IMU 系在机体系（base_link，FLU）中的姿态，按 ROS 固定轴 RPY
+/// （与 tf static_transform_publisher / setRPY 同序）组合：
+///   R_base<-lidar = R_z(yaw) · R_y(pitch) · R_x(roll)
+///  - pitch 正值 = 前倾（绕 +Y，机头向下）；
+///  - roll  正值 = 绕 +X，雷达右侧向下；
+///  - yaw   正值 = 绕 +Z，雷达前向朝左偏。
+/// 右乘补偿取它的逆：q_IB = (R_base<-lidar)⁻¹；roll = yaw = 0 时就是 R_y(-pitch)。
+/// 装配后雷达系看到的"水平前推"因此回到机体系。
+/// 任一非有限角度（含换算成弧度后溢出的极端值）返回 false 且不修改 out。
+inline bool computeFixedMounting(double mounting_roll_deg, double mounting_pitch_deg,
+                                 double mounting_yaw_deg, Eigen::Quaterniond &out)
 {
-  if (!std::isfinite(mounting_pitch_deg)) return false;
+  if (!isFiniteVector3(mounting_roll_deg, mounting_pitch_deg, mounting_yaw_deg)) return false;
+  const double roll_rad = mounting_roll_deg * (M_PI / 180.0);
   const double pitch_rad = mounting_pitch_deg * (M_PI / 180.0);
-  if (!std::isfinite(pitch_rad)) return false;
-  const Eigen::Quaterniond q(Eigen::AngleAxisd(-pitch_rad, Eigen::Vector3d::UnitY()));
+  const double yaw_rad = mounting_yaw_deg * (M_PI / 180.0);
+  if (!isFiniteVector3(roll_rad, pitch_rad, yaw_rad)) return false;
+  const Eigen::Quaterniond q_base_lidar = Eigen::AngleAxisd(yaw_rad, Eigen::Vector3d::UnitZ()) *
+                                          Eigen::AngleAxisd(pitch_rad, Eigen::Vector3d::UnitY()) *
+                                          Eigen::AngleAxisd(roll_rad, Eigen::Vector3d::UnitX());
+  const Eigen::Quaterniond q = q_base_lidar.conjugate();
   if (!quaternionIsValid(q)) return false;
   out = q.normalized();
   return true;
+}
+
+/// 纯俯仰安装（安装横滚、偏航为 0）：q_IB = R_y(-mounting_pitch_deg)。
+inline bool computeFixedMounting(double mounting_pitch_deg, Eigen::Quaterniond &out)
+{
+  return computeFixedMounting(0.0, mounting_pitch_deg, 0.0, out);
 }
 
 /// 参考实现：把 IKFoM 前六维状态误差协方差 P6 = [pos, rot] 转换到固定坐标系下
