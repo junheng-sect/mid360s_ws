@@ -19,6 +19,8 @@ src/FAST_LIO/Log/*.png
 src/FAST_LIO/Log/*.csv
 src/FAST_LIO/Log/*.pdf
 src/FAST_LIO/PCD/*.pcd
+src/LiDAR_IMU_Init/Log/*.txt
+src/LiDAR_IMU_Init/result/*.txt
 
 # System and editor files
 .vscode/
