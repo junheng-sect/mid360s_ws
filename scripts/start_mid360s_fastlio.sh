@@ -7,7 +7,8 @@ set -euo pipefail
 # 用法: ./start_mid360s_fastlio.sh [--check] [--send-to-mavros]
 #   --send-to-mavros   把带协方差位姿输出改为 /mavros/vision_pose/pose_cov
 #
-# 提示：桥接默认用固定安装补偿（mounting_source:=fixed，雷达相对机体前倾 20 度），
+# 提示：桥接默认用固定安装补偿（mounting_source:=fixed，实测安装角 roll 0.5 /
+# pitch 18.8 / yaw 1.6 度，取 gravity_bridge.launch 的默认值），
 # 初始化时机体保持静止即可、**无须水平**；改安装角用 gravity_bridge.launch 的
 # mounting_roll_deg / mounting_pitch_deg / mounting_yaw_deg 参数。旧的
 # mounting_source:=gravity 才要求初始化时机体水平。

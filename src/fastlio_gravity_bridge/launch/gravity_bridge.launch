@@ -16,9 +16,13 @@
     倾角当作安装角抵消）。三个角度（度）描述雷达 IMU 在机体系（FLU）中的姿态：
       R_base<-lidar = Rz(yaw) · Ry(pitch) · Rx(roll)   （ROS 固定轴 RPY 顺序）
     节点内部取逆作为右乘补偿 q_IB。符号：
-      mounting_pitch_deg 正值 = 前倾（机头向下），默认 20.0；
-      mounting_roll_deg  正值 = 雷达右侧向下，默认 0.0；
-      mounting_yaw_deg   正值 = 雷达前向朝左偏，默认 0.0。
+      mounting_pitch_deg 正值 = 前倾（机头向下），默认 18.8；
+      mounting_roll_deg  正值 = 雷达右侧向下，默认 0.5；
+      mounting_yaw_deg   正值 = 雷达前向朝左偏，默认 1.6。
+    默认值是本机实测安装角（替代原设计名义值 0/20/0）：roll/pitch 取 10.3 台架双 IMU 与
+    LI-Init 初始化的一致结果，yaw 取 10.4 飞行双脉冲结果（与台架 +1.7 同号）。飞行报告
+    里写的是 FRD 下 yaw −1.6（雷达前向在机头左侧 1.6 度），换到这里的 FLU 是 +1.6。
+    节点代码里的默认值仍是 0/20/0（单元测试依赖），不经本文件启动时需显式传参。
     roll、yaw 都为 0 时即纯俯仰 q_IB = Ry(-mounting_pitch_deg)，与旧行为一致。
     标定结果（如 iKalibr 以飞控 IMU 为参考时 Livox IMU 的 SO3_BiToBr = R_base<-lidar）
     按 ZYX 换算成 roll/pitch/yaw 填入，例如：
@@ -48,9 +52,9 @@
   <arg name="input_child_frame"  default="body" />
   <arg name="output_child_frame" default="base_link" />
   <arg name="mounting_source"    default="fixed" />
-  <arg name="mounting_roll_deg"  default="0.0" />
-  <arg name="mounting_pitch_deg" default="20.0" />
-  <arg name="mounting_yaw_deg"   default="0.0" />
+  <arg name="mounting_roll_deg"  default="0.5" />
+  <arg name="mounting_pitch_deg" default="18.8" />
+  <arg name="mounting_yaw_deg"   default="1.6" />
   <arg name="publish_static_tf"  default="true" />
   <arg name="mavros_pose_cov_topic" default="/mavros/vision_pose/pose_cov" />
 

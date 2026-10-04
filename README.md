@@ -134,7 +134,7 @@ source devel/setup.bash
 | `/fastlio/vision_pose_cov` | `geometry_msgs/PoseWithCovarianceStamped` | 输出（与上面同一位姿与协方差） |
 | `/tf_static` | — | `world → camera_init`（对齐旋转）与 `body → base_link`（机体安装旋转），本工作空间内唯一的发布者 |
 
-**姿态表示机体，位置基点仍是雷达 IMU。** 输出姿态已抵消雷达 IMU 的安装倾角（本机 20° 前倾），
+**姿态表示机体，位置基点仍是雷达 IMU。** 输出姿态已抵消雷达 IMU 的安装倾角（本机实测约 18.8° 前倾），
 水平放置时 pitch ≈ 0；初始化时机体本身倾斜时，输出会如实保留该倾角，不再被归零。位置仍是雷达
 IMU 的原点，**杆臂没有补偿**，该平移偏移留给下游 / 飞控参数（例如 PX4 的 `EKF2_EV_POS_*`）处理。
 
@@ -150,8 +150,10 @@ world ──静态(q_a)──> camera_init ──FAST-LIO──> body ──静�
 - `fixed`（**默认**）：固定安装旋转。`mounting_roll_deg` / `mounting_pitch_deg` / `mounting_yaw_deg`
   （度）描述**雷达 IMU 在机体系（base_link，FLU）中的姿态**，按 ROS 固定轴 RPY 组合：
   `R_base←lidar = Rz(yaw)·Ry(pitch)·Rx(roll)`，节点内部取逆得到 `q_IB`。符号：pitch 正值 = 前倾
-  （机头向下，默认 `20.0`）；roll 正值 = 雷达右侧向下（默认 `0.0`）；yaw 正值 = 雷达前向朝左偏
-  （默认 `0.0`）。roll、yaw 为 0 时就是纯俯仰 `q_IB = Ry(-mounting_pitch_deg)`。它只由参数决定、
+  （机头向下）；roll 正值 = 雷达右侧向下；yaw 正值 = 雷达前向朝左偏。`gravity_bridge.launch` 的默认值
+  是本机实测安装角 roll `0.5` / pitch `18.8` / yaw `1.6`（10.3 台架 + 10.4 飞行标定；飞行报告的 FRD
+  yaw −1.6° 对应这里的 FLU +1.6°）；节点代码默认仍是 `0/20/0`。roll、yaw 为 0 时就是纯俯仰
+  `q_IB = Ry(-mounting_pitch_deg)`。它只由参数决定、
   **与初始化重力无关**，所以初始化时机体保持静止即可、**不要求水平**。
   标定结果的填法：iKalibr 以飞控 IMU（`/mavros/imu/data_raw`，MAVROS 已转 FLU）为 `ReferIMU` 时，
   Livox IMU 的 `SO3_BiToBr` 就是 `R_base←lidar`，按 ZYX 欧拉角换算成 roll/pitch/yaw 填入。
@@ -173,7 +175,7 @@ roslaunch fastlio_gravity_bridge gravity_bridge.launch
 ```bash
 roslaunch fastlio_gravity_bridge gravity_bridge.launch send_to_mavros:=true
 
-# 改固定安装角（默认 20 度前倾）
+# 改固定安装角（launch 默认为实测值 0.5/18.8/1.6，这里只覆盖 pitch）
 roslaunch fastlio_gravity_bridge gravity_bridge.launch mounting_pitch_deg:=20.0
 
 # 填完整安装旋转（例如标定结果）
