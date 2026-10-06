@@ -104,7 +104,10 @@ rostopic echo /rc_record/bag_path    # latched："OPEN <path>" / "CLOSED <path>"
 | `bag_directory` / `bag_prefix` | `/home/orangepi/bags` / `handheld` | 输出位置与包名前缀 |
 | `record_raw_cloud` | `false` | true 额外录 `/livox/lidar`（约 +5 MB/s，需先 source mid360s_ws/devel） |
 | `status_rate` | `2.0` | `/rc_record/status` 频率 |
-| `topics` | 14 个（见 yaml） | 录制话题；类型必须在节点的登记表里，否则启动时跳过并报错 |
+| `topics` | 10 个（见 yaml） | 录制话题；类型必须在节点的登记表里，否则启动时跳过并报错 |
+
+已从默认清单移除 4 个重复话题（类型仍在登记表里，需要时在 yaml 加回即可）：
+`/fastlio/vision_pose_cov` 与 `/mavros/vision_pose/pose_cov` 逐条相同（桥接本地回显）；`/tf` 只有 camera_init→body，与 `/Odometry` 相同；`/tf_static` 是 latched 消息，节点启动时就收到、开包后不会再来，实际录不到；`/mavros/estimator_status` 在飞控 ulog 的 estimator_status 里更全。
 
 ## 绕线器状态记录
 

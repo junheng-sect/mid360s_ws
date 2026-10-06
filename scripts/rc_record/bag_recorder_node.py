@@ -48,19 +48,15 @@ from sequence_allocator import SequenceAllocator  # noqa: E402
 TICK_PERIOD = 0.2            # 5 Hz 心跳：保证尾巴到期有人关包
 DEFAULT_TOPICS = [
     '/mavros/state',
-    '/mavros/estimator_status',
     '/mavros/timesync_status',
     '/mavros/local_position/pose',
     '/mavros/local_position/odom',
     '/mavros/local_position/velocity_local',
     '/mavros/vision_pose/pose_cov',
-    '/fastlio/vision_pose_cov',
     '/fastlio/odom_world',
     '/tether_winch_control/status',
     '/Odometry',
     '/livox/imu',
-    '/tf',
-    '/tf_static',
 ]
 
 
