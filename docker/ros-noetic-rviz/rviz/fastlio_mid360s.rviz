@@ -180,6 +180,18 @@ Visualization Manager:
       Topic: /path
       Unreliable: false
       Value: true
+    - Class: rviz/Image
+      Enabled: true
+      Image Topic: /ov13855_apriltag_vision/image_preview
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: OV13855 Preview
+      Normalize Range: true
+      Queue Size: 2
+      Transport Hint: compressed
+      Unreliable: false
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 0; 0; 0
@@ -230,6 +242,8 @@ Visualization Manager:
     Saved: ~
 Window Geometry:
   Displays:
+    collapsed: false
+  OV13855 Preview:
     collapsed: false
   Height: 1495
   Hide Left Dock: false
