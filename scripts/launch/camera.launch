@@ -1,0 +1,27 @@
+<launch>
+  <!--
+    相机预览：OV13855 驱动 + AprilTag 视觉节点（产出 /ov13855_apriltag_vision/image_preview，
+    供本机 RViz 的 OV13855 Preview 面板经 /compressed 查看）。
+
+    由 fusion.sh 在主链路节点注册后作为「第二个、非 required 的」roslaunch 拉起，
+    不并进 fusion.launch：fusion.sh 给主 roslaunch 传 required 选项（强制全部节点 required），相机掉帧超时节点会退出，
+    并进去就会把 MAVROS/FAST-LIO 整条定位链路一起带下来。这里两个节点都 respawn，
+    相机断流只影响预览，不影响定位与录包。
+
+    参数沿用 orange 工作空间各包自带的 YAML（与 ov13855.launch / ov13855_apriltag_vision.launch 一致）。
+    不启动 front_marker_control：本入口只看图，不做视觉控制。
+  -->
+  <arg name="camera_config" default="$(find ov13855_cam)/config/ov13855.yaml"/>
+  <arg name="vision_config" default="$(find ov13855_apriltag_vision)/config/ov13855_apriltag_vision.yaml"/>
+
+  <node pkg="ov13855_cam" type="ov13855_cam_node" name="ov13855_cam" output="screen"
+        respawn="true" respawn_delay="5">
+    <rosparam command="load" file="$(arg camera_config)"/>
+  </node>
+
+  <node pkg="ov13855_apriltag_vision" type="ov13855_apriltag_vision_node"
+        name="ov13855_apriltag_vision_node" output="screen"
+        respawn="true" respawn_delay="5">
+    <rosparam command="load" file="$(arg vision_config)"/>
+  </node>
+</launch>

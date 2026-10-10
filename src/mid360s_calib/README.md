@@ -10,7 +10,7 @@ cd /home/orangepi/mid360s_ws && source devel/setup.bash
 roslaunch mid360s_calib calib_record.launch
 ```
 
-启动 MAVROS（`/dev/ttyS4:921600`）+ MID-360S 驱动（CustomMsg）+ 标定录包节点。
+启动 MAVROS（`/dev/ttyS3:921600`）+ MID-360S 驱动（CustomMsg）+ 标定录包节点。
 **不要和 `fusion.sh` / `start_handheld_test.sh` 同时运行**：同一 ROS Master 上同名节点会把正在
 运行的 `/mavros` 踢掉，飞控串口也会冲突。
 
