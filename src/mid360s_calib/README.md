@@ -16,7 +16,7 @@ roslaunch mid360s_calib calib_record.launch
 
 | launch 参数 | 默认 | 说明 |
 |---|---|---|
-| `bag_dir` | `/home/orangepi/bags/calib` | 包目录 |
+| `bag_dir` | `/home/orangepi/test_data/bags/calib` | 包目录 |
 | `bag_prefix` | `calib` | 包名 `calib_000001.bag`，每拨一次开关新增一个序号 |
 | `imu_raw_rate` | `400` | 录包期间请求的飞控 IMU 频率；0 = 不改（默认 50 Hz） |
 | `fastlio` | `false` | `true` 时额外起 FAST-LIO，只用来现场确认雷达正常（不起桥接、不送飞控） |

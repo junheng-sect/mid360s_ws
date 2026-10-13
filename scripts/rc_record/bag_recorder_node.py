@@ -118,7 +118,7 @@ class RcBagRecorder(object):
         self._rc_warn_timeout = float(rospy.get_param('~rc_warn_timeout_s', 5.0))
         self._stop_on_rc_loss = bool(rospy.get_param('~stop_on_rc_loss', False))
         self._bag_directory = os.path.abspath(
-            rospy.get_param('~bag_directory', '/home/orangepi/bags'))
+            rospy.get_param('~bag_directory', '/home/orangepi/test_data/bags'))
         self._bag_prefix = rospy.get_param('~bag_prefix', 'handheld')
         self._status_rate = float(rospy.get_param('~status_rate', 2.0))
 

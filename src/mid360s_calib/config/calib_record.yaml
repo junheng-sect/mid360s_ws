@@ -12,7 +12,7 @@ rc_warn_timeout_s: 5.0     # 多久收不到 RC 就告警
 stop_on_rc_loss: false     # false: RC 丢失不截断正在录的包
 
 # ---- 输出 ----
-bag_directory: /home/orangepi/bags/calib
+bag_directory: /home/orangepi/test_data/bags/calib
 bag_prefix: calib          # calib_000001.bag，序号文件 .calib_sequence
 status_rate: 2.0           # /calib_record/status 发布频率
 status_topic: /calib_record/status

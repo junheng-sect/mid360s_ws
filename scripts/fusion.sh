@@ -13,7 +13,7 @@
 #   --no-winch          不启动绕线器控制（非系留测试）
 #   --no-camera         不启动相机预览（OV13855 驱动 + AprilTag 视觉节点）
 #   --bag-prefix NAME   包名前缀（默认 noprop，产出 NAME_000001.bag）
-#   --bag-dir PATH      包输出目录（默认 /home/orangepi/bags）
+#   --bag-dir PATH      包输出目录（默认 /home/orangepi/test_data/bags）
 #   -h|--help           帮助
 #
 # 前置检查只做三件事：环境文件（ROS/工作空间 + rospack 找包）、飞控串口权限、
@@ -70,7 +70,7 @@ DO_RECORD=1
 DO_WINCH=1
 DO_CAMERA=1
 BAG_PREFIX="noprop"
-BAG_DIR="/home/orangepi/bags"
+BAG_DIR="/home/orangepi/test_data/bags"
 
 while [ $# -gt 0 ]; do
   case "$1" in

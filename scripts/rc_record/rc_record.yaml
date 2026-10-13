@@ -12,7 +12,7 @@ rc_bag_recorder:
   stop_on_rc_loss: false     # false: RC 丢失不截断正在录的包
 
   # ---- 输出 ----
-  bag_directory: /home/orangepi/bags
+  bag_directory: /home/orangepi/test_data/bags
   bag_prefix: handheld       # 包名 handheld_000001.bag，序号文件 .handheld_sequence
   record_raw_cloud: false    # true 则额外录 /livox/lidar（约 +5 MB/s）
   status_rate: 2.0           # /rc_record/status 发布频率

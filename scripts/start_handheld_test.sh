@@ -10,7 +10,7 @@
 #   --no-lidar          调试：只起 MAVROS + 录包节点，用于单独验证「开关 -> 录包」
 #   --no-record         不启动 RC 触发录包节点
 #   --bag-prefix NAME   包名前缀（默认 noprop，产出 NAME_000001.bag）
-#   --bag-dir PATH      包输出目录（默认 /home/orangepi/bags）
+#   --bag-dir PATH      包输出目录（默认 /home/orangepi/test_data/bags）
 #   --fix-params        飞控参数不符时自动写入（含 RC 录包所需的 SDLOG_MODE=3）
 #   --require-disarmed  飞控已解锁则中止（默认只告警，适配无桨台架测试）
 #   --no-net-check      跳过雷达网口/ping 检查（调试用）
@@ -48,7 +48,7 @@ FCU_URL="${TTY}:921600"
 
 CHECK_ONLY=0; FIX_PARAMS=0; NET_CHECK=1
 DO_RECORD=1; DO_LIDAR=1; REQUIRE_DISARMED=0
-BAG_PREFIX="noprop"; BAG_DIR="/home/orangepi/bags"
+BAG_PREFIX="noprop"; BAG_DIR="/home/orangepi/test_data/bags"
 
 while [ $# -gt 0 ]; do
   case "$1" in

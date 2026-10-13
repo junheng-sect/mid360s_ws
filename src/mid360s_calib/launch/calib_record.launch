@@ -17,7 +17,7 @@
   <arg name="fcu_protocol"   default="v1.0"/>
   <arg name="tgt_system"     default="1"/>
   <arg name="tgt_component"  default="1"/>
-  <arg name="bag_dir"        default="/home/orangepi/bags/calib"/>
+  <arg name="bag_dir"        default="/home/orangepi/test_data/bags/calib"/>
   <arg name="bag_prefix"     default="calib"/>
   <!-- 录包期间请求的飞控 IMU 频率；0 = 不改（保持默认 50 Hz） -->
   <arg name="imu_raw_rate"   default="400"/>

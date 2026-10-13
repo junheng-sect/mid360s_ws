@@ -28,7 +28,7 @@
   <arg name="record"         default="true"/>
   <arg name="winch"          default="true"/>
   <arg name="bag_prefix"     default="noprop"/>
-  <arg name="bag_dir"        default="/home/orangepi/bags"/>
+  <arg name="bag_dir"        default="/home/orangepi/test_data/bags"/>
 
   <!-- 1) MAVROS：飞控串口 -->
   <include file="$(find mavros)/launch/px4.launch">

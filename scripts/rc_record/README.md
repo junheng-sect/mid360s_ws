@@ -71,7 +71,7 @@ cd /home/orangepi/mid360s_ws/scripts/rc_record
 ./start_rc_record.sh
 
 # 临时覆盖输出（不改 yaml）
-RC_BAG_PREFIX=handheld RC_BAG_DIR=/home/orangepi/bags ./start_rc_record.sh
+RC_BAG_PREFIX=handheld RC_BAG_DIR=/home/orangepi/test_data/bags ./start_rc_record.sh
 
 # 一体化（推荐）：MAVROS + 雷达/FAST-LIO + 本节点一起起，默认前缀 noprop
 cd /home/orangepi/mid360s_ws/scripts && ./fusion.sh
@@ -86,8 +86,8 @@ rostopic echo /rc_record/status      # state=REC/IDLE bags=N last=<当前包> rc
 rostopic echo /rc_record/bag_path    # latched："OPEN <path>" / "CLOSED <path>"
 ```
 
-产出：`/home/orangepi/bags/handheld_000001.bag`、`000002`、… 序号状态文件
-`/home/orangepi/bags/.handheld_sequence`（与今天的 `20260919_*.bag` 等时间戳命名的包不冲突）。
+产出：`/home/orangepi/test_data/bags/handheld_000001.bag`、`000002`、… 序号状态文件
+`/home/orangepi/test_data/bags/.handheld_sequence`（与今天的 `20260919_*.bag` 等时间戳命名的包不冲突）。
 
 ## 参数（`rc_record.yaml`，命令行也可用 `_name:=value` 覆盖）
 
@@ -101,7 +101,7 @@ rostopic echo /rc_record/bag_path    # latched："OPEN <path>" / "CLOSED <path>"
 | `release_tail_s` | `1.0` | 松手后继续录的尾巴；期间重新拨下则继续同一个包 |
 | `rc_warn_timeout_s` | `5.0` | 多久收不到 RC 就告警 |
 | `stop_on_rc_loss` | `false` | false: 丢遥控也不截断正在录的包 |
-| `bag_directory` / `bag_prefix` | `/home/orangepi/bags` / `handheld` | 输出位置与包名前缀 |
+| `bag_directory` / `bag_prefix` | `/home/orangepi/test_data/bags` / `handheld` | 输出位置与包名前缀 |
 | `record_raw_cloud` | `false` | true 额外录 `/livox/lidar`（约 +5 MB/s，需先 source mid360s_ws/devel） |
 | `status_rate` | `2.0` | `/rc_record/status` 频率 |
 | `topics` | 10 个（见 yaml） | 录制话题；类型必须在节点的登记表里，否则启动时跳过并报错 |

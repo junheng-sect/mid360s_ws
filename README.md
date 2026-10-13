@@ -241,7 +241,7 @@ cd /home/orangepi/mid360s_ws && source devel/setup.bash
 roslaunch mid360s_calib calib_record.launch
 ```
 
-通道 6 拨下开始录 `/home/orangepi/bags/calib/calib_*.bag`（`/livox/lidar`、`/livox/imu`、
+通道 6 拨下开始录 `/home/orangepi/test_data/bags/calib/calib_*.bag`（`/livox/lidar`、`/livox/imu`、
 `/mavros/imu/data_raw`、`/mavros/timesync_status`），录包期间飞控 IMU 临时提到约 190 Hz，
 关包后恢复默认并打印体检摘要。平时飞行的录包不受影响。详见 `src/mid360s_calib/README.md`。
 
