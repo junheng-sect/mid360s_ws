@@ -29,3 +29,11 @@ rc_bag_recorder:
     - /tether_winch_control/status
     - /Odometry
     - /livox/imu
+    # front_marker_control（控制节点没跑时没有消息，不影响录包）：
+    - /front_marker_control/control_mode      # 状态机阶段 ALIGN/YAW_SAMPLING/POSE_ALIGNING/POS_HOLD/RETREAT
+    - /front_marker_control/status            # 状态文本（门控原因、目标、采样统计）
+    - /front_marker_control/position_error    # 视觉位置误差（机体系）
+    - /mavros/setpoint_raw/local              # 实际发给飞控的 setpoint（20 Hz）
+  # 只在变化时发布的 latch 话题：平时缓存最新一条，开包时先补写当前值（须同时在 topics 里）
+  latched_topics:
+    - /front_marker_control/control_mode

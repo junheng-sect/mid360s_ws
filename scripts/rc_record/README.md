@@ -26,7 +26,7 @@ bag 名用六位序号 + 状态文件，崩溃最多留空号、绝不复用编�
 | `start_rc_record.sh` | 启动包装：加载 yaml + `exec python3 bag_recorder_node.py`；也是 launch 里的 `<node type>` |
 | `package.xml` | 仅用于让 rospack/roslaunch 定位本目录（不参与 catkin 构建，见文末备注） |
 | `test_rc_record_policy.py` | 策略与序号分配器的离线测试（27 项断言） |
-| `test_rc_record_e2e.sh` | 端到端测试：隔离 Master + 假 RC/位姿发布器，自动翻转开关验收发 |
+| `test_rc_record_e2e.sh` | 端到端测试：隔离 Master + 假 RC/位姿/control_mode 发布器，自动翻转开关验收发，并检查 latch 话题开包补写 |
 
 ## 与飞控 ulog 配对（关键）
 
@@ -104,10 +104,27 @@ rostopic echo /rc_record/bag_path    # latched："OPEN <path>" / "CLOSED <path>"
 | `bag_directory` / `bag_prefix` | `/home/orangepi/test_data/bags` / `handheld` | 输出位置与包名前缀 |
 | `record_raw_cloud` | `false` | true 额外录 `/livox/lidar`（约 +5 MB/s，需先 source mid360s_ws/devel） |
 | `status_rate` | `2.0` | `/rc_record/status` 频率 |
-| `topics` | 10 个（见 yaml） | 录制话题；类型必须在节点的登记表里，否则启动时跳过并报错 |
+| `topics` | 14 个（见 yaml） | 录制话题；类型必须在节点的登记表里，否则启动时跳过并报错 |
+| `latched_topics` | `/front_marker_control/control_mode` | 只在变化时发布的 latch 话题：平时缓存最新一条，开包时先补写当前值（时间记为开包时刻）；须同时在 `topics` 里 |
 
 已从默认清单移除 4 个重复话题（类型仍在登记表里，需要时在 yaml 加回即可）：
 `/fastlio/vision_pose_cov` 与 `/mavros/vision_pose/pose_cov` 逐条相同（桥接本地回显）；`/tf` 只有 camera_init→body，与 `/Odometry` 相同；`/tf_static` 是 latched 消息，节点启动时就收到、开包后不会再来，实际录不到；`/mavros/estimator_status` 在飞控 ulog 的 estimator_status 里更全。
+
+## 控制话题记录
+
+默认话题列表包含 `front_marker_control` 的 4 个话题，用来分析自动移到码前、到位读码的过程
+（进场用了多久、到位时还在不在动、有没有反复进出 `POS_HOLD`）：
+
+| 话题 | 类型 | 内容 |
+|---|---|---|
+| `/front_marker_control/control_mode` | `std_msgs/String` | 状态机阶段 ALIGN / YAW_SAMPLING / POSE_ALIGNING / POS_HOLD / RETREAT，只在变化时发布（latch） |
+| `/front_marker_control/status` | `std_msgs/String` | 状态文本（门控原因、目标、采样统计），变化时和定时发布 |
+| `/front_marker_control/position_error` | `geometry_msgs/Vector3Stamped` | 视觉位置误差（机体系） |
+| `/mavros/setpoint_raw/local` | `mavros_msgs/PositionTarget` | 实际发给飞控的 setpoint（20 Hz，门控不通过时为零速度） |
+
+`control_mode` 只在变化时发布，开包前收到的那一条录不进包，所以它在 `latched_topics` 里：
+节点平时缓存最新一条，开包时先补写一条当前值，包里第一条就是开包时刻所处的阶段。
+控制节点没跑时这些话题没有消息，不影响录包。
 
 ## 绕线器状态记录
 
@@ -140,7 +157,8 @@ python3 test_rc_record_policy.py     # 纯逻辑，27 项断言
 ```
 
 E2E 脚本会在临时目录里用 `channels[5] = 1000/2000/1000/2000/1000` 的脚本翻转开关，
-期望得到 **2 个** bag，各含 pose 和 WinchStatus 消息且都已正常收尾（无残留 `.bag.active`）。
+期望得到 **2 个** bag，各含 pose 和 WinchStatus 消息且都已正常收尾（无残留 `.bag.active`）；
+`control_mode` 只在开包前发过（ALIGN，两个包之间又发 POS_HOLD），每个包里应正好有开包时补写的那一条。
 换端口跑：`./test_rc_record_e2e.sh 11378`（避免和别的 Master 撞）。
 
 ## 备注

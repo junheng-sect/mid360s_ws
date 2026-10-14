@@ -17,14 +17,15 @@ offboard_bag_recorder 一致），不 fork rosbag record 进程；bag 名用六�
 
 话题：
   订阅  <rc_topic>             mavros_msgs/RCIn         触发源
-        每个 ~topics 里的数据话题
+        每个 ~topics 里的数据话题；~latched_topics 里的话题（只在变化时发布）
+        平时也缓存最新一条，开包时先补写当前值
   发布  ~/bag_path (latched)   std_msgs/String          "OPEN <path>" / "CLOSED <path>"
         ~/status                std_msgs/String          状态（开关电平、是否在录）
 
 参数（rospy 私有参数，命令行可直接 _name:=value 覆盖）：
   rc_topic, rc_channel(1-based), rc_threshold, active_high, confirm_samples,
   release_tail_s, rc_warn_timeout_s, stop_on_rc_loss, bag_directory, bag_prefix,
-  topics, record_raw_cloud, status_topic, bag_path_topic, status_rate
+  topics, latched_topics, record_raw_cloud, status_topic, bag_path_topic, status_rate
 """
 
 import os
@@ -35,11 +36,12 @@ import time
 import rosbag
 import rospy
 from std_msgs.msg import String
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TwistStamped
+from geometry_msgs.msg import (PoseStamped, PoseWithCovarianceStamped, TwistStamped,
+                               Vector3Stamped)
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from tf2_msgs.msg import TFMessage
-from mavros_msgs.msg import EstimatorStatus, RCIn, State, TimesyncStatus
+from mavros_msgs.msg import EstimatorStatus, PositionTarget, RCIn, State, TimesyncStatus
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rc_record_policy import RcRecordSession  # noqa: E402
@@ -57,7 +59,13 @@ DEFAULT_TOPICS = [
     '/tether_winch_control/status',
     '/Odometry',
     '/livox/imu',
+    '/front_marker_control/control_mode',
+    '/front_marker_control/status',
+    '/front_marker_control/position_error',
+    '/mavros/setpoint_raw/local',
 ]
+# 只在变化时发布的 latch 话题：开包前收到的最新一条要在开包时补写，否则包里要等下一次变化才有。
+DEFAULT_LATCHED_TOPICS = ['/front_marker_control/control_mode']
 
 
 def topic_type_registry():
@@ -75,6 +83,11 @@ def topic_type_registry():
         '/livox/imu': Imu,
         '/tf': TFMessage,
         '/tf_static': TFMessage,
+        # front_marker_control：状态机阶段（latch，只在变化时发布）、状态文本、视觉位置误差、实际 setpoint
+        '/front_marker_control/control_mode': String,
+        '/front_marker_control/status': String,
+        '/front_marker_control/position_error': Vector3Stamped,
+        '/mavros/setpoint_raw/local': PositionTarget,
     }
     try:
         from tether_winch_control.msg import WinchStatus
@@ -146,6 +159,12 @@ class RcBagRecorder(object):
             rospy.logfatal('没有可录制的话题，退出')
             rospy.signal_shutdown('no topics to record')
             return
+        recorded = set(t for t, _ in self._topics)
+        latched = list(rospy.get_param('~latched_topics', DEFAULT_LATCHED_TOPICS))
+        for topic in latched:
+            if topic not in recorded:
+                rospy.logwarn('latched_topics 里的 %s 不在录制话题里，已忽略', topic)
+        self._latched = dict((t, None) for t in latched if t in recorded)
 
         self._path_publisher = rospy.Publisher(
             rospy.get_param('~bag_path_topic', '/rc_record/bag_path'),
@@ -179,6 +198,8 @@ class RcBagRecorder(object):
                       self._session.release_tail_s, self._bag_directory)
         rospy.loginfo('录制话题（%d 个）：%s', len(self._topics),
                       ', '.join(t for t, _ in self._topics))
+        if self._latched:
+            rospy.loginfo('开包时补写当前值的 latch 话题：%s', ', '.join(self._latched))
         self._publish_status()
 
     # ------------------------------------------------------------ RC ----
@@ -252,6 +273,7 @@ class RcBagRecorder(object):
             rospy.signal_shutdown('cannot open bag')
             return
         self._bag_count += 1
+        self._write_latched()
         self._path_publisher.publish(String(data='OPEN ' + self._bag_path))
         rospy.logwarn('开关已拨到触发位：开始录包 %s', self._bag_path)
         self._publish_status()
@@ -280,8 +302,21 @@ class RcBagRecorder(object):
         self._publish_status()
 
     # ------------------------------------------------------------ 数据 ----
+    def _write_latched(self):
+        """开包时补写 latch 话题的当前值（时间记为开包时刻）。"""
+        now = rospy.Time.now()
+        for topic, message in self._latched.items():
+            if message is None:
+                continue
+            try:
+                self._bag.write(topic, message, t=now)
+            except Exception as exception:
+                rospy.logerr('补写 latch 话题 %s 失败：%s', topic, exception)
+
     def _data_callback(self, message, topic):
         with self._lock:
+            if topic in self._latched:
+                self._latched[topic] = message
             if self._bag is None or not self._session.recording():
                 return
             try:

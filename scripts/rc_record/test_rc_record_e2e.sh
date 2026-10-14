@@ -42,7 +42,8 @@ rc_bag_recorder:
   active_high: true
   confirm_samples: 2
   release_tail_s: 1.0
-  topics: [/mavros/local_position/pose, /tether_winch_control/status]
+  topics: [/mavros/local_position/pose, /tether_winch_control/status, /front_marker_control/control_mode]
+  latched_topics: [/front_marker_control/control_mode]
 YAML
 rosparam load "$BAGDIR/config.yaml" || { echo "[FAIL] rosparam load 失败"; exit 1; }
 
@@ -57,6 +58,7 @@ python3 - "$BAGDIR" <<'PYEOF' >"$BAGDIR/publisher.log" 2>&1 &
 import sys, time, rospy
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import RCIn
+from std_msgs.msg import String
 from tether_winch_control.msg import WinchStatus
 
 rospy.init_node('fake_rc_and_pose', anonymous=True, disable_signals=True)
@@ -64,14 +66,23 @@ bagdir = sys.argv[1]
 pose_pub = rospy.Publisher('/mavros/local_position/pose', PoseStamped, queue_size=10)
 rc_pub = rospy.Publisher('/test/rc_in', RCIn, queue_size=10)
 winch_pub = rospy.Publisher('/tether_winch_control/status', WinchStatus, queue_size=10)
+# latch 话题只在变化时发：两次都在开包前发，靠录制器缓存补写进包。
+mode_pub = rospy.Publisher('/front_marker_control/control_mode', String, queue_size=1, latch=True)
 time.sleep(1.0)   # 等订阅者连上
+mode_pub.publish(String(data='ALIGN'))
 
 script = [(1000, 2.0), (2000, 3.0), (1000, 2.5), (2000, 2.0), (1000, 1.5)]
 start = time.monotonic()
 pose_count = 0
-for pwm, duration in script:
-    end = time.monotonic() + duration
+mode_changed = False
+for index, (pwm, duration) in enumerate(script):
+    begin = time.monotonic()
+    end = begin + duration
     while time.monotonic() < end and not rospy.is_shutdown():
+        if index == 2 and not mode_changed and time.monotonic() - begin >= 1.8:
+            # 两个包之间变化一次：包 1 的 1 s 尾巴已关、包 2 还没开（第 2.5 s 才拨高）。
+            mode_pub.publish(String(data='POS_HOLD'))
+            mode_changed = True
         msg = RCIn()
         channels = [1500] * 8
         channels[5] = pwm        # 通道 6
@@ -124,7 +135,7 @@ for b in "$BAGDIR"/e2e_*.bag; do
   [ -e "$b" ] || continue
   echo "--- $(basename "$b")"
   rosbag info "$b" | sed -n '/topics:/,$p'
-  n=$(rosbag info "$b" | awk '/\/mavros\/local_position\/pose/{print $3}')
+  n=$(rosbag info "$b" | awk '{for (i = 1; i < NF; i++) if ($i == "/mavros/local_position/pose") print $(i + 1)}')
   [ "${n:-0}" -gt 10 ] || { echo "[FAIL] $b 里 pose 消息太少（$n）"; FAILED=1; }
 done
 RC_RECORD_TEST_DIR="$DIR" PYTHONPATH="$DIR:${PYTHONPATH:-}" python3 - "$BAGDIR" <<'CHECK_WINCH' || FAILED=1
@@ -149,6 +160,30 @@ for path in glob.glob(os.path.join(sys.argv[1], 'e2e_*.bag')):
         assert stamp == msg.header.stamp
     print('[PASS] WinchStatus bag readback:', path, len(rows), 'messages')
 CHECK_WINCH
+RC_RECORD_TEST_DIR="$DIR" PYTHONPATH="$DIR:${PYTHONPATH:-}" python3 - "$BAGDIR" <<'CHECK_LATCHED' || FAILED=1
+import glob, os, sys
+import rosbag, yaml
+from bag_recorder_node import DEFAULT_LATCHED_TOPICS, DEFAULT_TOPICS, topic_type_registry
+topic = '/front_marker_control/control_mode'
+registry = topic_type_registry()
+for name in ('/front_marker_control/control_mode', '/front_marker_control/status',
+             '/front_marker_control/position_error', '/mavros/setpoint_raw/local'):
+    assert name in DEFAULT_TOPICS and name in registry, name
+assert topic in DEFAULT_LATCHED_TOPICS
+with open(os.path.join(os.environ['RC_RECORD_TEST_DIR'], 'rc_record.yaml')) as stream:
+    config = yaml.safe_load(stream)['rc_bag_recorder']
+assert set(DEFAULT_TOPICS) == set(config['topics']), set(DEFAULT_TOPICS) ^ set(config['topics'])
+assert config['latched_topics'] == DEFAULT_LATCHED_TOPICS
+# 两次变化都发生在开包前：每个包里只有开包时补写的那一条，内容是开包时刻的当前值。
+expected = ['ALIGN', 'POS_HOLD']
+paths = sorted(glob.glob(os.path.join(sys.argv[1], 'e2e_*.bag')))
+assert len(paths) == len(expected), paths
+for path, want in zip(paths, expected):
+    with rosbag.Bag(path) as bag:
+        rows = [msg.data for _, msg, _ in bag.read_messages(topics=[topic])]
+    assert rows == [want], (path, rows)
+    print('[PASS] latched control_mode replayed at open:', path, rows)
+CHECK_LATCHED
 echo
 if [ "$FAILED" -eq 0 ]; then echo "=== E2E 通过 ==="; else echo "=== E2E 失败 ==="; fi
 echo "（bag 留在 $BAGDIR，便于人工检查）"
