@@ -222,11 +222,11 @@ start_camera() {
     camera_alive || break
     _cur="$(timeout 5 rosnode list 2>/dev/null)"
     _miss=""
-    for _n in /ov13855_cam /ov13855_apriltag_vision_node; do
+    for _n in /ov13855_cam /ov13855_full_cam /ov13855_apriltag_vision_node; do
       printf '%s\n' "$_cur" | grep -qx "$_n" || _miss="$_miss $_n"
     done
     if [ -z "$_miss" ]; then
-      ok "相机预览已启动：/ov13855_apriltag_vision/image_preview/compressed（有订阅者才生成）"
+      ok "相机已启动：预览 /ov13855_apriltag_vision/image_preview/compressed（有订阅者才生成），读码全图 /ov13855_full/image_raw"
       return 0
     fi
     sleep 1; _i=$((_i + 1))
@@ -485,7 +485,7 @@ if timeout 5 rosnode list >/dev/null 2>&1; then
   _nodes="$(timeout 5 rosnode list 2>/dev/null)"
   _busy=""
   _check="$EXPECT_NODES /rc_bag_recorder"
-  [ "$DO_CAMERA" -eq 1 ] && _check="$_check /ov13855_cam /ov13855_apriltag_vision_node"
+  [ "$DO_CAMERA" -eq 1 ] && _check="$_check /ov13855_cam /ov13855_full_cam /ov13855_apriltag_vision_node"
   for n in $_check; do
     printf '%s\n' "$_nodes" | grep -qx "$n" && _busy="$_busy $n"
   done
