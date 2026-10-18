@@ -17,6 +17,7 @@
 mid360s_ws/
 ├── scripts/
 │   ├── build.sh                   # 一键编译脚本（构建并安装本地 SDK，配置并编译 ROS 包）
+│   ├── car_reloc.py               # M65 小车定位检查与板端重定位（经 rosbridge，不依赖 ROS master）
 │   └── start_mid360s_fastlio.sh   # 一键启动驱动与 FAST-LIO2 算法节点（含前置检查与进程锁）
 ├── src/
 │   ├── FAST_LIO/                  # FAST-LIO2 算法包
@@ -285,3 +286,23 @@ Ctrl+C会统一结束本次fusion启动的节点，绕线器正常退出尝试�
 不会套用本机脉冲脚本Ctrl+C发送300的规则；网络断开时不能保证备用指令送达。
 沿用原有 `roslaunch --required` 规则：绕线器进程异常退出会结束本次整条链路；
 绕线器报告FAULT但进程仍在时不会触发整链退出。
+
+
+## 小车定位（car_reloc.py）
+
+M65 小车（spirit，`192.168.31.231`，rosbridge `9090`）开机时直接读回关机前的位姿，不做搜索：
+关机时挪过车，定位就是错的，App 却照样报定位正常。`scripts/car_reloc.py` 在板端检查车的定位，
+不合格时拿车的 `/scan` 在它的 `/map` 上做全局匹配（不需要初值），调 `/set_relocation` 重定位，
+再复核一遍。只经 rosbridge 和车通信，不依赖板端 ROS master，fusion 没起也能用；全程不让车动。
+
+```bash
+cd /home/orangepi/mid360s_ws/scripts
+./car_reloc.py                     # 检查，不合格才重定位
+./car_reloc.py --check             # 只检查，不发
+./car_reloc.py --force             # 检查合格也重发一次
+./car_reloc.py --wait-online 180   # 车刚开机：最多等 180 s 上线再做
+```
+
+判据（板端激光得分、局部再匹配偏移、车自报 `/local_global_score[1]` 和 `/submap_in_map_score`）
+和退出码见脚本开头说明。依赖 roslibpy（`pip --user`）、numpy、`python3-opencv`，板端已装。
+室内地图上一次完整重定位约 16 s：检查约 2 s，全局匹配约 4 s，车端搜索恢复约 4 s。
