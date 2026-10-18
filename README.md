@@ -17,6 +17,7 @@
 mid360s_ws/
 ├── scripts/
 │   ├── build.sh                   # 一键编译脚本（构建并安装本地 SDK，配置并编译 ROS 包）
+│   ├── build_map.py               # 无人机建图：驱动 + FAST-LIO2 存图 + 录原始包，收尾后摆正降采样
 │   ├── car_reloc.py               # M65 小车定位检查与板端重定位（经 rosbridge，不依赖 ROS master）
 │   └── start_mid360s_fastlio.sh   # 一键启动驱动与 FAST-LIO2 算法节点（含前置检查与进程锁）
 ├── src/
@@ -306,3 +307,33 @@ cd /home/orangepi/mid360s_ws/scripts
 判据（板端激光得分、局部再匹配偏移、车自报 `/local_global_score[1]` 和 `/submap_in_map_score`）
 和退出码见脚本开头说明。依赖 roslibpy（`pip --user`）、numpy、`python3-opencv`，板端已装。
 室内地图上一次完整重定位约 16 s：检查约 2 s，全局匹配约 4 s，车端搜索恢复约 4 s。
+
+## 无人机建图（build_map.py）
+
+`scripts/build_map.py` 拉起 MID-360S 驱动、FAST-LIO2 和重力对齐桥接，同时录原始包；按 Ctrl+C 结束后，
+FAST-LIO 写出地图，脚本再把地图摆正、降采样、出预览图。每次的产出放在 `~/test_data/mapping/<时间>/`。
+FAST-LIO 的 `pcd_save_en` 只在脚本生成的 launch 里打开，`mid360s.yaml` 不动，fusion 飞行不受影响。
+
+```bash
+cd /home/orangepi/mid360s_ws/scripts
+./build_map.py                    # 实机建图：等提示「初始化完成」再走，回到起点按 Ctrl+C
+./build_map.py --name lab         # 输出目录名加后缀
+./build_map.py --bag ~/test_data/mapping/<时间>/raw.bag   # 用录好的原始包离线重建
+./build_map.py --post ~/test_data/mapping/<时间>          # 只重做后处理（比如换 --voxel）
+```
+
+| 文件 | 内容 |
+|---|---|
+| `raw.bag` | 实机：`/livox/lidar` `/livox/imu` `/tf_static` `/fastlio/gravity_init` `/Odometry`（离线时是只含后三个话题的 `odom.bag`） |
+| `scans.pcd` | FAST-LIO 原样输出：`camera_init` 系、稠密、未降采样 |
+| `map_world.pcd` | 摆正到 `world`（z 朝上，原点 = 起点时的雷达 IMU，yaw 不动），0.05 m 体素，字段 `x y z intensity` |
+| `preview.png` | 俯视、侧视和轨迹 |
+| `meta.json` | 点数、`world←camera_init`、地面拟合（起点离地高度、残余倾斜）、首尾位姿差、git 版本 |
+
+注意：
+- FAST-LIO 只在节点正常退出时一次写出 `scans.pcd`。要用 Ctrl+C（或 SIGTERM）结束，脚本会按顺序收尾；
+  ssh 断开（SIGHUP）也按正常收尾存图。kill -9 或者掉电，这一次的地图就没了，原始包可能也不完整。
+- 每分钟约 400 万原始点、约 130 MB；单次建图建议控制在 5 min 内。
+- 离线重建不用仿真时间：FAST-LIO 只认消息时间戳，而它的主循环在仿真时间下，回放一停就出不来，地图存不下来。
+- 前置检查和 `start_mid360s_fastlio.sh` 一样，但要求板端没有正在运行的 ROS master。实机还会先等 chrony 对上时间（同 fusion.sh，最多 60 s）：雷达用板端系统时间打戳，建图中时间一跳地图就作废；没外网时加 `--allow-unsynced-clock`。
+
