@@ -14,10 +14,14 @@
 #   --no-camera         不启动相机预览（OV13855 驱动 + AprilTag 视觉节点）
 #   --bag-prefix NAME   包名前缀（默认 noprop，产出 NAME_000001.bag）
 #   --bag-dir PATH      包输出目录（默认 /home/orangepi/test_data/bags）
+#   --allow-unsynced-clock  板端时间没对上也照样启动（没外网时用，只告警）
 #   -h|--help           帮助
 #
-# 前置检查只做三件事：环境文件（ROS/工作空间 + rospack 找包）、飞控串口权限、
-# 防重复启动（锁 + 残留进程/节点）。不 ping 雷达、不拉取核对飞控参数、不逐话题
+# 前置检查只做四件事：环境文件（ROS/工作空间 + rospack 找包）、飞控串口权限、
+# 防重复启动（锁 + 残留进程/节点）、板端时钟已由 chrony 对上（运行中不会再跳）。
+# 检查通过后、roslaunch 之前用 fc_set_time.py 把板端时间写进飞控 RTC（只影响 ulog
+# 文件名/日期；板端没对上或飞控已解锁时跳过，失败只告警）。
+# 不 ping 雷达、不拉取核对飞控参数、不逐话题
 # 测频、不等 EKF 就绪 —— 要逐项体检请用同目录 start_handheld_test.sh；两个入口
 # 共用 /tmp/mid360s_fusion.lock，互相排斥。
 #
@@ -50,6 +54,7 @@ WS_SETUP="$WS/devel/setup.bash"
 ORANGE_SETUP="/home/orangepi/orange/devel/setup.bash"
 FUSION_LAUNCH="$DIR/launch/fusion.launch"
 CAMERA_LAUNCH="$DIR/launch/camera.launch"
+FC_TIME_PY="$DIR/fc_set_time.py"
 RC_RECORD_DIR="$DIR/rc_record"
 LOG_DIR="$WS/logs/fusion"
 # 与 start_handheld_test.sh 共用同一把锁文件：新旧入口互斥
@@ -65,8 +70,13 @@ NODES_TIMEOUT=90      # 等全部节点注册（秒）
 READY_TIMEOUT=180     # 等首帧 /fastlio/odom_world（秒）
 READY_POLL=3          # 等首帧时每轮阻塞上限（秒）：短轮询，好让信号能及时被处理
 STOP_TIMEOUT=30       # 收尾时等 roslaunch 退出的上限（秒）
+CLOCK_SYNC_TIMEOUT=60 # 等板端 chrony 对上时间（秒）；实测开机约 30 s 完成
+CLOCK_MAX_OFFSET=0.05 # 对上之后允许的剩余偏差（秒），超过说明 chrony 还在大幅修正
+CLOCK_SYNCED=0        # check_clock 确认板端已对上才置 1；飞控校时只在为 1 时写
+FC_TIME_TIMEOUT=20    # 飞控校时脚本的总时限（秒），正常 5~10 s
 
 DO_RECORD=1
+ALLOW_UNSYNCED_CLOCK=0
 DO_WINCH=1
 DO_CAMERA=1
 BAG_PREFIX="noprop"
@@ -79,7 +89,8 @@ while [ $# -gt 0 ]; do
     --no-camera) DO_CAMERA=0 ;;
     --bag-prefix) BAG_PREFIX="${2:-}"; shift ;;
     --bag-dir) BAG_DIR="${2:-}"; shift ;;
-    -h|--help) sed -n '3,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --allow-unsynced-clock) ALLOW_UNSYNCED_CLOCK=1 ;;
+    -h|--help) sed -n '3,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1（-h 看用法）" >&2; exit 2 ;;
   esac
   shift
@@ -146,6 +157,7 @@ LAUNCH_TRIED=0        # 是否已经发起过 roslaunch（收尾时区分「还�
 CAM_TRIED=0           # 是否已经发起过相机 roslaunch
 SHUTTING_DOWN=0
 MISSING_NODES=""
+FC_TIME_PID=""        # 飞控校时脚本（timeout 包装）的 PID，收尾时停掉它以释放串口
 
 # /proc/<pid>/stat 的第 22 个字段 = 进程启动时刻（自开机起的 tick 数）。comm 字段可能
 # 含空格和括号，所以先贪婪砍到最后一个 ')' 再数第 20 个字段。exec 不改变 PID 与启动时刻，
@@ -394,13 +406,22 @@ verify_clean() {
 }
 
 on_signal() {
-  local _sig="$1" _code="$2"
+  local _sig="$1" _code="$2" _i=0
   if [ "$SHUTTING_DOWN" -eq 1 ]; then
     warn "收尾进行中，忽略重复的 SIG$_sig"
     return
   fi
   SHUTTING_DOWN=1
   hr; warn "收到 SIG$_sig：只收拢本次启动的 roslaunch（pid=${ROSLAUNCH_PID:-未启动}）"
+  if [ -n "$FC_TIME_PID" ]; then
+    # timeout 把 SIGTERM 转给校时脚本，脚本先关掉飞控上的 MAVLink shell 再退出（< 1 s）；
+    # 等它放开串口，下面的收尾检查才不会误报串口被占用
+    log "停止飞控校时脚本（pid=$FC_TIME_PID）"
+    kill -TERM "$FC_TIME_PID" 2>/dev/null
+    while kill -0 "$FC_TIME_PID" 2>/dev/null && [ "$_i" -lt 15 ]; do
+      sleep 0.2; _i=$((_i + 1))
+    done
+  fi
   stop_camera
   stop_roslaunch
   verify_clean
@@ -418,7 +439,7 @@ esac
 
 # ============================================================== 前置检查 =====
 hr; log "融合快速启动（日志：$LOGFILE）"
-hr; log "步骤 1/3：前置检查（环境 / 串口 / 防重复启动）"
+hr; log "步骤 1/3：前置检查（环境 / 串口 / 防重复启动 / 板端时钟）"
 
 [ -f "$ROS_SETUP" ] || { err "缺少 $ROS_SETUP"; exit 1; }
 [ -f "$WS_SETUP" ]  || { err "缺少 $WS_SETUP，请先在板端 catkin build"; exit 1; }
@@ -498,6 +519,106 @@ if timeout 5 rosnode list >/dev/null 2>&1; then
 else
   log "当前没有 ROS Master，将由本次 roslaunch 创建"
 fi
+
+# 板端 RTC 掉电不保持：开机先用 fake-hwclock 存的旧时间，chrony 连上外网时间源后
+# 再一次性跳到正确时间（makestep 1 3；实测开机约 30 s 时跳了 +1045 s）。MID-360S 没接
+# PTP，雷达/IMU 时间戳就是板端系统时间：链路运行中时间一跳，往前跳 FAST-LIO 的 IMU
+# 积分会出错，往回跳桥接直接 fatal。所以先等 chrony 对上、剩余偏差足够小再启动。
+# 每轮只阻塞 ≤ 3 s，等待期间 Ctrl+C 照样能及时处理；计时用 /proc/uptime（开机以来的
+# 单调时间），不受等待期间时钟跳变影响。
+clock_status() {  # 输出 "<Leap status> <剩余偏差绝对值(秒)>"；chronyd 不可达时返回非 0
+  local _t
+  _t="$(timeout 3 chronyc -n tracking 2>/dev/null)" || return 1
+  printf '%s\n' "$_t" | awk -F': *' '
+    /^Leap status/ { leap = $2; gsub(/ /, "_", leap) }
+    /^System time/ { split($2, a, " "); off = a[1] + 0; if (off < 0) off = -off }
+    END { if (leap == "" || off == "") exit 1; printf "%s %.6f\n", leap, off }'
+}
+uptime_s() { awk '{ printf "%d\n", $1 }' /proc/uptime; }
+check_clock() {
+  local _t0="" _leap="" _off="" _why="" _waiting=0
+  if ! command -v chronyc >/dev/null 2>&1; then
+    _why="找不到 chronyc"
+  else
+    _t0="$(uptime_s)"
+    while :; do
+      if read -r _leap _off < <(clock_status); then
+        if [ "$_leap" = "Not_synchronised" ]; then
+          _why="chrony 还没同步上时间源"
+        elif awk -v o="$_off" -v m="$CLOCK_MAX_OFFSET" 'BEGIN { exit !(o < m) }'; then
+          ok "板端时间已由 chrony 对上（剩余偏差 ${_off} s）"
+          CLOCK_SYNCED=1
+          return 0
+        else
+          _why="chrony 已同步，但剩余偏差 ${_off} s 超过 ${CLOCK_MAX_OFFSET} s，还在修正"
+        fi
+      else
+        _why="chronyd 无响应"
+      fi
+      [ $(( $(uptime_s) - _t0 )) -ge "$CLOCK_SYNC_TIMEOUT" ] && break
+      if [ "$_waiting" -eq 0 ]; then
+        _waiting=1
+        log "板端时间还没对上（${_why}），等 chrony 对时，最多 ${CLOCK_SYNC_TIMEOUT} s"
+      fi
+      sleep 2
+    done
+  fi
+  if [ "$ALLOW_UNSYNCED_CLOCK" -eq 1 ]; then
+    warn "板端时间没对上（${_why}），按 --allow-unsynced-clock 继续启动"
+    warn "运行中一旦连上外网，chrony 可能一次性跳时间，FAST-LIO 出错或桥接 fatal，整条链路会停"
+    return 0
+  fi
+  err "板端时间没对上（${_why}）"
+  err "现在启动，运行中 chrony 一旦拿到时间源就可能一次性跳时间，FAST-LIO/桥接会断"
+  err "确认外网后重试（chronyc tracking 看 Leap status）；确定没外网也要启动，加 --allow-unsynced-clock"
+  return 1
+}
+check_clock || exit 1
+# 等对时期间时钟可能已经跳过，收尾筛「本次生成的 bag」的起点按对时之后重取
+RUN_START_TS="$(date +%s)"
+
+# ============================================================== 飞控校时 =====
+# Pixhawk 6C 的 RTC 断电停走、开机接着走（每断一次电慢一个断电时长），PX4 又只在自身
+# 时钟早于 2009 年时才接受 MAVROS 的 SYSTEM_TIME，所以趁 MAVROS 还没占用串口，由
+# fc_set_time.py 走 MAVLink shell 执行 date -s 写进飞控 RTC。只影响 ulog 文件名/日期，
+# 不影响融合，所以任何情况都只告警、不拦启动。板端没对上（--allow-unsynced-clock 放行）
+# 时不写，免得把错误时间带给飞控。
+sync_fc_time() {
+  local _pid _rc _line
+  hr; log "飞控校时：把板端时间写进飞控 RTC"
+  if [ "$CLOCK_SYNCED" -ne 1 ]; then
+    warn "板端时间没对上，跳过飞控校时（本次 ulog 文件名时间可能不准）"
+    return 0
+  fi
+  if [ ! -f "$FC_TIME_PY" ]; then
+    warn "缺 $FC_TIME_PY，跳过飞控校时"
+    return 0
+  fi
+  if command -v fuser >/dev/null 2>&1 && fuser "$TTY" >/dev/null 2>&1; then
+    warn "$TTY 正被别的进程占用，跳过飞控校时"
+    return 0
+  fi
+  # 放后台再 wait：等待期间收到 Ctrl+C/SIGTERM 能立即进 on_signal（此时 roslaunch 还没起，
+  # 脚本自带总时限，到时自己退出并释放串口）
+  timeout "$FC_TIME_TIMEOUT" python3 "$FC_TIME_PY" --dev "$TTY" --baud "${FCU_URL##*:}" \
+    >"$RUN_DIR/fc_time.out" 2>&1 &
+  _pid=$!
+  FC_TIME_PID="$_pid"
+  wait "$_pid"; _rc=$?
+  FC_TIME_PID=""
+  while IFS= read -r _line; do
+    [ -n "$_line" ] && log "  $_line"
+  done <"$RUN_DIR/fc_time.out"
+  case "$_rc" in
+    0)   ok "飞控时间与板端对齐（误差 1 s 内）" ;;
+    2)   warn "飞控已解锁，跳过飞控校时" ;;
+    3)   warn "缺 pymavlink，跳过飞控校时（python3 -m pip install --user pymavlink）" ;;
+    124) warn "飞控校时超过 ${FC_TIME_TIMEOUT} s 没完成，跳过（本次 ulog 文件名时间可能不准）" ;;
+    *)   warn "飞控校时失败（退出码 $_rc），不影响启动（本次 ulog 文件名时间可能不准）" ;;
+  esac
+  return 0
+}
+sync_fc_time
 
 # ============================================================== 启动 =========
 hr; log "步骤 2/3：启动统一 launch（scripts/launch/fusion.launch）"
