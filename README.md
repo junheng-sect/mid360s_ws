@@ -19,6 +19,7 @@ mid360s_ws/
 │   ├── build.sh                   # 一键编译脚本（构建并安装本地 SDK，配置并编译 ROS 包）
 │   ├── build_map.py               # 无人机建图：驱动 + FAST-LIO2 存图 + 录原始包，收尾后摆正降采样
 │   ├── car_reloc.py               # M65 小车定位检查与板端重定位（经 rosbridge，不依赖 ROS master）
+│   ├── map_flight.sh              # 飞行建图：fusion.sh + 录原始点云到 ~/test_data/mapping，落地后离线建图
 │   └── start_mid360s_fastlio.sh   # 一键启动驱动与 FAST-LIO2 算法节点（含前置检查与进程锁）
 ├── src/
 │   ├── FAST_LIO/                  # FAST-LIO2 算法包
@@ -337,3 +338,26 @@ cd /home/orangepi/mid360s_ws/scripts
 - 离线重建不用仿真时间：FAST-LIO 只认消息时间戳，而它的主循环在仿真时间下，回放一停就出不来，地图存不下来。
 - 前置检查和 `start_mid360s_fastlio.sh` 一样，但要求板端没有正在运行的 ROS master。实机还会先等 chrony 对上时间（同 fusion.sh，最多 60 s）：雷达用板端系统时间打戳，建图中时间一跳地图就作废；没外网时加 `--allow-unsynced-clock`。
 
+### 飞行建图（map_flight.sh）
+
+手持建图时，人一直在雷达附近；下压机头去扫低处，还会让 FAST-LIO 退化。正式的先验地图建议飞着建。
+`scripts/map_flight.sh` 用 `fusion.sh` 起整条飞行链路，另外起一个 C++ `rosbag record`，从 fusion 起来、飞机还在地上静止时开始，
+一直录到按 Ctrl+C：录 `/livox/lidar /livox/imu /tf_static /fastlio/gravity_init /Odometry`，存成
+`~/test_data/mapping/flight_raw_<时间>.bag`。fusion 停下后，脚本对这个包跑 `build_map.py --bag`，在离线状态下建图。
+fusion 自带的 RC 触发录包和以前一样，只是也放进 `~/test_data/mapping`，前缀改成 `flight_rc`。`fusion.sh` 和 `rc_record` 都没改。
+
+原始点云不交给 fusion 的 Python 录包节点去录：它按消息类型订阅，每帧约 2 万个点都要先反序列化、再序列化，
+在 A76 大核上要 69 ms/帧，10 Hz 时占掉大半个核；在 A55 小核上要 292 ms/帧，根本跟不上。
+C++ 的 `rosbag record` 不解析消息内容，直接写字节，只要 0.03 ms/帧。
+
+```bash
+cd /home/orangepi/mid360s_ws/scripts
+./map_flight.sh                     # 默认前缀 flight
+./map_flight.sh --no-winch --no-build   # 非系留飞行、只录包（之后再 ./build_map.py --bag 包）
+```
+
+飞的时候：
+- 飞机在地上保持静止，等终端出现「原始包开始录」再起飞。离线建图时，FAST-LIO 用包开头的静止段做初始化。
+- 机身保持基本水平，平移不超过 0.3 m/s，yaw 先控制在 15°/s 以内（10-18 那次以 46°/s 转 yaw 时，FAST-LIO 的位置错了约 1.5 m）。
+- 落回起飞点后，静止几秒再按 Ctrl+C。离线建图按 1 倍速重放，原始包有多长就要再等多久。
+- 建议在 NoMachine 的板端桌面终端或 tmux 里运行：ssh 一断，本脚本就会被杀掉。录包进程在独立会话里，发现 ROS master 停了约 10 s 后会自己收尾；但落地后不会再自动建图，需要手动跑 `build_map.py --bag`。

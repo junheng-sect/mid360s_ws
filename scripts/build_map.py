@@ -225,7 +225,7 @@ def floor_fit(p):
     zb = z[z < -0.05]
     if len(zb) < 500:
         return None
-    e = np.arange(np.percentile(zb, 0.2), -0.05 + 0.02, 0.02)
+    e = np.arange(np.percentile(zb, 0.2) - 0.1, -0.05 + 0.02, 0.02)   # 往下留 0.1 m：没有噪点时地面峰会落在第一格，找峰会漏掉
     if len(e) < 4:
         return None
     h, e = np.histogram(zb, e)
