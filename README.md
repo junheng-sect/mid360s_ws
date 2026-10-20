@@ -340,24 +340,34 @@ cd /home/orangepi/mid360s_ws/scripts
 
 ### 飞行建图（map_flight.sh）
 
-手持建图时，人一直在雷达附近；下压机头去扫低处，还会让 FAST-LIO 退化。正式的先验地图建议飞着建。
-`scripts/map_flight.sh` 用 `fusion.sh` 起整条飞行链路，另外起一个 C++ `rosbag record`，从 fusion 起来、飞机还在地上静止时开始，
-一直录到按 Ctrl+C：录 `/livox/lidar /livox/imu /tf_static /fastlio/gravity_init /Odometry`，存成
-`~/test_data/mapping/flight_raw_<时间>.bag`。fusion 停下后，脚本对这个包跑 `build_map.py --bag`，在离线状态下建图。
-fusion 自带的 RC 触发录包和以前一样，只是也放进 `~/test_data/mapping`，前缀改成 `flight_rc`。`fusion.sh` 和 `rc_record` 都没改。
+`scripts/map_flight.sh` 用 `fusion.sh` 启动飞行定位链路，**CH6 同时控制轻量包和原始点云包**。
+启动后先待命，不自动录点云；开关先置关闭位，再拨到开启位开始录。CH6 关闭后，沿用轻量包的约 1 s 尾巴一起收尾。
+飞控 ULog 继续由现有 CH6 / AUX1 配置触发；软件去抖、尾巴和进程启动会有延迟，不是逐帧精确同步，本脚本不修改飞控参数。
 
-原始点云不交给 fusion 的 Python 录包节点去录：它按消息类型订阅，每帧约 2 万个点都要先反序列化、再序列化，
-在 A76 大核上要 69 ms/帧，10 Hz 时占掉大半个核；在 A55 小核上要 292 ms/帧，根本跟不上。
-C++ 的 `rosbag record` 不解析消息内容，直接写字节，只要 0.03 ms/帧。
+原始点云由独立 C++ `rosbag record` 录制，Python 控制器只接收 `/rc_record/bag_path` 和 `/rc_record/status`，不解析点云。
+脚本强制 `RC_RECORD_RAW_CLOUD=false`，避免继承环境变量重新打开 Python 点云订阅。C++ 仍有网络、缓冲、内存和写盘开销。
+
+每次 CH6 开关对应一组包，保存在 `~/test_data/mapping`：
+
+- `flight_rc_000001.bag`：原来的轻量话题。
+- `flight_raw_000001.bag`：`/livox/lidar /livox/imu /tf_static /fastlio/gravity_init /Odometry`。
+
+两包共用序号；CH6 可反复开关。fusion 退出后，按本次记录清单逐个对原始包运行 `build_map.py --bag` 离线建图；未开 CH6 就不生成包、不建图。
+录包故障日志保留在 `logs/fusion/map_flight_*.log`。原有 `fusion.sh` 和轻量录包逻辑不变。
 
 ```bash
 cd /home/orangepi/mid360s_ws/scripts
-./map_flight.sh                     # 默认前缀 flight
-./map_flight.sh --no-winch --no-build   # 非系留飞行、只录包（之后再 ./build_map.py --bag 包）
+./map_flight.sh --no-camera             # 系留，保留绕线器
+./map_flight.sh --no-winch --no-camera  # 非系留
+./map_flight.sh --no-winch --no-build   # 只录包，之后手动离线建图
 ```
 
-飞的时候：
-- 飞机在地上保持静止，等终端出现「原始包开始录」再起飞。离线建图时，FAST-LIO 用包开头的静止段做初始化。
-- 机身保持基本水平，平移不超过 0.3 m/s，yaw 先控制在 15°/s 以内（10-18 那次以 46°/s 转 yaw 时，FAST-LIO 的位置错了约 1.5 m）。
-- 落回起飞点后，静止几秒再按 Ctrl+C。离线建图按 1 倍速重放，原始包有多长就要再等多久。
-- 建议在 NoMachine 的板端桌面终端或 tmux 里运行：ssh 一断，本脚本就会被杀掉。录包进程在独立会话里，发现 ROS master 停了约 10 s 后会自己收尾；但落地后不会再自动建图，需要手动跑 `build_map.py --bag`。
+操作顺序：
+
+1. 启动时 CH6 关闭，飞机静止；等待链路运行和「CH6 原始录包待命」。
+2. CH6 开，确认「CH6 开：启动 C++ 原始点云录包」，保持地面静止 5–10 s，再进行采图；每个独立原始包都要有自己的静止初始化段。
+3. 落地上锁，保持静止几秒，CH6 关，等待「原始包已收尾」。
+4. 按一次 Ctrl+C，等待同步落盘和全部离线建图完成再断电。离线重建约需原始包时长。
+
+建议在 NoMachine 板端桌面终端或 tmux 中运行。控制器对终止信号、master/录包状态丢失会收尾原始包；终端断开后不会自动完成离线建图。
+10-18 转向险情仍未完成原因闭环；更改录包触发和实现不代表已通过实飞安全验证。
