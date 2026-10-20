@@ -89,7 +89,7 @@ mid360s_ws/
 - **基线提交**: `70fc8a2` ("mid360", 2025-04-07)
 - **许可证**: GPLv2 (见 `src/voxel_slam/LICENSE`)
 - **已有适配**:
-  - 只收入上游 `VoxelSLAM/` 子目录（包名 `voxel_slam`）；`VoxelSLAMPointCloud2/` 和 `figure/` 没收，上游 README 存为 `README_upstream.md`。
+  - 只收入上游 `VoxelSLAM/` 子目录（包名 `voxel_slam`）；`VoxelSLAMPointCloud2/` 和 `figure/` 没收；包内 `README.md` 是中文用法说明（含上游 README 的要点）。
   - `CMakeLists.txt`、`package.xml`、`src/feature_point.hpp`、`src/voxelslam.cpp`: 依赖与 `CustomMsg` 回调由 `livox_ros_driver` 改为 `livox_ros_driver2`（共 7 行）。
   - 参数不改上游文件，`drone_mapping/config/voxelslam_mid360s.yaml` 是上游 `config/mid360.yaml` 的副本。
 
