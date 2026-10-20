@@ -43,6 +43,20 @@ def count_frames(d):
         return 0
 
 
+def _hint(log_path):
+    """节点没存出位姿就退出时，按日志末尾给个能看懂的原因"""
+    try:
+        with open(log_path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 20000))
+            tail = f.read().decode('utf-8', 'replace')
+    except OSError:
+        return ''
+    if 'Too Less Voxel' in tail:   # 上游 voxel_map.hpp 里的硬退出：全局 BA 的平面体素比线程数还少，exit(0)
+        return '：全局 BA 报 Too Less Voxel 后退出，设备几乎没动（只有一个关键帧），静止数据建不了图，建图时要走动起来'
+    return ''
+
+
 def _stop(p, timeout=10.0):
     """整个进程组先 SIGINT，超时 SIGKILL（roslaunch 的节点和它在同一个进程组里）"""
     if p is None or p.poll() is not None:
@@ -157,7 +171,8 @@ def run(bag, work, config, log_path, rate=1.0, say=print, abort=lambda: False):
             time.sleep(0.2)
         info['gba_s'] = round(time.time() - t2 - 1.0, 1)
         if not os.path.isfile(state):
-            raise RuntimeError('voxelslam 退出了（roslaunch %s），没有位姿文件，看 %s' % (launch.returncode, log_path))
+            raise RuntimeError('voxelslam 退出了（roslaunch %s），没有位姿文件%s，看 %s'
+                               % (launch.returncode, _hint(log_path), log_path))
     finally:
         for p in reversed(procs):
             _stop(p)
