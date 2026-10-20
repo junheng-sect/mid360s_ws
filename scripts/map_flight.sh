@@ -6,12 +6,14 @@
 # 点云包 NAME_raw_000001.bag 与轻量包 NAME_rc_000001.bag 共用序号。
 # 原始包录 /livox/lidar /livox/imu /tf_static /fastlio/gravity_init /Odometry。
 # 每次开录时飞机在地面静止 5–10 s，供该包离线初始化；落地上锁、CH6 关后再 Ctrl+C。
+# 退出后对每个原始包调 drone_mapping 的 build_map --bag（离线 Voxel-SLAM，耗时约等于包长）。
 # Python 控制器只监听轻量开/关包事件和状态，不解析点云。
 # C++ 仍有网络/缓冲/磁盘开销，改录包方式不代表此前飞行异常已经解决。
 # --no-build 只录包；其余三个开关传给 fusion。原始包在 ~/test_data/mapping。
 set -o pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS="$(cd "$DIR/.." && pwd)"
+BUILD_MAP="$WS/src/drone_mapping/scripts/build_map"   # = rosrun drone_mapping build_map
 BAG_DIR="/home/orangepi/test_data/mapping"
 PREFIX="flight"
 DO_BUILD=1
@@ -34,7 +36,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 [[ "$PREFIX" =~ ^[A-Za-z0-9_-]+$ ]] || { echo '--prefix 只能用字母、数字、_、-' >&2; exit 2; }
-for f in "$DIR/fusion.sh" "$DIR/build_map.py" "$REC_BIN"; do
+for f in "$DIR/fusion.sh" "$BUILD_MAP" "$REC_BIN"; do
   [ -x "$f" ] || { echo "缺少 $f" >&2; exit 1; }
 done
 [ -f "$RAW_HELPER" ] || { echo "缺少 $RAW_HELPER" >&2; exit 1; }
@@ -162,8 +164,8 @@ for RAW in "${RAW_BAGS[@]}"; do
   fi
   log "原始包 $(basename "$RAW")：$(du -h "$RAW" | cut -f1)"
   if [ "$DO_BUILD" -eq 0 ]; then
-    log "--no-build：保留原始包。之后可以：$DIR/build_map.py --bag $RAW"
-  elif ! "$DIR/build_map.py" --bag "$RAW" --name "$(basename "$RAW" .bag)"; then
+    log "--no-build：保留原始包。之后可以：rosrun drone_mapping build_map --bag $RAW"
+  elif ! "$BUILD_MAP" --bag "$RAW" --name "$(basename "$RAW" .bag)"; then
     log "建图没完成；原始包在 $RAW"
     FAILED=1
   fi

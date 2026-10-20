@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>drone_mapping</name>
+  <version>0.1.0</version>
+  <description>
+    无人机先验地图建图：实机拉起 MID-360S 驱动 + FAST-LIO2 + 重力桥并录原始包，收尾后离线跑 Voxel-SLAM，
+    拼成 world 系的 map_world.pcd / meta.json / preview.png（drone_reloc 用）。--algo fastlio 保留 FAST-LIO 存图的旧做法。
+  </description>
+  <maintainer email="kawhi224@gmail.com">junhengsect</maintainer>
+  <license>GPLv2</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>rosbag</exec_depend>
+  <exec_depend>roslaunch</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>voxel_slam</exec_depend>
+  <exec_depend>fast_lio</exec_depend>
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>fastlio_gravity_bridge</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+</package>

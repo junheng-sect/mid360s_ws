@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""无人机建图入口：rosrun drone_mapping build_map [--bag RAW.bag | --post DIR] …，用法见 drone_mapping/build.py。
+没 source 工作空间时也能直接执行这个文件：先按源码路径导入，build.main 再套一层 bash 把 ROS 环境补上。"""
+import os
+import sys
+
+try:
+    from drone_mapping import build
+except ImportError:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'src'))
+    from drone_mapping import build
+
+if __name__ == '__main__':
+    try:
+        sys.exit(build.main(os.path.realpath(__file__)))
+    except KeyboardInterrupt:  # 还没进入建图（前置检查、等对时）时按 Ctrl+C
+        sys.exit(130)

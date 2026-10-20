@@ -1,0 +1,18 @@
+<launch>
+  <!-- 起 Voxel-SLAM 节点（离线建图时由 build_map 在独立 master 上调用）。单独用：
+         roscore 起来以后 roslaunch drone_mapping voxelslam.launch save_path:=/一个已存在的目录/
+         rosbag play 原始包（只放 /livox/lidar、/livox/imu），放完、处理完再 rosparam set /finish true，
+         位姿写到 <save_path><bagname>/alidarState.txt（同目录还有逐帧点云）。
+       Voxel-SLAM 读全局参数（General/… 和 /finish），所以 rosparam 加载在全局命名空间。 -->
+  <arg name="config" default="$(find drone_mapping)/config/voxelslam_mid360s.yaml"/>
+  <arg name="save_path"/>                <!-- 以 / 结尾；<save_path><bagname>/ 事先存在的话节点会直接退出 -->
+  <arg name="bagname" default="vs"/>
+
+  <rosparam command="load" file="$(arg config)"/>
+  <param name="General/save_path" type="str" value="$(arg save_path)"/>
+  <param name="General/bagname" type="str" value="$(arg bagname)"/>
+  <param name="General/is_save_map" type="int" value="1"/>   <!-- 不开就不写位姿文件 -->
+  <param name="finish" type="bool" value="false"/>
+
+  <node pkg="voxel_slam" type="voxelslam" name="voxelslam" output="screen" required="true"/>
+</launch>

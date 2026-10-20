@@ -16,12 +16,17 @@
 ```
 mid360s_ws/
 ├── scripts/
-│   ├── build.sh                   # 一键编译脚本（构建并安装本地 SDK，配置并编译 ROS 包）
-│   ├── build_map.py               # 无人机建图：驱动 + FAST-LIO2 存图 + 录原始包，收尾后摆正降采样
+│   ├── build.sh                   # 一键编译脚本（构建并安装本地 SDK 和 GTSAM，配置并编译 ROS 包）
+│   ├── build_map.py               # 兼容入口，转发到 rosrun drone_mapping build_map
 │   ├── car_reloc.py               # M65 小车定位检查与板端重定位（经 rosbridge，不依赖 ROS master）
 │   ├── map_flight.sh              # 飞行建图：fusion.sh + 录原始点云到 ~/test_data/mapping，落地后离线建图
 │   └── start_mid360s_fastlio.sh   # 一键启动驱动与 FAST-LIO2 算法节点（含前置检查与进程锁）
 ├── src/
+│   ├── drone_mapping/             # 无人机建图：实机录原始包，离线跑 Voxel-SLAM 拼成先验地图（详见包内 README）
+│   │   ├── config/voxelslam_mid360s.yaml
+│   │   ├── launch/voxelslam.launch
+│   │   └── scripts/build_map      # 入口
+│   ├── voxel_slam/                # Voxel-SLAM 算法包（离线建图用，飞行定位仍用 FAST-LIO2）
 │   ├── FAST_LIO/                  # FAST-LIO2 算法包
 │   │   ├── config/mid360s.yaml    # MID-360S 传感器配置参数
 │   │   ├── include/ikd-Tree/      # ikd-Tree 数据结构源码（以普通目录纳入）
@@ -37,14 +42,15 @@ mid360s_ws/
 │       ├── launch_ROS1/msg_MID360s.launch
 │       └── package.xml            # ROS1 package.xml（版本受控跟踪）
 └── third_party/
-    └── Livox-SDK2/                # Livox SDK 2.0 源码（完全内嵌，避免拉取官方仓库）
+    ├── Livox-SDK2/                # Livox SDK 2.0 源码（完全内嵌，避免拉取官方仓库）
+    └── gtsam-4.0.3/               # GTSAM 4.0.3 源码（Voxel-SLAM 依赖，裁掉例子数据和自带 Eigen）
 ```
 
 ---
 
 ## 第三方组件来源与适配说明
 
-本仓库完整收纳以下四个上游开源组件，移除嵌套 Git 元数据与子模块配置，作为独立源码跟踪：
+本仓库完整收纳以下六个上游开源组件，移除嵌套 Git 元数据与子模块配置，作为独立源码跟踪：
 
 ### 1. FAST_LIO
 - **上游地址**: `https://github.com/hku-mars/FAST_LIO.git`
@@ -78,6 +84,23 @@ mid360s_ws/
 - **许可证**: Apache-2.0 (见 `third_party/Livox-SDK2/LICENSE.txt`)
 - **已有适配**: 整体收入 `third_party/Livox-SDK2`，由构建脚本自动编译并安装到工作空间临时依赖目录 `.deps/livox-sdk2`。
 
+### 5. Voxel-SLAM
+- **上游地址**: `https://github.com/hku-mars/Voxel-SLAM.git`
+- **基线提交**: `70fc8a2` ("mid360", 2025-04-07)
+- **许可证**: GPLv2 (见 `src/voxel_slam/LICENSE`)
+- **已有适配**:
+  - 只收入上游 `VoxelSLAM/` 子目录（包名 `voxel_slam`）；`VoxelSLAMPointCloud2/` 和 `figure/` 没收，上游 README 存为 `README_upstream.md`。
+  - `CMakeLists.txt`、`package.xml`、`src/feature_point.hpp`、`src/voxelslam.cpp`: 依赖与 `CustomMsg` 回调由 `livox_ros_driver` 改为 `livox_ros_driver2`（共 7 行）。
+  - 参数不改上游文件，`drone_mapping/config/voxelslam_mid360s.yaml` 是上游 `config/mid360.yaml` 的副本。
+
+### 6. GTSAM
+- **上游地址**: `https://github.com/borglab/gtsam.git`
+- **基线提交**: `6425000` (tag `4.0.3`，Voxel-SLAM README 要求的版本)
+- **许可证**: BSD (见 `third_party/gtsam-4.0.3/LICENSE`)
+- **已有适配**: 收入 `third_party/gtsam-4.0.3`，删掉 `examples/Data/`（例子数据 29 MB）、`gtsam/3rdparty/Eigen/`（17 MB，只在 `GTSAM_USE_SYSTEM_EIGEN=OFF` 时用）和嵌套的 `.gitignore`，源码未改。
+  由构建脚本编译并安装到 `.deps/gtsam-4.0.3`：用系统 Eigen、不开 `march=native`、不编测试/例子/unstable/TBB，
+  并设 `CMAKE_INSTALL_RPATH`，`libgtsam.so` 自己找得到同目录的 `libmetis-gtsam.so`，运行时不用设 `LD_LIBRARY_PATH`。
+
 ---
 
 ## 系统依赖要求
@@ -91,12 +114,14 @@ mid360s_ws/
 
 ## 构建步骤
 
-工作空间构建采用提供的 `scripts/build.sh` 脚本统一执行，过程包含本地 SDK 构建与 ROS 包编译：
+工作空间构建采用提供的 `scripts/build.sh` 脚本统一执行，过程包含本地 SDK、GTSAM 构建与 ROS 包编译：
 
 ```bash
 cd /home/orangepi/mid360s_ws
 ./scripts/build.sh
 ```
+
+GTSAM 第一次编译在板端约 6 min（`-j6`，并行数用环境变量 `GTSAM_JOBS` 改），之后是增量编译。
 
 构建完成后加载环境：
 
@@ -309,34 +334,42 @@ cd /home/orangepi/mid360s_ws/scripts
 和退出码见脚本开头说明。依赖 roslibpy（`pip --user`）、numpy、`python3-opencv`，板端已装。
 室内地图上一次完整重定位约 16 s：检查约 2 s，全局匹配约 4 s，车端搜索恢复约 4 s。
 
-## 无人机建图（build_map.py）
+## 无人机建图（drone_mapping）
 
-`scripts/build_map.py` 拉起 MID-360S 驱动、FAST-LIO2 和重力对齐桥接，同时录原始包；按 Ctrl+C 结束后，
-FAST-LIO 写出地图，脚本再把地图摆正、降采样、出预览图。每次的产出放在 `~/test_data/mapping/<时间>/`。
-FAST-LIO 的 `pcd_save_en` 只在脚本生成的 launch 里打开，`mid360s.yaml` 不动，fusion 飞行不受影响。
+建图做成了功能包 `src/drone_mapping`（详见[包内 README](src/drone_mapping/README.md)）。实机拉起 MID-360S 驱动、FAST-LIO2 和重力对齐桥接，
+同时录原始包；按 Ctrl+C 结束后，**离线对原始包跑 Voxel-SLAM**，再用它的轨迹把原始点拼成 `world` 系地图、出预览图。
+每次的产出放在 `~/test_data/mapping/<时间>/`，`map_world.pcd` + `meta.json` 的格式没变，`drone_reloc.py --map` 直接用。
+Voxel-SLAM 只用来建图；飞行定位仍是 FAST-LIO，`mid360s.yaml` 和 fusion 飞行链路不受影响。
 
 ```bash
-cd /home/orangepi/mid360s_ws/scripts
-./build_map.py                    # 实机建图：等提示「初始化完成」再走，回到起点按 Ctrl+C
-./build_map.py --name lab         # 输出目录名加后缀
-./build_map.py --bag ~/test_data/mapping/<时间>/raw.bag   # 用录好的原始包离线重建
-./build_map.py --post ~/test_data/mapping/<时间>          # 只重做后处理（比如换 --voxel）
+source /opt/ros/noetic/setup.bash && source /home/orangepi/mid360s_ws/devel/setup.bash
+rosrun drone_mapping build_map                     # 实机建图：等提示「初始化完成」再走，回到起点按 Ctrl+C
+rosrun drone_mapping build_map --name lab          # 输出目录名加后缀
+rosrun drone_mapping build_map --bag ~/test_data/mapping/<时间>/raw.bag   # 用录好的原始包离线重建
+rosrun drone_mapping build_map --post ~/test_data/mapping/<时间>          # 只重新拼图（比如换 --voxel），不重跑 SLAM
+rosrun drone_mapping build_map --algo fastlio      # 旧做法：FAST-LIO 存 scans.pcd 再摆正
 ```
+
+`scripts/build_map.py` 留作兼容入口，参数原样转给上面的命令。
 
 | 文件 | 内容 |
 |---|---|
-| `raw.bag` | 实机：`/livox/lidar` `/livox/imu` `/tf_static` `/fastlio/gravity_init` `/Odometry`（离线时是只含后三个话题的 `odom.bag`） |
-| `scans.pcd` | FAST-LIO 原样输出：`camera_init` 系、稠密、未降采样 |
-| `map_world.pcd` | 摆正到 `world`（z 朝上，原点 = 起点时的雷达 IMU，yaw 不动），0.05 m 体素，字段 `x y z intensity` |
+| `raw.bag` | 实机：`/livox/lidar` `/livox/imu` `/tf_static` `/fastlio/gravity_init` `/Odometry` |
+| `map_world.pcd` | `world` 系（z 朝上，原点 = 起点时的雷达 IMU，yaw 不动），0.05 m 体素，字段 `x y z intensity` |
 | `preview.png` | 俯视、侧视和轨迹 |
-| `meta.json` | 点数、`world←camera_init`、地面拟合（起点离地高度、残余倾斜）、首尾位姿差、git 版本 |
+| `meta.json` | 算法、点数、地面拟合（起点离地高度、残余倾斜）、首尾位姿差、Voxel-SLAM 帧数和耗时、git 版本 |
+| `voxelslam_state.txt` / `voxelslam.yaml` / `voxelslam.log` | Voxel-SLAM 位姿（`--post` 用它重新拼图）、本次参数、输出 |
+
+`--algo fastlio` 时和以前一样另有 `scans.pcd`（离线时录 `odom.bag`），没有 `voxelslam_*`。
 
 注意：
-- FAST-LIO 只在节点正常退出时一次写出 `scans.pcd`。要用 Ctrl+C（或 SIGTERM）结束，脚本会按顺序收尾；
-  ssh 断开（SIGHUP）也按正常收尾存图。kill -9 或者掉电，这一次的地图就没了，原始包可能也不完整。
-- 每分钟约 400 万原始点、约 130 MB；单次建图建议控制在 5 min 内。
-- 离线重建不用仿真时间：FAST-LIO 只认消息时间戳，而它的主循环在仿真时间下，回放一停就出不来，地图存不下来。
-- 前置检查和 `start_mid360s_fastlio.sh` 一样，但要求板端没有正在运行的 ROS master。实机还会先等 chrony 对上时间（同 fusion.sh，最多 60 s）：雷达用板端系统时间打戳，建图中时间一跳地图就作废；没外网时加 `--allow-unsynced-clock`。
+- 按 Ctrl+C（或 SIGTERM）结束，脚本按顺序收尾：先停录包和 FAST-LIO、原始包落盘，再离线跑 Voxel-SLAM。
+  ssh 断开（SIGHUP）也照样跑完。离线建图这一步再按 Ctrl+C 就放弃建图，`raw.bag` 保留，之后可以 `--bag` 重做。
+- 离线建图按 1 倍速回放，耗时约为录制时长再加 30 s，板端约占 1 个核。只要不丢消息，倍速不改变结果。
+- 每分钟约 400 万原始点、约 130 MB；单次建图建议控制在 5 min 内。开头保持静止，FAST-LIO 和 Voxel-SLAM 都靠这一段初始化。
+- 前置检查和 `start_mid360s_fastlio.sh` 一样，实机要求板端没有正在运行的 ROS master（`--bag` 离线时不要求，Voxel-SLAM 用自己的 master）。
+  实机还会先等 chrony 对上时间（同 fusion.sh，最多 60 s）：雷达用板端系统时间打戳，建图中时间一跳地图就作废；没外网时加 `--allow-unsynced-clock`。
+- FAST-LIO 那一路：离线重建不用仿真时间（它的主循环在仿真时间下回放一停就出不来，地图存不下来）。
 
 ### 飞行建图（map_flight.sh）
 
@@ -352,7 +385,7 @@ cd /home/orangepi/mid360s_ws/scripts
 - `flight_rc_000001.bag`：原来的轻量话题。
 - `flight_raw_000001.bag`：`/livox/lidar /livox/imu /tf_static /fastlio/gravity_init /Odometry`。
 
-两包共用序号；CH6 可反复开关。fusion 退出后，按本次记录清单逐个对原始包运行 `build_map.py --bag` 离线建图；未开 CH6 就不生成包、不建图。
+两包共用序号；CH6 可反复开关。fusion 退出后，按本次记录清单逐个对原始包运行 `build_map --bag` 离线建图（Voxel-SLAM）；未开 CH6 就不生成包、不建图。
 录包故障日志保留在 `logs/fusion/map_flight_*.log`。原有 `fusion.sh` 和轻量录包逻辑不变。
 
 ```bash
