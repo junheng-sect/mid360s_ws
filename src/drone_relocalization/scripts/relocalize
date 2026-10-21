@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+import os
+import sys
+sys.dont_write_bytecode=True
+try:
+    from drone_relocalization.cli import main
+except ImportError:
+    pkg=os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    sys.path.insert(0,os.path.join(pkg,'src'))
+    sys.path.insert(0,os.path.join(os.path.dirname(pkg),'drone_mapping/src'))
+    from drone_relocalization.cli import main
+if __name__=='__main__':
+    try:sys.exit(main(os.path.realpath(__file__)))
+    except KeyboardInterrupt:sys.exit(130)

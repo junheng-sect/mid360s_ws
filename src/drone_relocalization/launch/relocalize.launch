@@ -1,0 +1,12 @@
+<launch>
+  <!-- Only localization and map visualization; reuse existing driver/LIO/bridge. -->
+  <arg name="map_dir" default="$(env HOME)/test_data/mapping/20261021_110311_indoor"/>
+  <arg name="config" default="$(find drone_relocalization)/config/indoor.yaml"/>
+  <arg name="rviz" default="false"/>
+  <!-- Display only: map in drone_map_view, world->drone_map_view identity until localized. -->
+  <arg name="view" default="true"/>
+  <node pkg="drone_relocalization" type="relocalize" name="drone_reloc" output="screen"
+        args="--map $(arg map_dir) --config $(arg config)"/>
+  <node if="$(arg view)" pkg="drone_relocalization" type="reloc_view" name="reloc_view" output="screen"/>
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="drone_reloc_rviz" args="-d $(find drone_relocalization)/rviz/indoor.rviz"/>
+</launch>

@@ -1,6 +1,17 @@
 # MID-360S 工作空间 (mid360s_ws)
 
 本项目为 Orange Pi 5 Max（RK3588，Ubuntu 20.04 + ROS Noetic）平台定制的 Livox MID-360S 激光雷达驱动与 FAST-LIO2 算法工作空间，采用单一独立仓库管理全部源码与内联依赖，构建不再依赖外部源码克隆。
+## 室内一次性重定位
+
+新增 [drone_relocalization](src/drone_relocalization/README.md)：复用已有雷达、FAST-LIO 和重力桥，两个独立静止窗口确认后锁定 `drone_map → world`；后续仅传播里程计，不接入飞控。只使用室内先验图。
+
+```bash
+export ROS_IP=192.168.31.32 && source /opt/ros/noetic/setup.bash && source ~/mid360s_ws/devel/setup.bash
+roslaunch drone_relocalization relocalize.launch
+```
+
+上述 launch 启动重定位和显示节点 `reloc_view`，默认地图 `~/test_data/mapping/20261021_110311_indoor`；传感器链需已运行且设备保持静止，成功时终端打印当前位置。本机看对照视图（彩色地图 + 白色实时点云，定位前错位、定位后重合）：`./scripts/run_rviz.sh --reloc`。中文接口、离线命令见包内 [说明](src/drone_relocalization/README.md) 与 [验收报告](src/drone_relocalization/ACCEPTANCE.md)（10-20 离线验收，旧图）。10-21 在新图上实机静止启动试过 3 次，都能锁定，没有用物理真值验收。
+
 ## 本地运行 RViz
 
 ```bash
@@ -18,6 +29,7 @@ mid360s_ws/
 ├── scripts/
 │   ├── build.sh                   # 一键编译脚本（构建并安装本地 SDK 和 GTSAM，配置并编译 ROS 包）
 │   ├── build_map.py               # 兼容入口，转发到 rosrun drone_mapping build_map
+│   ├── drone_reloc.py             # 兼容入口，转发到 drone_relocalization
 │   ├── car_reloc.py               # M65 小车定位检查与板端重定位（经 rosbridge，不依赖 ROS master）
 │   ├── map_flight.sh              # 飞行建图：fusion.sh + 录原始点云到 ~/test_data/mapping，落地后离线建图
 │   └── start_mid360s_fastlio.sh   # 一键启动驱动与 FAST-LIO2 算法节点（含前置检查与进程锁）
@@ -26,6 +38,7 @@ mid360s_ws/
 │   │   ├── config/voxelslam_mid360s.yaml
 │   │   ├── launch/voxelslam.launch
 │   │   └── scripts/build_map      # 入口
+│   ├── drone_relocalization/      # 室内一次性 SE3 重定位、双窗口确认、状态与先验地图显示
 │   ├── voxel_slam/                # Voxel-SLAM 算法包（离线建图用，飞行定位仍用 FAST-LIO2）
 │   ├── FAST_LIO/                  # FAST-LIO2 算法包
 │   │   ├── config/mid360s.yaml    # MID-360S 传感器配置参数
