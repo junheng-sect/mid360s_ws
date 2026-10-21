@@ -30,8 +30,8 @@
   <arg name="bag_prefix"     default="noprop"/>
   <arg name="bag_dir"        default="/home/orangepi/test_data/bags"/>
 
-  <!-- 1) MAVROS：飞控串口 -->
-  <include file="$(find mavros)/launch/px4.launch">
+  <!-- 1) MAVROS：飞控串口；经 mavros.launch，帧名换成 px4_map / px4_odom / drone_base -->
+  <include file="$(dirname)/mavros.launch">
     <arg name="fcu_url"       value="$(arg fcu_url)"/>
     <arg name="fcu_protocol"  value="$(arg fcu_protocol)"/>
     <arg name="tgt_system"    value="$(arg tgt_system)"/>

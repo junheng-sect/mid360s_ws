@@ -755,7 +755,7 @@ if roslaunch_alive; then
   2) 现场确认极性：rostopic echo /mavros/rc/in 看 channels[5]，
      或另开终端 rostopic echo /rc_record/status 看 state=REC/IDLE。
   3) 飞控 ulog 同向（SDLOG_MODE=3 + RC_MAP_AUX1=6）时，同一个开关同时录 bag 与 ulog。
-  4) 一次测试内不要重启链路：world 原点绑定 FAST-LIO 首次初始化，重启会跳变。
+  4) 一次测试内不要重启链路：drone_odom 原点绑定 FAST-LIO 首次初始化，重启会跳变。
 TIP
     echo
   fi

@@ -3,7 +3,7 @@
 本项目为 Orange Pi 5 Max（RK3588，Ubuntu 20.04 + ROS Noetic）平台定制的 Livox MID-360S 激光雷达驱动与 FAST-LIO2 算法工作空间，采用单一独立仓库管理全部源码与内联依赖，构建不再依赖外部源码克隆。
 ## 室内一次性重定位
 
-新增 [drone_relocalization](src/drone_relocalization/README.md)：复用已有雷达、FAST-LIO 和重力桥，两个独立静止窗口确认后锁定 `drone_map → world`；后续仅传播里程计，不接入飞控。只使用室内先验图。
+新增 [drone_relocalization](src/drone_relocalization/README.md)：复用已有雷达、FAST-LIO 和重力桥，两个独立静止窗口确认后锁定 `drone_map → drone_odom`；后续仅传播里程计，不接入飞控。只使用室内先验图。
 
 ```bash
 export ROS_IP=192.168.31.32 && source /opt/ros/noetic/setup.bash && source ~/mid360s_ws/devel/setup.bash
@@ -44,7 +44,7 @@ mid360s_ws/
 │   │   ├── config/mid360s.yaml    # MID-360S 传感器配置参数
 │   │   ├── include/ikd-Tree/      # ikd-Tree 数据结构源码（以普通目录纳入）
 │   │   └── launch/mapping_mid360s.launch
-│   ├── fastlio_gravity_bridge/    # 重力对齐桥接包（world 输出 + 带协方差位姿）
+│   ├── fastlio_gravity_bridge/    # 重力对齐桥接包（drone_odom 输出 + 带协方差位姿）
 │   │   ├── launch/gravity_bridge.launch
 │   │   ├── include/fastlio_gravity_bridge/   # 对齐旋转与协方差变换（纯数学 + 节点类）
 │   │   └── test/                  # 数学 / 协方差 / 消息测试
@@ -164,16 +164,16 @@ source devel/setup.bash
 
 ### 重力对齐桥接（fastlio_gravity_bridge）
 
-桥接节点订阅 FAST-LIO2 的输出，把 `camera_init` 下的里程计转换到重力对齐的 `world`（+Z 向上，
+桥接节点订阅 FAST-LIO2 的输出，把 `camera_init` 下的里程计转换到重力对齐的 `drone_odom`（+Z 向上，
 原点与 `camera_init` 相同，只做最小旋转、不调整 yaw，不代表已对准地理东/北）：
 
 | 话题 | 类型 | 说明 |
 |---|---|---|
 | `/Odometry` | `nav_msgs/Odometry` | 输入（`camera_init` → `body`） |
 | `/fastlio/gravity_init` | `geometry_msgs/Vector3Stamped`，latched | 输入：本次初始化的重力（`camera_init` 下），由 FAST-LIO2 在 IMU 初始化完成时发布一次 |
-| `/fastlio/odom_world` | `nav_msgs/Odometry` | 输出（`world` → `base_link`，保留输入时间戳；`twist` 原样透传） |
+| `/fastlio/odom_world` | `nav_msgs/Odometry` | 输出（`drone_odom` → `drone_base`，保留输入时间戳；`twist` 原样透传） |
 | `/fastlio/vision_pose_cov` | `geometry_msgs/PoseWithCovarianceStamped` | 输出（与上面同一位姿与协方差） |
-| `/tf_static` | — | `world → camera_init`（对齐旋转）与 `body → base_link`（机体安装旋转），本工作空间内唯一的发布者 |
+| `/tf_static` | — | `drone_odom → camera_init`（对齐旋转）与 `body → drone_base`（机体安装旋转），本工作空间内唯一的发布者 |
 
 **姿态表示机体，位置基点仍是雷达 IMU。** 输出姿态已抵消雷达 IMU 的安装倾角（本机实测约 18.8° 前倾），
 水平放置时 pitch ≈ 0；初始化时机体本身倾斜时，输出会如实保留该倾角，不再被归零。位置仍是雷达
@@ -182,14 +182,19 @@ IMU 的原点，**杆臂没有补偿**，该平移偏移留给下游 / 飞控参
 TF 树：
 
 ```
-world ──静态(q_a)──> camera_init ──FAST-LIO──> body ──静态(q_IB)──> base_link
-                                                (雷达 IMU)        (机体，原点=IMU)
+drone_odom ──静态(q_a)──> camera_init ──FAST-LIO──> body ──静态(q_IB)──> drone_base
+                                                     (雷达 IMU)        (机体，原点=IMU)
 ```
 
-安装旋转 `q_IB`（`body ← base_link`，即把机体系向量转到雷达 IMU 系）由 `mounting_source` 决定：
+帧名 10-21 改过：`world` → `drone_odom`，`base_link` → `drone_base`。改名前录的包仍能读，drone_relocalization 和
+drone_mapping 遇到旧名会按新名处理；话题名（`/fastlio/odom_world` 等）和地图文件名不变。MAVROS 统一经
+`scripts/launch/mavros.launch` 启动，它的帧名同时换成 `px4_map` / `px4_odom` / `drone_base`（见同目录
+`mavros_frames.yaml`），辅助帧 `drone_base → drone_base_frd` 挂在同一个机体上。
+
+安装旋转 `q_IB`（`body ← drone_base`，即把机体系向量转到雷达 IMU 系）由 `mounting_source` 决定：
 
 - `fixed`（**默认**）：固定安装旋转。`mounting_roll_deg` / `mounting_pitch_deg` / `mounting_yaw_deg`
-  （度）描述**雷达 IMU 在机体系（base_link，FLU）中的姿态**，按 ROS 固定轴 RPY 组合：
+  （度）描述**雷达 IMU 在机体系（drone_base，FLU）中的姿态**，按 ROS 固定轴 RPY 组合：
   `R_base←lidar = Rz(yaw)·Ry(pitch)·Rx(roll)`，节点内部取逆得到 `q_IB`。符号：pitch 正值 = 前倾
   （机头向下）；roll 正值 = 雷达右侧向下；yaw 正值 = 雷达前向朝左偏。`gravity_bridge.launch` 的默认值
   是本机实测安装角 roll `0.5` / pitch `18.8` / yaw `1.6`（10.3 台架 + 10.4 飞行标定；飞行报告的 FRD
@@ -350,7 +355,7 @@ cd /home/orangepi/mid360s_ws/scripts
 ## 无人机建图（drone_mapping）
 
 建图做成了功能包 `src/drone_mapping`（详见[包内 README](src/drone_mapping/README.md)）。实机拉起 MID-360S 驱动、FAST-LIO2 和重力对齐桥接，
-同时录原始包；按 Ctrl+C 结束后，**离线对原始包跑 Voxel-SLAM**，再用它的轨迹把原始点拼成 `world` 系地图、出预览图。
+同时录原始包；按 Ctrl+C 结束后，**离线对原始包跑 Voxel-SLAM**，再用它的轨迹把原始点拼成地图（地图系是建图那次的 `drone_odom`）、出预览图。
 每次的产出放在 `~/test_data/mapping/<时间>/`，`map_world.pcd` + `meta.json` 的格式没变，`drone_reloc.py --map` 直接用。
 Voxel-SLAM 只用来建图；飞行定位仍是 FAST-LIO，`mid360s.yaml` 和 fusion 飞行链路不受影响。
 
@@ -368,7 +373,7 @@ rosrun drone_mapping build_map --algo fastlio      # 旧做法：FAST-LIO 存 sc
 | 文件 | 内容 |
 |---|---|
 | `raw.bag` | 实机：`/livox/lidar` `/livox/imu` `/tf_static` `/fastlio/gravity_init` `/Odometry` |
-| `map_world.pcd` | `world` 系（z 朝上，原点 = 起点时的雷达 IMU，yaw 不动），0.05 m 体素，字段 `x y z intensity` |
+| `map_world.pcd` | 地图系，即建图那次的 `drone_odom`（z 朝上，原点 = 起点时的雷达 IMU，yaw 不动），0.05 m 体素，字段 `x y z intensity` |
 | `preview.png` | 俯视、侧视和轨迹 |
 | `meta.json` | 算法、点数、地面拟合（起点离地高度、残余倾斜）、首尾位姿差、Voxel-SLAM 帧数和耗时、git 版本 |
 | `voxelslam_state.txt` / `voxelslam.yaml` / `voxelslam.log` | Voxel-SLAM 位姿（`--post` 用它重新拼图）、本次参数、输出 |

@@ -18,7 +18,7 @@ def main():
     tests=[(-180,0,0),(-135,1,0),(-90,-1,0),(-45,0,1),(0,0,-1),(45,2,0),(90,-2,0),(135,0,2),(179,0,-2)]
     for y,roll,pitch in tests:
         expected=rotz(math.radians(y))@exp(np.radians([roll,pitch,0]));translation=np.array([1.3,-.8,.6])
-        # Re-express the SAME observed cloud in a synthetic world frame. Expected map<-world is known exactly relative to ref.
+        # Re-express the SAME observed cloud in a synthetic drone_odom frame. Expected map<-drone_odom is known exactly relative to ref.
         source=(pmap-translation)@expected;c=(cmap-translation)@expected
         r=relocalize(M,source,c);er=ea=None
         if 'transform' in r:

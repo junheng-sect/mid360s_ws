@@ -45,11 +45,16 @@ def main():
         frames=[point_cloud2.create_cloud_xyz32(Header(frame_id='camera_init'),p.astype('f4').tolist()) for p in np.array_split(cloud,20)]
         pub_od=rospy.Publisher('/Odometry',Odometry,queue_size=10);pub_cl=rospy.Publisher('/cloud_registered',PointCloud2,queue_size=10)
         broadcaster=tf2_ros.StaticTransformBroadcaster();tf=[]
-        for a,b,R,t in [('world','camera_init',S.Rwc,S.twc),('body','base_link',S.Rib,S.tib)]:
-            tr=TransformStamped();tr.header.frame_id=a;tr.child_frame_id=b;tr.header.stamp=rospy.Time.now()
-            tr.transform.translation.x,tr.transform.translation.y,tr.transform.translation.z=t
-            tr.transform.rotation.x,tr.transform.rotation.y,tr.transform.rotation.z,tr.transform.rotation.w=R_quat(R);tf.append(tr)
-        broadcaster.sendTransform(tf)
+        def init_tf(names):
+            out=[]
+            for (a,b),(R,t) in zip(names,[(S.Rwc,S.twc),(S.Rib,S.tib)]):
+                tr=TransformStamped();tr.header.frame_id=a;tr.child_frame_id=b;tr.header.stamp=rospy.Time.now()
+                tr.transform.translation.x,tr.transform.translation.y,tr.transform.translation.z=t
+                tr.transform.rotation.x,tr.transform.rotation.y,tr.transform.rotation.z,tr.transform.rotation.w=R_quat(R);out.append(tr)
+            return out
+        tf=init_tf([('drone_odom','camera_init'),('body','drone_base')]);broadcaster.sendTransform(tf)
+        # Pre-10-21 names, sent alone by a fresh broadcaster so the latched /tf_static holds only them.
+        legacy_tf=init_tf([('world','camera_init'),('body','base_link')])
         pub_clock=rospy.Publisher('/clock',Clock,queue_size=1)
         state=dict(status=None,result=None,poses=[],tfs=[],maps=0,enabled=True,cloud_enabled=True,rewind=False)
         def status(m):state['status']=json.loads(m.data)
@@ -57,7 +62,7 @@ def main():
             r=json.loads(m.data)
             if r.get('confirmed'):state['result']=r
         def pose(m):state['poses'].append(m)
-        def on_tf(m):state['tfs'].extend(t for t in m.transforms if t.header.frame_id=='drone_map' and t.child_frame_id=='world')
+        def on_tf(m):state['tfs'].extend(t for t in m.transforms if t.header.frame_id=='drone_map' and t.child_frame_id=='drone_odom')
         def on_map(m):
             if m.header.frame_id=='drone_map' and m.width>1000:state['maps']+=1
         subs=[rospy.Subscriber('/drone_reloc/status',String,status),rospy.Subscriber('/drone_reloc/result',String,result),
@@ -76,10 +81,12 @@ def main():
                     n+=1
                 stop.wait(.1)
         thread=threading.Thread(target=publish,daemon=True);thread.start();results=[]
-        for fault in ['stale','cloud_stale','rewind','tf_change','clock_freeze']:
+        for fault in ['stale','cloud_stale','rewind','tf_change','clock_freeze','legacy_names']:
             state.update(status=None,result=None,poses=[],tfs=[],maps=0,enabled=True,cloud_enabled=True,rewind=False)
             rospy.set_param('/use_sim_time',fault=='clock_freeze')
-            broadcaster.sendTransform(tf);node_log=open(str(out/('ros_'+fault+'.log')),'w')
+            if fault=='legacy_names':tf2_ros.StaticTransformBroadcaster().sendTransform(legacy_tf)
+            else:broadcaster.sendTransform(tf)
+            node_log=open(str(out/('ros_'+fault+'.log')),'w')
             node=subprocess.Popen(['rosrun','drone_relocalization','relocalize','--map',str(Path.home()/'test_data/mapping/20261018_194304_voxelslam'),'--save',''],stdout=node_log,stderr=subprocess.STDOUT,start_new_session=True)
             deadline=time.monotonic()+65
             while time.monotonic()<deadline and not (state['status'] and state['status']['valid'] and state['poses'] and state['result']):
@@ -94,11 +101,11 @@ def main():
             assert np.linalg.norm(actual-expected)<1e-6
             np.testing.assert_allclose(quat_R([q.x,q.y,q.z,q.w]),expected_R,atol=1e-6)
             assert state['tfs'] and p.header.frame_id=='drone_map'
-            if fault in ('stale','clock_freeze'):state['enabled']=False
+            if fault in ('stale','clock_freeze','legacy_names'):state['enabled']=False
             elif fault=='cloud_stale':state['cloud_enabled']=False
             elif fault=='rewind':state['rewind']=True
             else:
-                changed=TransformStamped();changed.header.frame_id='world';changed.child_frame_id='camera_init';changed.header.stamp=rospy.Time.now()
+                changed=TransformStamped();changed.header.frame_id='drone_odom';changed.child_frame_id='camera_init';changed.header.stamp=rospy.Time.now()
                 changed.transform.translation.x=.01
                 changed.transform.rotation.x,changed.transform.rotation.y,changed.transform.rotation.z,changed.transform.rotation.w=R_quat(S.Rwc)
                 broadcaster.sendTransform(changed)

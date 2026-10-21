@@ -96,7 +96,7 @@ for index, (pwm, duration) in enumerate(script):
         pose_pub.publish(pose)
         winch = WinchStatus()
         winch.header.stamp = pose.header.stamp
-        winch.header.frame_id = 'world'
+        winch.header.frame_id = 'drone_odom'
         winch.mode = 'HIGH' if pwm == 2000 else 'LOW'
         winch.enabled = True
         winch.command_valid = True

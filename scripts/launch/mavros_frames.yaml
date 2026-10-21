@@ -1,0 +1,43 @@
+# MAVROS 帧名（10-21 改名），由 mavros.launch 加载到 /mavros 下，覆盖系统 px4_config.yaml 里的同名项。
+#   map → px4_map、odom → px4_odom：PX4 自己的本地原点和里程计原点。名字要和统一的 map、FAST-LIO 的 drone_odom 分开。
+#   base_link → drone_base：机体，和 FAST-LIO 那一路（重力桥 body→drone_base）是同一个。
+# 节点据此发三条静态辅助帧：px4_map→px4_map_ned、px4_odom→px4_odom_ned、drone_base→drone_base_frd。
+# 这里只列 px4_config.yaml 里取值是 map / odom / base_link 的项；黑名单里的插件（wheel_odometry、vibration）不管。
+map_frame_id: px4_map
+odom_frame_id: px4_odom
+base_link_frame_id: drone_base
+# altitude 插件从节点根下的 ~frame_id 取帧名，默认 map，px4_config.yaml 里没有这一项（10-21 实机看到 /mavros/altitude 还是 map）
+frame_id: px4_map
+
+global_position:
+  frame_id: px4_map
+  child_frame_id: drone_base
+  tf:
+    frame_id: px4_map
+    child_frame_id: drone_base
+imu:
+  frame_id: drone_base
+local_position:
+  frame_id: px4_map
+  tf:
+    frame_id: px4_map
+    child_frame_id: drone_base
+setpoint_attitude:
+  tf:
+    frame_id: px4_map
+setpoint_position:
+  tf:
+    frame_id: px4_map
+fake_gps:
+  tf:
+    frame_id: px4_map
+odometry:
+  fcu:
+    odom_parent_id_des: px4_odom
+    odom_child_id_des: drone_base
+    map_id_des: px4_map
+vision_pose:
+  tf:
+    frame_id: px4_odom
+camera:
+  frame_id: drone_base

@@ -1,6 +1,6 @@
 // fastlio_gravity_bridge 节点入口。
 // 订阅 FAST-LIO2 的 /Odometry 与初始化重力，输出重力对齐的 odom / pose_cov，
-// 并发布 world -> camera_init 静态 TF。参数说明见 launch/gravity_bridge.launch。
+// 并发布 drone_odom -> camera_init 静态 TF。参数说明见 launch/gravity_bridge.launch。
 
 #include <ros/ros.h>
 

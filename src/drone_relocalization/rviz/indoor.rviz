@@ -34,7 +34,7 @@ Visualization Manager:
     - Class: rviz/Axes
       Name: Drone
       Enabled: true
-      Reference Frame: base_link
+      Reference Frame: drone_base
       Length: 0.3
       Radius: 0.03
     - Class: rviz/Axes

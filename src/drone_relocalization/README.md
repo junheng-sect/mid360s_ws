@@ -1,7 +1,7 @@
 # drone_relocalization
 
 室内一次性自动重定位。复用已运行的 MID-360S、FAST-LIO 和重力桥，在未知起始位置/朝向下匹配先验地图。
-两个独立静止窗口确认后固定 `drone_map ← world`，后续只传播里程计，**不做持续地图校正、不向 PX4/MAVROS 发送位姿或控制指令**。
+两个独立静止窗口确认后固定 `drone_map ← drone_odom`，后续只传播里程计，**不做持续地图校正、不向 PX4/MAVROS 发送位姿或控制指令**。
 
 当前默认地图是 `~/test_data/mapping/20261021_110311_indoor`（10-21 房间布局大改后重建，已去人）。
 `ACCEPTANCE.md` 和 `test/` 下的回归脚本仍按 10.18 旧图 `20261018_194304_voxelslam` 及旧布局的包记录，旧布局的包不能用来评判新图。
@@ -34,7 +34,7 @@ roslaunch drone_relocalization relocalize.launch map_dir:=$HOME/test_data/mappin
 不设 `ROS_IP` 时节点按主机名通告，本机 RViz 能列出话题但收不到数据。
 
 双确认成功时终端打印一行 `定位成功，当前位置（地图系，原点=建图起点的雷达 IMU）：x=… y=… z=… m，航向 …°，离地图地面 … m`，
-和 `/drone_reloc/pose` 同一条变换链（取最新一帧里程计）：位置是雷达 IMU，航向是机体（base_link）航向。
+和 `/drone_reloc/pose` 同一条变换链（取最新一帧里程计）：位置是雷达 IMU，航向是机体（drone_base）航向。
 雷达相对机体约有 1.6° 安装偏航，所以按建图时的姿势放回起点，航向约 −1.4°（10-21 回放），不是 0°。之后的位置看 `/drone_reloc/pose`。
 launch 起重定位节点和显示节点 `reloc_view`（`view:=false` 关闭）、`car_view`（`car:=false` 关闭，见下节），可用 `rviz:=true` 在板端起 RViz；板端是 llvmpipe 软件渲染，会和重定位抢 CPU，建议在本机看（见下节）。
 
@@ -48,10 +48,10 @@ launch 起重定位节点和显示节点 `reloc_view`（`view:=false` 关闭）�
 
 彩色是先验地图（按高度着色），白色是 FAST-LIO 实时点云 `/cloud_registered`；三组 0.3 m 坐标轴（红 x、绿 y、蓝 z）：
 - 带青色 `map (0,0,0)` 标签的是统一 map：原点是车 App 的「充电桩」点，x 是车插在桩上时的车头方向（从桩指向房间里），y 朝左，地面 z=0。
-- 带橙色 `car base_footprint` 标签的是车体（`/tracked_pose` 的位置和航向），固定画在离地 0.2 m（车激光高度）。车 2 s 没数据或换了地图时标签变红并写明原因。
+- 带橙色 `car_base` 标签的是车体（`/tracked_pose` 的位置和航向），固定画在离地 0.2 m（车激光高度）。车 2 s 没数据或换了地图时标签变红并写明原因。
   车的位姿由车端 Cartographer 纯定位持续拿激光对地图修正。
-- 带紫色 `drone base_link` 标签、上方有状态文字的是无人机机体。它在 map 里的位姿是一次重定位得到的固定 `drone_map←world`
-  乘上 FAST-LIO 里程计（`world` 就是无人机的 odom 系），锁定后不再对地图修正，FAST-LIO 漂多少就差多少。
+- 带紫色 `drone_base` 标签、上方有状态文字的是无人机机体。它在 map 里的位姿是一次重定位得到的固定 `drone_map←drone_odom`
+  乘上 FAST-LIO 里程计（`drone_odom` 就是无人机的 odom 系），锁定后不再对地图修正，FAST-LIO 漂多少就差多少。
 
 窗口布局：左栏是 Displays、Views 和摄像头预览 `OV13855 Preview`（同 `fastlio_mid360s.rviz`，相机节点没跑时显示 No Image）；
 右侧上面三维，下面是二维车图 `Car map`：按车 App 的画法（车图 x 朝右、y 朝上，map 的 x 正好朝上），画 map 坐标轴、车身框（650×550 mm）和车头、
@@ -60,8 +60,8 @@ launch 起重定位节点和显示节点 `reloc_view`（`view:=false` 关闭）�
 定位失效（STALE/FAILED，或 status 2.5 秒没更新）又退回错位。
 
 实现只服务显示，不改真实输出：`reloc_view` 把 `/drone_reloc/map` 转发成 `/drone_reloc/view/map`（`drone_map_view` 系），
-在 `/tf_static` 上发 `world→drone_map_view`，未定位为单位变换，定位有效时为 `drone_map←world` 的逆。
-真实的 `/tf` `drone_map→world` 和 `/drone_reloc/pose` 仍只在定位有效时由重定位节点发布；不要用 `drone_map_view` 做导航或控制。
+在 `/tf_static` 上发 `drone_odom→drone_map_view`，未定位为单位变换，定位有效时为 `drone_map←drone_odom` 的逆。
+真实的 `/tf` `drone_map→drone_odom` 和 `/drone_reloc/pose` 仍只在定位有效时由重定位节点发布；不要用 `drone_map_view` 做导航或控制。
 状态文字话题 `/drone_reloc/view/status_text`（英文，RViz 字体不支持中文）。
 
 车和 map 由 `car_view` 节点显示，同样只服务显示：
@@ -91,7 +91,7 @@ rosrun drone_relocalization relocalize --map ~/test_data/mapping/20261021_110311
 ## 一次性定位流程
 
 1. 地图 `map_world.pcd`、`meta.json` 校验并建立索引；不修改点云、元数据或旧缓存。
-2. 等待 `/Odometry`、`/cloud_registered` 及 `world→camera_init`、`body→base_link` 静态 TF，检查数据新鲜性和连续静止。
+2. 等待 `/Odometry`、`/cloud_registered` 及 `drone_odom→camera_init`、`body→drone_base` 静态 TF（10-21 改名前的 `world`、`base_link` 也认），检查数据新鲜性和连续静止。
 3. 攒2秒点云，二维全局似然场搜索未知 x/y/yaw。同一朝向保留多个空间峰，最多精配8个不同候选。
 4. 以候选为初值做6DoF点到面 ICP，先按实际内点支持度选解，再检查内点率、残差、退化、竞争解和相对竖直方向倾角。
    最高支持解退化时拒绝该窗，不能退而接受较弱位置；退化竞争候选仍参与歧义判断。
@@ -104,7 +104,7 @@ rosrun drone_relocalization relocalize --map ~/test_data/mapping/20261021_110311
 输入接收超过0.5秒未更新则无效；看门狗使用墙钟，回放 `/clock` 停止也会失效。在线60秒预算包含地图加载耗时；首次重建缓存会占用预算。离线时序验收另列地图加载耗时。
 持续运动或初始化里程计自身漂移超门限，也会拒绝，需静止等待稳定后重启；不能为了让旧包通过而放宽门限。
 
-精配允许地图和本次 world 有至多3°的相对倾角，吸收两次重力对齐之间的小差异；这不是物理水平标定，不能消除沿途非刚体漂移。
+精配允许地图和本次 drone_odom 有至多3°的相对倾角，吸收两次重力对齐之间的小差异；这不是物理水平标定，不能消除沿途非刚体漂移。
 地图地面值仅用于搜索高度和墙层，不作为精确离地传感器，也不强行压平室内原图。
 
 ## 输入、输出与失效
@@ -113,16 +113,16 @@ rosrun drone_relocalization relocalize --map ~/test_data/mapping/20261021_110311
 |---|---|
 | `/Odometry` | `nav_msgs/Odometry`，`camera_init → body`，位置原点为雷达 IMU |
 | `/cloud_registered` | `sensor_msgs/PointCloud2`，`camera_init`，FAST-LIO 已去畸变注册的点云 |
-| `/tf_static` | 必须包含 `world→camera_init` 和 `body→base_link`，运行中不允许改变 |
+| `/tf_static` | 必须包含 `drone_odom→camera_init` 和 `body→drone_base`（旧名 `world`、`base_link` 也认，第一次遇到时打一条警告），运行中不允许改变 |
 | `/drone_reloc/map` | latched `PointCloud2`，先验点云，`drone_map` 系 |
-| `/drone_reloc/pose` | `PoseStamped`，`drone_map` 中的 `base_link` 姿态，沿用记录的安装 TF |
+| `/drone_reloc/pose` | `PoseStamped`，`drone_map` 中的 `drone_base` 姿态，沿用记录的安装 TF |
 | `/drone_reloc/result` | latched `String` JSON v2；只有双确认后 `ok=true, confirmed=true`；首轮可有 `candidate_ok=true` 但 `ok=false` |
 | `/drone_reloc/status` | latched + 1Hz `String` JSON：时间戳、state、valid、why、次数、确认数、`tracking=false` |
-| `/tf` | 动态 `drone_map→world`，变换值固定，只随新鲜里程计推进时间戳 |
+| `/tf` | 动态 `drone_map→drone_odom`，变换值固定，只随新鲜里程计推进时间戳 |
 
-本套安装 TF 的平移为0，因此 base_link 原点仍是雷达 IMU，不代表已补偿到机体重心。
+本套安装 TF 的平移为0，因此 drone_base 原点仍是雷达 IMU，不代表已补偿到机体重心。
 
-JSON v2 中 `transform.translation` 为 xyz，`transform.q_xyzw` 为四元数，均表示 `drone_map ← world`：
+JSON v2 中 `transform.translation` 为 xyz，`transform.q_xyzw` 为四元数，均表示 `drone_map ← drone_odom`：
 `p_map = R_map_world @ p_world + t_map_world`。
 兼容统计字段 `T=[x,y,z,yaw]` 仅为投影，带 `T_is_yaw_projection=true`，存在roll/pitch时不能用T重建真实变换。
 `height` 是相对地图记录地面的 z 差，不是测距真值。在线未确认候选的 `ok` 与离线单窗 `ok` 语义不同：

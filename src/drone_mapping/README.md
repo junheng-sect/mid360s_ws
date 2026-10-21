@@ -1,7 +1,7 @@
 # drone_mapping
 
 无人机先验地图建图。实机：拉起 MID-360S 驱动、FAST-LIO2 和重力对齐桥接，录原始包；按 Ctrl+C 结束后，
-离线对原始包跑 **Voxel-SLAM**（带局部 BA、回环和全局 BA），再用它的轨迹把原始点拼成 `world` 系地图。
+离线对原始包跑 **Voxel-SLAM**（带局部 BA、回环和全局 BA），再用它的轨迹把原始点拼成地图（地图系就是建图那次的 `drone_odom`，10-21 改名前叫 `world`）。
 产出放在 `~/test_data/mapping/<时间>[_名字]/`，`map_world.pcd` + `meta.json` 的格式和以前一样，`drone_reloc.py --map` 直接用。
 
 为什么换成 Voxel-SLAM（10-19/20，同样三个原始包离线对比）：
@@ -82,7 +82,7 @@ rosrun drone_mapping build_map --algo fastlio ...   # 旧做法：FAST-LIO 存 s
 | 文件 | 内容 |
 |---|---|
 | `raw.bag` | 实机：`/livox/lidar` `/livox/imu` `/tf_static` `/fastlio/gravity_init` `/Odometry` |
-| `map_world.pcd` | `world` 系（z 朝上，原点 = 起点时的雷达 IMU，yaw 不动），0.05 m 体素，字段 `x y z intensity` |
+| `map_world.pcd` | 地图系，即建图那次的 `drone_odom`（z 朝上，原点 = 起点时的雷达 IMU，yaw 不动），0.05 m 体素，字段 `x y z intensity` |
 | `preview.png` | 俯视、侧视和轨迹 |
 | `meta.json` | `algo`、点数、地面拟合（起点离地高度、残余倾斜）、首尾位姿差、Voxel-SLAM 帧数和各段耗时、去人（`carve`）、git 版本 |
 | `voxelslam_state.txt` | Voxel-SLAM 位姿（每行 `t x y z qx qy qz qw …`，第 18–20 列是重力）；`--post` 靠它重新拼图 |

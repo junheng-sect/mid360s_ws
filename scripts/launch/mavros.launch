@@ -1,0 +1,28 @@
+<launch>
+  <!--
+    MAVROS 入口：include 系统的 px4.launch（/opt 下的文件不改），再把帧名换成和本工作空间 TF 树一致的名字，
+    换法见 mavros_frames.yaml。fusion.launch 和 start_handheld_test.sh 都走这里。
+    帧名不能在 roslaunch 之前用 rosparam set 预先设好：node.launch 给 mavros 节点开了 clear_params，
+    启动时会清掉 /mavros 下的旧参数。写在同一个 roslaunch 里就没问题——roslaunch 先清、再统一设参数，
+    同名的项以后加载的这份为准。
+    参数和 px4.launch 一样，默认值也照它（板端 px4.launch 已改成 /dev/ttyS3:921600、v1.0）。
+  -->
+  <arg name="fcu_url"        default="/dev/ttyS3:921600"/>
+  <arg name="gcs_url"        default=""/>
+  <arg name="tgt_system"     default="1"/>
+  <arg name="tgt_component"  default="1"/>
+  <arg name="log_output"     default="screen"/>
+  <arg name="fcu_protocol"   default="v1.0"/>
+  <arg name="respawn_mavros" default="false"/>
+
+  <include file="$(find mavros)/launch/px4.launch">
+    <arg name="fcu_url"        value="$(arg fcu_url)"/>
+    <arg name="gcs_url"        value="$(arg gcs_url)"/>
+    <arg name="tgt_system"     value="$(arg tgt_system)"/>
+    <arg name="tgt_component"  value="$(arg tgt_component)"/>
+    <arg name="log_output"     value="$(arg log_output)"/>
+    <arg name="fcu_protocol"   value="$(arg fcu_protocol)"/>
+    <arg name="respawn_mavros" value="$(arg respawn_mavros)"/>
+  </include>
+  <rosparam command="load" ns="mavros" file="$(dirname)/mavros_frames.yaml"/>
+</launch>

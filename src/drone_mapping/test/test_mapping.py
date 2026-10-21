@@ -44,6 +44,27 @@ class TestMapio(unittest.TestCase):
         np.testing.assert_allclose(R @ (g / np.linalg.norm(g)), [0, 0, -1], atol=1e-12)
         np.testing.assert_allclose(mapio.quat_R(*mapio.R_quat(R)), R, atol=1e-6)   # R_quat 小角度时开方损失约 1e-8
 
+    def test_read_bag_accepts_old_tf_name(self):
+        # 10-21 起重力桥发 drone_odom→camera_init，之前的包叫 world→camera_init，两种都要读到
+        import rosbag
+        import rospy
+        from geometry_msgs.msg import TransformStamped
+        from tf2_msgs.msg import TFMessage
+        for parent in ('drone_odom', 'world', 'map'):
+            tr = TransformStamped()
+            tr.header.frame_id, tr.child_frame_id = parent, 'camera_init'
+            tr.transform.translation.z = 0.25
+            tr.transform.rotation.w = 1.0
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, 'meta.bag')
+                with rosbag.Bag(path, 'w') as b:
+                    b.write('/tf_static', TFMessage(transforms=[tr]), rospy.Time(1))
+                tf, _, _ = mapio.read_bag(path)
+            if parent == 'map':
+                self.assertIsNone(tf)
+            else:
+                self.assertEqual(tf, ((0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 0.25)))
+
 
 class TestAssemble(unittest.TestCase):
     def test_to_world_undistorts_moving_scan(self):

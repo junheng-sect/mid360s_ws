@@ -523,11 +523,11 @@ TEST_F(BridgeMessagesTest, OutputsSharePoseCovarianceAndTimestamp)
 
   const fgb::AlignmentTransform &alignment = bridge_->alignment();
 
-  // 时间戳保留输入测量时间，父坐标系为 world，子坐标系为 base_link（姿态已是机体）。
+  // 时间戳保留输入测量时间，父坐标系为 drone_odom，子坐标系为 drone_base（姿态已是机体）。
   EXPECT_DOUBLE_EQ(last_odom_.header.stamp.toSec(), 102.5);
-  EXPECT_EQ(last_odom_.header.frame_id, "world");
-  EXPECT_EQ(last_odom_.child_frame_id, "base_link");
-  EXPECT_EQ(last_pose_cov_.header.frame_id, "world");
+  EXPECT_EQ(last_odom_.header.frame_id, "drone_odom");
+  EXPECT_EQ(last_odom_.child_frame_id, "drone_base");
+  EXPECT_EQ(last_pose_cov_.header.frame_id, "drone_odom");
   EXPECT_DOUBLE_EQ(last_pose_cov_.header.stamp.toSec(), 102.5);
 
   // 位姿：p_W = R_a p_C，q_out = q_a ⊗ q_CB ⊗ q_IB。
@@ -544,7 +544,7 @@ TEST_F(BridgeMessagesTest, OutputsSharePoseCovarianceAndTimestamp)
   EXPECT_LT((q_actual.toRotationMatrix() - q_expected.toRotationMatrix()).cwiseAbs().maxCoeff(),
             1e-12);
 
-  // 对齐后重力沿 world 的 -Z。
+  // 对齐后重力沿 drone_odom 的 -Z。
   const Eigen::Vector3d g_world = alignment.R * tiltedGravity().normalized();
   EXPECT_LT(std::abs(g_world.x()), 1e-12);
   EXPECT_LT(std::abs(g_world.y()), 1e-12);
@@ -579,7 +579,7 @@ TEST_F(BridgeMessagesTest, RejectsInvalidInputs)
   spinUntil([this] { return odom_count_ > 0; }, 0.3);
   EXPECT_EQ(odom_count_, 0);
 
-  publishOdom(103.0, "camera_init", "base_link");  // 输入 child_frame 错误（应为 body）
+  publishOdom(103.0, "camera_init", "drone_base");  // 输入 child_frame 错误（应为 body）
   spinUntil([this] { return odom_count_ > 0; }, 0.3);
   EXPECT_EQ(odom_count_, 0);
 
@@ -735,7 +735,7 @@ TEST_F(BridgeMessagesTest, StopsOnSecondGravityInitialization)
   EXPECT_FALSE(bridge_->fatalReason().empty());
 }
 
-/// 默认发布 world -> camera_init 静态 TF（latched，晚订阅也能查询到）。
+/// 默认发布 drone_odom -> camera_init 静态 TF（latched，晚订阅也能查询到）。
 TEST_F(BridgeMessagesTest, PublishesStaticTransform)
 {
   config_.publish_static_tf = true;
@@ -751,7 +751,7 @@ TEST_F(BridgeMessagesTest, PublishesStaticTransform)
       [&] {
         try
         {
-          transform = tf_buffer.lookupTransform("world", "camera_init", ros::Time(0));
+          transform = tf_buffer.lookupTransform("drone_odom", "camera_init", ros::Time(0));
           return true;
         }
         catch (const tf2::TransformException &)
@@ -761,7 +761,7 @@ TEST_F(BridgeMessagesTest, PublishesStaticTransform)
       },
       5.0));
 
-  EXPECT_EQ(transform.header.frame_id, "world");
+  EXPECT_EQ(transform.header.frame_id, "drone_odom");
   EXPECT_EQ(transform.child_frame_id, "camera_init");
   EXPECT_NEAR(transform.transform.translation.x, 0.0, 1e-15);
   EXPECT_NEAR(transform.transform.translation.y, 0.0, 1e-15);
@@ -770,13 +770,13 @@ TEST_F(BridgeMessagesTest, PublishesStaticTransform)
                              transform.transform.rotation.y, transform.transform.rotation.z);
   EXPECT_LT((q.toRotationMatrix() - bridge_->alignment().R).cwiseAbs().maxCoeff(), 1e-12);
 
-  // 同时发布 body -> base_link 的安装旋转，保证 TF 树与 odom 消息自洽
+  // 同时发布 body -> drone_base 的安装旋转，保证 TF 树与 odom 消息自洽
   geometry_msgs::TransformStamped mount;
   ASSERT_TRUE(spinUntil(
       [&] {
         try
         {
-          mount = tf_buffer.lookupTransform("body", "base_link", ros::Time(0));
+          mount = tf_buffer.lookupTransform("body", "drone_base", ros::Time(0));
           return true;
         }
         catch (const tf2::TransformException &)
@@ -786,7 +786,7 @@ TEST_F(BridgeMessagesTest, PublishesStaticTransform)
       },
       5.0));
   EXPECT_EQ(mount.header.frame_id, "body");
-  EXPECT_EQ(mount.child_frame_id, "base_link");
+  EXPECT_EQ(mount.child_frame_id, "drone_base");
   EXPECT_NEAR(mount.transform.translation.x, 0.0, 1e-15);  // 原点不动，杆臂不补偿
   EXPECT_NEAR(mount.transform.translation.y, 0.0, 1e-15);
   EXPECT_NEAR(mount.transform.translation.z, 0.0, 1e-15);
@@ -795,9 +795,9 @@ TEST_F(BridgeMessagesTest, PublishesStaticTransform)
   const Eigen::Quaterniond &q_ib = bridge_->mounting();
   EXPECT_LT((q_mount.toRotationMatrix() - q_ib.toRotationMatrix()).cwiseAbs().maxCoeff(), 1e-12);
 
-  // 完整的 world -> camera_init -> body -> base_link 链需要 FAST-LIO 提供 camera_init -> body
+  // 完整的 drone_odom -> camera_init -> body -> drone_base 链需要 FAST-LIO 提供 camera_init -> body
   // 这一段，单测里没有该发布者，因此这里只验证两段静态 TF 的复合：
-  // world -> base_link 的旋转应等于 q_a ⊗ q_ib（回放验证里再查完整链路）。
+  // drone_odom -> drone_base 的旋转应等于 q_a ⊗ q_ib（回放验证里再查完整链路）。
   const Eigen::Quaterniond q_composed = (bridge_->alignment().q * q_ib).normalized();
   const Eigen::Quaterniond q_static_chain =
       (q * q_mount).normalized();
@@ -806,7 +806,7 @@ TEST_F(BridgeMessagesTest, PublishesStaticTransform)
             1e-12);
 }
 
-/// fixed 模式的完整安装旋转（roll / pitch / yaw）：安装旋转、body -> base_link 静态 TF、
+/// fixed 模式的完整安装旋转（roll / pitch / yaw）：安装旋转、body -> drone_base 静态 TF、
 /// 输出姿态 q_a ⊗ q_cb ⊗ q_IB 三者一致。坐标系名与其它用例分开，避免静态 TF 互相干扰。
 TEST_F(BridgeMessagesTest, FixedMountingUsesFullRpy)
 {
@@ -856,7 +856,7 @@ TEST_F(BridgeMessagesTest, FixedMountingUsesFullRpy)
                                    last_odom_.pose.pose.orientation.z);
   EXPECT_NEAR((q_level * Eigen::Vector3d::UnitZ()).z(), 1.0, 1e-12);
 
-  // body -> base_link 静态 TF 就是同一个安装旋转，平移为零
+  // body -> drone_base 静态 TF 就是同一个安装旋转，平移为零
   geometry_msgs::TransformStamped mount;
   ASSERT_TRUE(spinUntil(
       [&] {

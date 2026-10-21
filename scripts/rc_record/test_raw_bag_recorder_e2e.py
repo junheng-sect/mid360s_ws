@@ -89,7 +89,7 @@ def main():
         gravity.vector.z = -9.81
         pubs['gravity'].publish(gravity)
         transform = TransformStamped()
-        transform.header.frame_id = 'world'
+        transform.header.frame_id = 'drone_odom'
         transform.child_frame_id = 'camera_init'
         transform.transform.rotation.w = 1
         pubs['tf'].publish(TFMessage(transforms=[transform]))

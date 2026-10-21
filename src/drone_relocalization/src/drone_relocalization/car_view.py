@@ -19,6 +19,7 @@ import time
 import cv2
 import numpy as np
 import yaml
+from .frames import BASE
 
 CAR_STALE_S=2.  # /tracked_pose is throttled to 10 Hz
 DRONE_STALE_S=1.;STATUS_STALE_S=2.5  # same status rule as reloc_view
@@ -195,10 +196,10 @@ class CarViewNode:
     def publish_labels(self,why):
         # ASCII only: RViz's text font has no CJK glyphs. Cyan like the old drone map origin label.
         self.pub_label.publish(self.label('map_view',0,'map (0,0,0)',.4,(.2,.9,1.)))
-        self.pub_label.publish(self.label('car_view',1,'car base_footprint' if not why else 'car (%s)'%why,.35,(1.,.55,0.) if not why else (1.,.25,.2)))
-        # base_link only exists while FAST-LIO runs; a fresh reloc status is the proxy, otherwise drop the label
+        self.pub_label.publish(self.label('car_view',1,'car_base' if not why else 'car (%s)'%why,.35,(1.,.55,0.) if not why else (1.,.25,.2)))
+        # drone_base only exists while FAST-LIO runs; a fresh reloc status is the proxy, otherwise drop the label
         with self.lock:alive=self.status is not None and time.monotonic()-self.status_time<STATUS_STALE_S
-        m=self.label('base_link',2,'drone base_link',.35,(.85,.2,.85))
+        m=self.label(BASE,2,BASE,.35,(.85,.2,.85))
         if not alive:m.action=m.DELETE
         self.pub_label.publish(m)
 

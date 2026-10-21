@@ -99,7 +99,7 @@ Visualization Manager:
       Length: 0.30000001192092896
       Name: Drone
       Radius: 0.029999999329447746
-      Reference Frame: base_link
+      Reference Frame: drone_base
       Show Trail: false
       Value: true
     - Alpha: 1

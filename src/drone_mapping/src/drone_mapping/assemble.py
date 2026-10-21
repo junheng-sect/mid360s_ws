@@ -4,7 +4,7 @@
 - 点：取法和 Voxel-SLAM / FAST-LIO 的预处理一样（tag 正常、每 point_filter_num 点取 1、离雷达 > blind），
   按轨迹逐点插值去畸变；外参、blind、point_filter_num 取本次 Voxel-SLAM 参数（voxelslam.yaml）。
   不用 Voxel-SLAM 自己存的逐帧点云：那是 0.1 m 体素平均过的，点更稀，面也显得更薄（10-19 对比时统一用原始点）。
-- world：z 朝上，原点 = 起点时的雷达 IMU，yaw 不动（同 FAST-LIO 那一路）；只按它估的重力再摆一次（通常 < 0.1°）。
+- 地图系 = 建图那次的 drone_odom：z 朝上，原点 = 起点时的雷达 IMU，yaw 不动（同 FAST-LIO 那一路）；只按它估的重力再摆一次（通常 < 0.1°）。
   不按地面二次摆正：10-20 试过，重定位的可信次数反而变少。
 - 去人（10-21 加，carve）：手持建图时拿设备的人会被扫进图里。设备走过的空间里不会有静止物体，所以离轨迹水平
   CARVE_R、上下 CARVE_H 以内（扁椭球），且只在不到 CARVE_SECS 个不同的秒里被看到的 CARVE_CELL 格子整格去掉。
@@ -67,7 +67,7 @@ def slerp_R(q0, q1, a):
 
 
 def to_world(xyz, T, traj, Rg):
-    """IMU 系的点 xyz（时刻 T）→ world：在前后两个位姿之间插值，再按重力摆正"""
+    """IMU 系的点 xyz（时刻 T）→ 地图系：在前后两个位姿之间插值，再按重力摆正"""
     tt = traj[:, 0]
     j = np.clip(np.searchsorted(tt, T) - 1, 0, len(tt) - 2)
     w = ((T - tt[j]) / (tt[j + 1] - tt[j])).clip(0, 1)
@@ -77,7 +77,7 @@ def to_world(xyz, T, traj, Rg):
 
 
 def gather(bag, traj, prm, Rg):
-    """逐帧解原始 CustomMsg（不经 rospy 反序列化），返回 world 系点、强度、时间（相对轨迹起点，s）、用到的雷达帧数"""
+    """逐帧解原始 CustomMsg（不经 rospy 反序列化），返回地图系的点、强度、时间（相对轨迹起点，s）、用到的雷达帧数"""
     import rosbag
     t_lo, t_hi = traj[0, 0], traj[-1, 0]
     rot = not np.array_equal(prm['R'], np.eye(3))
@@ -201,7 +201,7 @@ def build(d, bag, state, config, voxel, meta=None, say=print, carve_r=CARVE_R):
                         start_world=tw[0].tolist(), end_world=tw[-1].tolist(), end_minus_start_m=(tw[-1] - tw[0]).tolist(),
                         end_minus_start_dist_m=float(np.linalg.norm(tw[-1] - tw[0])), yaw_change_deg=math.degrees(dyaw)))
     tr = meta['trajectory']
-    text = ('Voxel-SLAM: points raw %d -> world %d (voxel %.2f m)%s   frame: world = start lidar IMU, z up\n'
+    text = ('Voxel-SLAM: points raw %d -> map %d (voxel %.2f m)%s   frame: drone_odom = start lidar IMU, z up\n'
             % (n_raw, len(q), voxel, '   carve -%d raw pts near path' % n_carved if carve_r > 0 else '')
             + 'trajectory %.0f s, %.1f m, end-start %.3f m / yaw %+.1f deg   ' %
             (tr['duration_s'], tr['path_m'], tr['end_minus_start_dist_m'], tr['yaw_change_deg'])

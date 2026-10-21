@@ -5,6 +5,7 @@ import os
 import struct
 import numpy as np
 from drone_mapping import assemble
+from .frames import ODOM_EDGE,MOUNT_EDGE,init_edge
 from .geometry import quat_R,rotz,yaw,transform,unpack
 
 
@@ -21,13 +22,14 @@ class BagSession:
                 for tr in m.transforms:
                     a,b=tr.header.frame_id.strip('/'),tr.child_frame_id.strip('/');q,p=tr.transform.rotation,tr.transform.translation
                     val=(np.array([q.x,q.y,q.z,q.w]),np.array([p.x,p.y,p.z]))
-                    if (a,b) in transforms and any(not np.allclose(x,y,atol=1e-10,rtol=0) for x,y in zip(val,transforms[a,b])):raise ValueError('bag initialization TF changes')
-                    transforms[a,b]=val
-        if len(od)<2 or ('world','camera_init') not in transforms or ('body','base_link') not in transforms:raise ValueError('bag needs Odometry, world->camera_init and body->base_link')
+                    key=init_edge(a,b) or (a,b)  # bags from before 10-21 use world / base_link
+                    if key in transforms and any(not np.allclose(x,y,atol=1e-10,rtol=0) for x,y in zip(val,transforms[key])):raise ValueError('bag initialization TF changes')
+                    transforms[key]=val
+        if len(od)<2 or ODOM_EDGE not in transforms or MOUNT_EDGE not in transforms:raise ValueError('bag needs Odometry, drone_odom->camera_init and body->drone_base (or the old world / base_link)')
         self.od=np.array(od,float)
         if not np.isfinite(self.od).all() or (np.diff(self.od[:,0])<=0).any():raise ValueError('invalid/backwards odometry timestamps')
-        self.Rwc=quat_R(transforms['world','camera_init'][0]);self.twc=transforms['world','camera_init'][1]
-        self.Rib=quat_R(transforms['body','base_link'][0]);self.tib=transforms['body','base_link'][1]
+        self.Rwc=quat_R(transforms[ODOM_EDGE][0]);self.twc=transforms[ODOM_EDGE][1]
+        self.Rib=quat_R(transforms[MOUNT_EDGE][0]);self.tib=transforms[MOUNT_EDGE][1]
         self.t0=self.od[0,0];self.dur=self.od[-1,0]-self.t0
         self.Tli=np.array([-.011,-.02329,.04412]);self.Rli=np.eye(3);self.every=3;self.blind=.5
         pp=os.path.join(os.path.dirname(os.path.abspath(path)),'params.yaml')

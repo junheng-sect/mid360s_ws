@@ -1,4 +1,4 @@
-"""Read-only ROS interface. Dynamic map->world is emitted only with fresh valid odometry."""
+"""Read-only ROS interface. Dynamic drone_map->drone_odom is emitted only with fresh valid odometry."""
 from collections import deque
 import json
 import math
@@ -7,6 +7,7 @@ import threading
 import time
 import numpy as np
 from .controller import StartupController
+from .frames import ODOM,ODOM_EDGE,MOUNT_EDGE,init_edge
 from .geometry import quat_R,R_quat,mapped_pose,unpack,yaw
 from .matching import relocalize
 
@@ -37,7 +38,7 @@ class RosNode:
         from std_msgs.msg import Header
         self.rospy=rospy;self.String=String;self.Pose=PoseStamped;self.Transform=TransformStamped
         self.M,self.args=M,args;self.lock=threading.RLock();self.ctl=StartupController(M.cfg,getattr(args,'startup_started',time.monotonic()))
-        self.tf={};self.clouds=[];self.worker=None;self.exit_code=0;self.last_status=None;self.status_time=0.;self.last_row=None
+        self.tf={};self.legacy_warned=False;self.clouds=[];self.worker=None;self.exit_code=0;self.last_status=None;self.status_time=0.;self.last_row=None
         self.pub_pose=rospy.Publisher('/drone_reloc/pose',PoseStamped,queue_size=10)
         self.pub_result=rospy.Publisher('/drone_reloc/result',String,queue_size=1,latch=True)
         self.pub_status=rospy.Publisher('/drone_reloc/status',String,queue_size=1,latch=True)
@@ -53,13 +54,15 @@ class RosNode:
         self.watchdog=threading.Thread(target=self.watch_inputs,daemon=True);self.watchdog.start()
         self.publish_status(force=True)
 
-    def ready_tf(self):return ('world','camera_init') in self.tf and ('body','base_link') in self.tf
+    def ready_tf(self):return ODOM_EDGE in self.tf and MOUNT_EDGE in self.tf
 
     def on_tf(self,msg):
         with self.lock:
             for tr in msg.transforms:
-                key=tr.header.frame_id.strip('/'),tr.child_frame_id.strip('/')
-                if key not in [('world','camera_init'),('body','base_link')]:continue
+                raw=tr.header.frame_id.strip('/'),tr.child_frame_id.strip('/');key=init_edge(*raw)
+                if key is None:continue
+                if key!=raw and not self.legacy_warned:
+                    self.legacy_warned=True;self.rospy.logwarn('旧帧名 %s->%s（10-21 改名前），按 %s->%s 读',*raw,*key)
                 q,p=tr.transform.rotation,tr.transform.translation
                 try:R=quat_R([q.x,q.y,q.z,q.w]);t=np.array([p.x,p.y,p.z])
                 except ValueError:self.ctl.invalidate('初始化TF旋转非法',True);continue
@@ -75,7 +78,7 @@ class RosNode:
             if m.header.frame_id.strip('/')!='camera_init' or m.child_frame_id.strip('/')!='body':
                 self.ctl.invalidate('Odometry坐标系不符',True);return
             p,q=m.pose.pose.position,m.pose.pose.orientation;row=np.array([m.header.stamp.to_sec(),p.x,p.y,p.z,q.x,q.y,q.z,q.w]);self.last_row=row
-            Rwc,twc=self.tf['world','camera_init'];Rib,tib=self.tf['body','base_link']
+            Rwc,twc=self.tf[ODOM_EDGE];Rib,tib=self.tf[MOUNT_EDGE]
             try:
                 world=row.copy();world[1:4]=Rwc@row[1:4]+twc;world[4:8]=R_quat(Rwc@quat_R(row[4:8]))
             except ValueError:self.ctl.invalidate('Odometry姿态非法',True);return
@@ -86,7 +89,7 @@ class RosNode:
                 ps.pose.position.x,ps.pose.position.y,ps.pose.position.z=pm
                 ps.pose.orientation.x,ps.pose.orientation.y,ps.pose.orientation.z,ps.pose.orientation.w=R_quat(Rm)
                 R,t=unpack(self.ctl.result);tf=self.Transform();tf.header.stamp=m.header.stamp
-                tf.header.frame_id='drone_map';tf.child_frame_id='world';tf.transform.translation.x,tf.transform.translation.y,tf.transform.translation.z=t
+                tf.header.frame_id='drone_map';tf.child_frame_id=ODOM;tf.transform.translation.x,tf.transform.translation.y,tf.transform.translation.z=t
                 tf.transform.rotation.x,tf.transform.rotation.y,tf.transform.rotation.z,tf.transform.rotation.w=R_quat(R)
                 self.broadcaster.sendTransform(tf);self.pub_pose.publish(ps)
 
@@ -120,7 +123,7 @@ class RosNode:
             if job:
                 chunks=[p for ts,p in self.clouds if job['start']<=ts<=job['end']+1e-6]
                 self.clouds=[];cloud=np.concatenate(chunks) if chunks else np.zeros((0,3))
-                Rwc,twc=self.tf['world','camera_init'];cloud=cloud@Rwc.T+twc
+                Rwc,twc=self.tf[ODOM_EDGE];cloud=cloud@Rwc.T+twc
                 self.worker=threading.Thread(target=self.solve,args=(job,cloud),daemon=True);self.worker.start()
             self.publish_status()
             if self.ctl.terminal and self.ctl.state=='FAILED':
@@ -139,8 +142,8 @@ class RosNode:
             self.publish_status(force=True)
             print('搜索%d: %s；确认%d/%d；%s'%(self.ctl.attempts,'可信候选' if geom_ok else '拒绝',self.ctl.confirmed,self.M.cfg['confirmations'],r.get('why','')),flush=True)
             if accepted and self.last_row is not None:
-                # Same chain as /drone_reloc/pose: base_link (origin = lidar IMU) in drone_map, from the latest odometry.
-                Rwc,twc=self.tf['world','camera_init'];Rib,tib=self.tf['body','base_link']
+                # Same chain as /drone_reloc/pose: drone_base (origin = lidar IMU) in drone_map, from the latest odometry.
+                Rwc,twc=self.tf[ODOM_EDGE];Rib,tib=self.tf[MOUNT_EDGE]
                 pm,Rm=mapped_pose(self.ctl.result,Rwc,twc,Rib,tib,self.last_row)
                 print('定位成功，当前位置（地图系，原点=建图起点的雷达 IMU）：x=%.3f y=%.3f z=%.3f m，航向 %.1f°，离地图地面 %.2f m'%(
                       pm[0],pm[1],pm[2],math.degrees(yaw(Rm)),pm[2]-self.M.zf),flush=True)

@@ -42,7 +42,8 @@ def read_bag(path):
         for topic, m, _ in b.read_messages(topics=META_TOPICS):
             if topic == '/tf_static':
                 for tr in m.transforms:
-                    if tr.header.frame_id.strip('/') == 'world' and tr.child_frame_id.strip('/') == 'camera_init':
+                    # 10-21 起叫 drone_odom，之前的包叫 world
+                    if tr.header.frame_id.strip('/') in ('drone_odom', 'world') and tr.child_frame_id.strip('/') == 'camera_init':
                         q, t = tr.transform.rotation, tr.transform.translation
                         tf = ((q.x, q.y, q.z, q.w), (t.x, t.y, t.z))
             elif topic == '/fastlio/gravity_init':

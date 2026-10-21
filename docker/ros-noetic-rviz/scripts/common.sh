@@ -12,7 +12,7 @@ CONTAINER_NAME="${RVIZ_CONTAINER_NAME:-${CONTAINER_NAME:-rviz_mid360s}}"
 DEFAULT_ROS_MASTER="http://192.168.31.32:11311"
 DEFAULT_BOARD_IP="192.168.31.32"
 RVIZ_CONFIG_IN_CONTAINER="/opt/rviz-ws/rviz/fastlio_mid360s.rviz"
-# 显示 launch 仅启动 RViz；world 静态 TF 来自板端。
+# 显示 launch 仅启动 RViz；drone_odom 静态 TF 来自板端。
 LAUNCH_FILE_IN_CONTAINER="/opt/rviz-ws/launch/display_gravity_aligned.launch"
 LAUNCH_FILE_ON_HOST="$CONFIG_DIR/launch/display_gravity_aligned.launch"
 

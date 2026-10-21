@@ -23,13 +23,13 @@ inline bool mountingSourceIsKnown(const std::string &source)
 }
 
 /// 订阅 FAST-LIO2 在 camera_init 下的 /Odometry，用本次运行的初始化重力确定固定对齐
-/// 旋转，输出 world 下的里程计与带协方差位姿，并发布静态 TF：
-///   world -> camera_init（对齐旋转 q_a）与 body -> base_link（机体安装旋转 q_IB）。
+/// 旋转，输出 drone_odom 下的里程计与带协方差位姿，并发布静态 TF：
+///   drone_odom -> camera_init（对齐旋转 q_a）与 body -> drone_base（机体安装旋转 q_IB）。
 ///
-/// 输出姿态表示 base_link（机体）而不是雷达 IMU；位置基点仍是雷达 IMU
+/// 输出姿态表示 drone_base（机体）而不是雷达 IMU；位置基点仍是雷达 IMU
 /// （本轮不做杆臂补偿，由下游/飞控参数处理）。
 ///
-/// 安装旋转 q_IB（body <- base_link）由 mounting_source 决定：
+/// 安装旋转 q_IB（body <- drone_base）由 mounting_source 决定：
 ///  - fixed（默认）：用 mounting_roll/pitch/yaw_deg 指定的固定安装旋转，不依赖初始化重力，
 ///    因此初始化时机体**保持静止即可，不要求水平**；
 ///  - gravity：由初始化重力推导 q_IB = q_a⁻¹，前提是初始化时机体水平；
@@ -51,12 +51,12 @@ class GravityBridge
     std::string gravity_in = "/fastlio/gravity_init";
     std::string odom_out = "/fastlio/odom_world";
     std::string pose_cov_out = "/fastlio/vision_pose_cov";
-    std::string world_frame = "world";
+    std::string world_frame = "drone_odom";
     std::string input_frame = "camera_init";
     /// 输入校验用的 child frame：FAST-LIO2 发布的就是 body（雷达 IMU）。
     std::string input_child_frame = "body";
     /// 输出命名用的 child frame：姿态已换成机体，故与输入不同名。
-    std::string output_child_frame = "base_link";
+    std::string output_child_frame = "drone_base";
     /// 机体安装旋转的来源："fixed"（默认）= 用下方的固定安装角，与初始化姿态无关；
     /// "gravity" = 由初始化重力推导 q_IB = q_a⁻¹（前提：初始化时机体水平）；
     /// "none" = 不做安装补偿（输出仍是雷达 IMU 姿态）。
@@ -91,7 +91,7 @@ class GravityBridge
   State state() const { return state_; }
   bool hasAlignment() const { return alignment_.valid; }
   const AlignmentTransform &alignment() const { return alignment_; }
-  /// body <- base_link 的安装旋转（把机体系向量转到雷达 IMU 系；none 时为单位四元数）。
+  /// body <- drone_base 的安装旋转（把机体系向量转到雷达 IMU 系；none 时为单位四元数）。
   const Eigen::Quaterniond &mounting() const { return mounting_; }
   std::size_t publishedCount() const { return published_count_; }
   const std::string &fatalReason() const { return fatal_reason_; }
@@ -109,7 +109,7 @@ class GravityBridge
 
   Config config_;
   AlignmentTransform alignment_;
-  /// body <- base_link：由 mounting_source 决定；fixed 在构造时确定，gravity 在锁定
+  /// body <- drone_base：由 mounting_source 决定；fixed 在构造时确定，gravity 在锁定
   /// 对齐旋转时一并确定，none 始终为单位四元数。
   Eigen::Quaterniond mounting_ = Eigen::Quaterniond::Identity();
   State state_ = State::kWaitingGravity;

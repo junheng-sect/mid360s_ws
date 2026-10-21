@@ -26,8 +26,8 @@ constexpr double kCovDiagEps = -1e-12;
 /// 合法协方差的舍入级不对称/负特征值在 1e-15 量级，这里放宽到 1e-9 仍能拦住结构性错误。
 constexpr double kCovRelTol = 1e-9;
 
-/// 本次运行的固定重力对齐旋转：把 camera_init 摆到 Z 轴向上的 world。
-/// world 是局部世界系，原点与 camera_init 相同；只做最小旋转，不调整 yaw，
+/// 本次运行的固定重力对齐旋转：把 camera_init 摆到 Z 轴向上的 drone_odom。
+/// drone_odom 是局部世界系，原点与 camera_init 相同；只做最小旋转，不调整 yaw，
 /// 因此它不代表已经对齐地理东、北。
 struct AlignmentTransform
 {
@@ -143,8 +143,8 @@ inline bool poseCovarianceIsValid(const double *covariance)
 }
 
 /// 由 camera_init 下的重力向量求本次运行的固定对齐旋转：
-/// q_a = FromTwoVectors(g.normalized(), -UnitZ())，把重力方向转到 world 的 -Z
-/// （即 world 的 +Z 向上）。这是最小旋转，不额外调整 yaw。
+/// q_a = FromTwoVectors(g.normalized(), -UnitZ())，把重力方向转到 drone_odom 的 -Z
+/// （即 drone_odom 的 +Z 向上）。这是最小旋转，不额外调整 yaw。
 /// 输入非有限或模长过小时返回 false，且不修改 out。
 inline bool computeAlignmentTransform(const Eigen::Vector3d &gravity,
                                       AlignmentTransform &out)
@@ -165,12 +165,12 @@ inline bool computeAlignmentTransform(const Eigen::Vector3d &gravity,
   return true;
 }
 
-/// 机体安装旋转 q_IB（body <- base_link），作为常量右乘项把输出姿态从雷达 IMU 换成机体：
+/// 机体安装旋转 q_IB（body <- drone_base），作为常量右乘项把输出姿态从雷达 IMU 换成机体：
 ///   q_out = q_a ⊗ q_CB ⊗ q_IB
-/// 方向说明：右乘的 q_IB 作用在雷达 IMU 一侧，把机体系（base_link）向量转换到雷达 IMU
-/// 系，即 q_IB = R_lidar<-base_link；TF 里发布的 body -> base_link 就是这个 q_IB
-/// （父 body、子 base_link，四元数表示子系在父系中的姿态）。旧注释写成
-/// "base_link <- body" 是把方向写反了。
+/// 方向说明：右乘的 q_IB 作用在雷达 IMU 一侧，把机体系（drone_base）向量转换到雷达 IMU
+/// 系，即 q_IB = R_lidar<-drone_base；TF 里发布的 body -> drone_base 就是这个 q_IB
+/// （父 body、子 drone_base，四元数表示子系在父系中的姿态）。旧注释写成
+/// "drone_base <- body" 是把方向写反了。
 ///
 /// 【旧模式 mounting_source=gravity】由初始化重力推导：
 /// body 就是雷达 IMU 坐标系，安装时相对机体有固定倾角（本机约 20 度前倾）。
@@ -195,7 +195,7 @@ inline Eigen::Quaterniond mountingFromAlignment(const AlignmentTransform &alignm
 /// 固定安装旋转（mounting_source=fixed，默认）：从参数指定的安装角直接构造 q_IB，
 /// 只由配置决定，**不依赖初始化重力**，因此允许初始化时机体不水平。
 ///
-/// 三个角度（度）描述雷达 IMU 系在机体系（base_link，FLU）中的姿态，按 ROS 固定轴 RPY
+/// 三个角度（度）描述雷达 IMU 系在机体系（drone_base，FLU）中的姿态，按 ROS 固定轴 RPY
 /// （与 tf static_transform_publisher / setRPY 同序）组合：
 ///   R_base<-lidar = R_z(yaw) · R_y(pitch) · R_x(roll)
 ///  - pitch 正值 = 前倾（绕 +Y，机头向下）；
@@ -246,13 +246,13 @@ inline Eigen::Matrix<double, 6, 6> ikfomPoseCovarianceToRosFrame(
   return symmetrizeCovariance(A * P6 * A.transpose());
 }
 
-/// 把 camera_init 下的位姿及协方差变换到 world：
+/// 把 camera_init 下的位姿及协方差变换到 drone_odom：
 ///   p_W   = R_a p_C
 ///   q_out = q_a ⊗ q_CB ⊗ q_IB   （左乘对齐、右乘机体安装旋转，最后归一化）
 ///   Σ_W   = J Σ_C Jᵀ，J = diag(R_a, R_a)
 /// 变换后只做舍入层面的对称化。
 ///
-/// q_ib 是 body <- base_link 的安装旋转：mountingFromAlignment（旧 gravity 模式）或
+/// q_ib 是 body <- drone_base 的安装旋转：mountingFromAlignment（旧 gravity 模式）或
 /// computeFixedMounting（fixed 模式，默认）；不需要安装补偿时传单位四元数。
 /// 它是常量右乘，而姿态误差是固定轴左扰动，
 /// 因此 δ_out = R_a·δ_C，与加安装旋转之前完全一致 —— 协方差传播不需要改动，

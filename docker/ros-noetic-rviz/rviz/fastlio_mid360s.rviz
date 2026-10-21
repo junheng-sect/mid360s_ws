@@ -196,7 +196,7 @@ Visualization Manager:
   Global Options:
     Background Color: 0; 0; 0
     Default Light: true
-    Fixed Frame: world
+    Fixed Frame: drone_odom
     Frame Rate: 30
   Name: root
   Tools:

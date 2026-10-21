@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """RViz comparison view against an isolated master: identity before localization, aligned after, identity again
 once the localization node dies. A stationary stream is built from one window of the map's own raw.bag and moved
-by a known rigid offset P in world, as if FAST-LIO had started away from the map origin.
+by a known rigid offset P in drone_odom, as if FAST-LIO had started away from the map origin.
 No driver, FCU or hardware is started. --demo binds the master to the Wi-Fi address and holds each phase longer
 so the local Docker RViz can watch it: ./scripts/run_rviz.sh --reloc --ros-master http://192.168.31.32:11531
 """
@@ -54,14 +54,14 @@ def main():
         rospy.init_node('reloc_view_test',disable_signals=True)
         S=BagSession(str(MAP/'raw.bag'));M=MapModel(str(MAP))
         Rp=rotz(P_YAW)
-        cw=S.cloud(1,2)@Rp.T+P_T                         # perturbed world cloud
+        cw=S.cloud(1,2)@Rp.T+P_T                         # perturbed drone_odom cloud
         cloud=(cw-S.twc)@S.Rwc                           # back to camera_init
         row=S.pose(S.t0+2);Rb=S.Rwc@quat_R(row[4:8]);pb=S.Rwc@row[1:4]+S.twc
         Rb_ci=S.Rwc.T@Rp@Rb;pb_ci=S.Rwc.T@(Rp@pb+P_T-S.twc)
         frames=[point_cloud2.create_cloud_xyz32(Header(frame_id='camera_init'),p.astype('f4').tolist()) for p in np.array_split(cloud,20)]
         pub_od=rospy.Publisher('/Odometry',Odometry,queue_size=10);pub_cl=rospy.Publisher('/cloud_registered',PointCloud2,queue_size=10)
         static=tf2_ros.StaticTransformBroadcaster();dyn=tf2_ros.TransformBroadcaster();tf=[]
-        for p_,c_,R,t in [('world','camera_init',S.Rwc,S.twc),('body','base_link',S.Rib,S.tib)]:
+        for p_,c_,R,t in [('drone_odom','camera_init',S.Rwc,S.twc),('body','drone_base',S.Rib,S.tib)]:
             tr=TransformStamped();tr.header.frame_id=p_;tr.child_frame_id=c_;tr.header.stamp=rospy.Time.now()
             tr.transform.translation.x,tr.transform.translation.y,tr.transform.translation.z=t
             tr.transform.rotation.x,tr.transform.rotation.y,tr.transform.rotation.z,tr.transform.rotation.w=R_quat(R);tf.append(tr)
@@ -73,7 +73,7 @@ def main():
             if r.get('confirmed'):state['result']=r
         def on_static(m):
             for t in m.transforms:
-                if t.header.frame_id=='world' and t.child_frame_id=='drone_map_view':
+                if t.header.frame_id=='drone_odom' and t.child_frame_id=='drone_map_view':
                     q,p=t.transform.rotation,t.transform.translation
                     state['view_tf']=(quat_R([q.x,q.y,q.z,q.w]),np.array([p.x,p.y,p.z]))
         def on_view_map(m):state['view_map']=(m.header.frame_id,m.width*m.height)
@@ -125,7 +125,7 @@ def main():
         before=fit();report.update(before=before,text_before=state['text'])
         assert before['inlier']<.3,before
         print('PASS before: identity view, inlier %.3f'%before['inlier'],flush=True)
-        # 2. hold still: localized view equals the inverse of drone_map<-world and the scan lands on the map
+        # 2. hold still: localized view equals the inverse of drone_map<-drone_odom and the scan lands on the map
         state['jiggle']=False
         wait(lambda:state['status']['valid'] and state['result'],70,'LOCALIZED')
         time.sleep(1.)

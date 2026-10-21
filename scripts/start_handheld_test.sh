@@ -367,7 +367,7 @@ fi
 # ============================================================== 启动 MAVROS ==
 hr; log "步骤 2/5：启动 MAVROS（$FCU_URL）"
 start_child "$PIDFILE_MAVROS" "$LOG_DIR/mavros_${STAMP}.log" \
-  roslaunch mavros px4.launch \
+  roslaunch "$DIR/launch/mavros.launch" \
   fcu_url:="$FCU_URL" fcu_protocol:=v1.0 tgt_system:=1 tgt_component:=1 gcs_url:=""
 log "MAVROS pid=$CHILD_PID（日志：$LOG_DIR/mavros_${STAMP}.log）"
 wait_for "MAVROS 已连接飞控" 60 state_connected || {
@@ -529,7 +529,7 @@ cat <<'TIP'
   * 卸桨后再解锁；解锁后 const_pos_mode 会变 False，属正常。
   * 解锁前后都看一眼 /mavros/estimator_status 的 pos_horiz_rel_status_flag 应为 True。
   * 电机转起来后留意 /mavros/local_position/pose 是否随振动抖动加剧。
-  * 一次测试内不要重启链路：world 原点绑定 FAST-LIO 首次初始化，重启会跳变。
+  * 一次测试内不要重启链路：drone_odom 原点绑定 FAST-LIO 首次初始化，重启会跳变。
 TIP
 echo
 echo "停止全部节点：按 Ctrl+C（录包节点会先把 bag 收尾写索引）"

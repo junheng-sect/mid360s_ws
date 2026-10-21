@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 本机一条命令启动 RViz：检查环境 -> 推导 ROS 网络参数 -> 以宿主机用户身份跑容器。
 #
-#   ./scripts/run_rviz.sh                     # 打开 RViz（world 重力对齐视图），订阅 /cloud_registered
+#   ./scripts/run_rviz.sh                     # 打开 RViz（drone_odom 重力对齐视图），订阅 /cloud_registered
 #   ./scripts/run_rviz.sh --shell             # 进入同一环境的交互式 shell
 #   ./scripts/run_rviz.sh --cmd 'rostopic hz /cloud_registered'
 set -euo pipefail
@@ -30,7 +30,7 @@ usage() {
   --dry-run           只打印将要执行的 docker 命令
   -h, --help          显示本帮助
 
-默认模式用 roslaunch 打开 RViz（Fixed Frame = world，world -> camera_init 静态 TF 由板端
+默认模式用 roslaunch 打开 RViz（Fixed Frame = drone_odom，drone_odom -> camera_init 静态 TF 由板端
 fastlio_gravity_bridge 节点发布；板端没跑时 RViz 会提示该 frame 不存在）。
 停止后台容器：docker stop <容器名>（默认 rviz_mid360s）
 左侧面板出现黑块/错位时（仓库根目录）：./docker/ros-noetic-rviz/scripts/repair_layout.sh
@@ -172,7 +172,7 @@ fi
 
 case "$run_mode" in
   # 显示模式：roslaunch 打开 RViz（required="true"，关窗/Ctrl+C/docker stop 时退出）。
-  # world -> camera_init 静态 TF 由板端 fastlio_gravity_bridge 发布，本机不发布。
+  # drone_odom -> camera_init 静态 TF 由板端 fastlio_gravity_bridge 发布，本机不发布。
   # --config 只作为 config 参数透传，不改用户给的配置。
   rviz)  set -- roslaunch "$LAUNCH_FILE_IN_CONTAINER" "config:=$rviz_config" ;;
   shell) set -- bash ;;

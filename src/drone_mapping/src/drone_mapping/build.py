@@ -8,8 +8,9 @@ Ctrl+C 收尾后离线跑 Voxel-SLAM，再拼图、摆正、降采样、出预�
   在终端里报走了多远，但不再存它的点云。
 - Voxel-SLAM 在录完以后离线跑（见 voxelslam.py），1 倍速回放，耗时约为录制时长再加 30 s；结果只取决于原始包。
 - --algo fastlio 保留旧做法：FAST-LIO 的 pcd_save 只在本脚本生成的 launch 里打开（mid360s.yaml 不动，飞行不攒点），
-  退出时写 src/FAST_LIO/PCD/scans.pcd（camera_init 系），按重力桥发的 world→camera_init（/tf_static）摆正。
-- world：z 朝上，原点 = 起点时的雷达 IMU，yaw 不动（两种算法一样）。
+  退出时写 src/FAST_LIO/PCD/scans.pcd（camera_init 系），按重力桥发的 drone_odom→camera_init（/tf_static，10-21 前的包叫 world）摆正。
+- 地图系：就是建图那次的 drone_odom（文件名 map_world 里的 world 是改名前的叫法；重定位时这个系叫 drone_map），
+  z 朝上，原点 = 起点时的雷达 IMU，yaw 不动（两种算法一样）。
 
 用法:
   build_map [--name NAME]                          实机建图（雷达要上电），Ctrl+C 结束
@@ -24,7 +25,7 @@ Ctrl+C 收尾后离线跑 Voxel-SLAM，再拼图、摆正、降采样、出预�
   --set NAME=VALUE  只对本次覆盖实时 FAST-LIO 的参数，可重复，例如 --set preprocess/blind=1.0 --set filter_size_surf=0.3
 产出（DIR = out-root/<YYYYmmdd_HHMMSS>[_NAME]）:
   raw.bag             实机：/livox/lidar /livox/imu /tf_static /fastlio/gravity_init /Odometry
-  map_world.pcd       world 系、体素降采样，字段 x y z intensity
+  map_world.pcd       地图系、体素降采样，字段 x y z intensity
   preview.png         俯视 + 侧视 + 轨迹
   meta.json           算法、点数、地面拟合（起点离地高度、残余倾斜）、首尾位姿差、git 版本
   voxelslam_state.txt Voxel-SLAM 位姿（--post 靠它重新拼图）；voxelslam.yaml 本次参数；voxelslam.log
@@ -136,7 +137,7 @@ def write_meta(d, meta):
 
 # ------------------------------------------------------- FAST-LIO 后处理 ----
 def post_fastlio(d, voxel, run=None):
-    """scans.pcd + 包里的 world←camera_init → map_world.pcd / preview.png / meta.json；返回 meta"""
+    """scans.pcd + 包里的 drone_odom←camera_init → map_world.pcd / preview.png / meta.json；返回 meta"""
     t0 = time.time()
     meta_path = os.path.join(d, 'meta.json')
     meta = {}
@@ -152,10 +153,10 @@ def post_fastlio(d, voxel, run=None):
         say('[WARN] 目录里没有 raw.bag / odom.bag，无法摆正')
     Rg = mapio.R_from_gravity(grav) if grav else None
     if tf:
-        R, t, src = mapio.quat_R(*tf[0]), np.array(tf[1]), 'tf_static world->camera_init'
+        R, t, src = mapio.quat_R(*tf[0]), np.array(tf[1]), 'tf_static drone_odom->camera_init'
     elif Rg is not None:
         R, t, src = Rg, np.zeros(3), 'gravity_init（tf_static 缺失，按最小旋转推算）'
-        say('[WARN] 包里没有 world→camera_init，改用 /fastlio/gravity_init 推算')
+        say('[WARN] 包里没有 drone_odom→camera_init（旧包叫 world），改用 /fastlio/gravity_init 推算')
     else:
         R, t, src = np.eye(3), np.zeros(3), 'none（没摆正）'
         say('[WARN] 包里既没有 tf_static 也没有 gravity_init，map_world.pcd 没有摆正')
@@ -188,7 +189,7 @@ def post_fastlio(d, voxel, run=None):
                                   end_minus_start_dist_m=float(np.linalg.norm(traj[-1] - traj[0])),
                                   yaw_change_deg=math.degrees(dyaw))
     tr = meta.get('trajectory')
-    text = ('points raw %d -> world %d (voxel %.2f m)   frame: world = start lidar IMU, z up\n' % (len(p), len(q), voxel)
+    text = ('points raw %d -> map %d (voxel %.2f m)   frame: drone_odom = start lidar IMU, z up\n' % (len(p), len(q), voxel)
             + ('trajectory %.0f s, %.1f m, end-start %.3f m / yaw %+.1f deg   ' %
                (tr['duration_s'], tr['path_m'], tr['end_minus_start_dist_m'], tr['yaw_change_deg']) if tr else '')
             + ('floor %.3f m below start, tilt %.2f deg, rms %.3f m, %d pts%s' % (fl['height_m'], fl['tilt_deg'], fl['rms_m'],
@@ -198,7 +199,7 @@ def post_fastlio(d, voxel, run=None):
     say('后处理 %.1f s：原始 %d 点 → 摆正降采样 %d 点（%.2f m 体素），范围 x %.1f…%.1f、y %.1f…%.1f、z %.1f…%.1f m'
         % (time.time() - t0, len(p), len(q), voxel, *[v for pair in zip(q.min(axis=0), q.max(axis=0)) for v in pair]))
     if 'tf_vs_gravity_deg' in meta:
-        say('world←camera_init 来自 %s；和按重力推算的差 %.3f°' % (src, meta['tf_vs_gravity_deg']))
+        say('drone_odom←camera_init 来自 %s；和按重力推算的差 %.3f°' % (src, meta['tf_vs_gravity_deg']))
     if tr:
         say('轨迹 %.0f s、%.1f m；终点 − 起点 = %.3f m、yaw %+.2f°（回到起点停的话就是漂移）'
             % (tr['duration_s'], tr['path_m'], tr['end_minus_start_dist_m'], tr['yaw_change_deg']))

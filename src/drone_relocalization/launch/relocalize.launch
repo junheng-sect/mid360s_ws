@@ -3,7 +3,7 @@
   <arg name="map_dir" default="$(env HOME)/test_data/mapping/20261021_110311_indoor"/>
   <arg name="config" default="$(find drone_relocalization)/config/indoor.yaml"/>
   <arg name="rviz" default="false"/>
-  <!-- Display only: map in drone_map_view, world->drone_map_view identity until localized. -->
+  <!-- Display only: map in drone_map_view, drone_odom->drone_map_view identity until localized. -->
   <arg name="view" default="true"/>
   <!-- Display only: car frame, map (charging-pile origin) and a 2D car map image, read from the car's rosbridge. -->
   <arg name="car" default="true"/>

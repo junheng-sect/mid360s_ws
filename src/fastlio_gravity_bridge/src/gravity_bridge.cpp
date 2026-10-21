@@ -184,8 +184,8 @@ void GravityBridge::publishStaticTransform()
   static_tf_broadcaster_.sendTransform(tf_msg);
 
   // 安装旋转另发一段静态 TF，使 TF 树与 odom 消息自洽：
-  //   world -> camera_init -> body(=雷达 IMU) -> base_link(=机体)
-  // 平移为零：base_link 的原点与雷达 IMU 重合，杆臂不在本节点补偿。
+  //   drone_odom -> camera_init -> body(=雷达 IMU) -> drone_base(=机体)
+  // 平移为零：drone_base 的原点与雷达 IMU 重合，杆臂不在本节点补偿。
   // 只要输出 child frame 与输入不同名就发布，旋转就是位姿输出用的同一个 mounting_
   // （fixed / gravity 为安装旋转，none 为单位四元数），保证两者永远一致。
   if (config_.output_child_frame != config_.input_child_frame)
@@ -205,16 +205,17 @@ void GravityBridge::publishStaticTransform()
   }
 
   const Eigen::AngleAxisd minimal_rotation(alignment_.q);
-  // 对齐后 grav 应恰好落在 world 的 -Z 上；残差只用于日志自检。
+  // 对齐后 grav 应恰好落在 drone_odom 的 -Z 上；残差只用于日志自检。
   const Eigen::Vector3d gravity(latched_gravity_.vector.x, latched_gravity_.vector.y,
                                 latched_gravity_.vector.z);
   if (gravity.norm() < kGravityNormEps) return;
   const Eigen::Vector3d residual =
       alignment_.R * gravity.normalized() - Eigen::Vector3d(0.0, 0.0, -1.0);
-  ROS_INFO("[gravity_bridge] locked world->%s: q=(%.12f, %.12f, %.12f, %.12f), "
+  ROS_INFO("[gravity_bridge] locked %s->%s: q=(%.12f, %.12f, %.12f, %.12f), "
            "minimal rotation %.6f deg about (%.6f, %.6f, %.6f), aligned gravity residual=%.3e",
-           config_.input_frame.c_str(), alignment_.q.x(), alignment_.q.y(), alignment_.q.z(),
-           alignment_.q.w(), minimal_rotation.angle() * 180.0 / M_PI, minimal_rotation.axis().x(),
+           config_.world_frame.c_str(), config_.input_frame.c_str(), alignment_.q.x(),
+           alignment_.q.y(), alignment_.q.z(), alignment_.q.w(),
+           minimal_rotation.angle() * 180.0 / M_PI, minimal_rotation.axis().x(),
            minimal_rotation.axis().y(), minimal_rotation.axis().z(), residual.norm());
 }
 

@@ -54,7 +54,7 @@ cp -n docker/ros-noetic-rviz/local.env.example docker/ros-noetic-rviz/local.env
 
 ## 显示与面板保护
 
-- Fixed Frame 为 `world`，TF 来自板端重力桥接，本机不重复发布。
+- Fixed Frame 为 `drone_odom`（10-21 前叫 `world`），TF 来自板端重力桥接，本机不重复发布。
 - 使用 `--ipc=host` 修复本机 Qt5/XCB 的面板滚动残影；共享宿主机 IPC，限用于可信的本机显示镜像。
 - 不自动最大化或还原主窗口；旧 `--no-maximize` 为兼容空操作，`--maximize-delay N` 接受但忽略。
 - 默认保留 Displays/Views 和约 700px 左栏。启动布局稳定后仅在超过 12 MiB 保守面积预算时收窄分隔条。
