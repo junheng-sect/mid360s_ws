@@ -1,7 +1,7 @@
 """RViz comparison view, display only.
 
 The prior map is re-published in its own frame drone_map_view, child of world. Before a valid localization
-world->drone_map_view is identity, i.e. the live cloud is drawn as if the start were the map origin, so a drone
+world->drone_map_view is identity, i.e. the live cloud is drawn as if the start were the drone_map origin, so a drone
 started elsewhere shows a visible offset. Once status is valid it becomes the inverse of drone_map<-world and the
 live cloud lands on the map. The real /tf drone_map->world and /drone_reloc/pose are untouched; consumers must
 still check status.valid.
@@ -28,21 +28,12 @@ class ViewNode:
         self.broadcaster=tf2_ros.StaticTransformBroadcaster()
         self.pub_map=rospy.Publisher('/drone_reloc/view/map',PointCloud2,queue_size=1,latch=True)
         self.pub_text=rospy.Publisher('/drone_reloc/view/status_text',Marker,queue_size=1,latch=True)
-        self.pub_label=rospy.Publisher('/drone_reloc/view/map_label',Marker,queue_size=1,latch=True)
         self.subs=[rospy.Subscriber('/drone_reloc/map',PointCloud2,self.on_map,queue_size=1,buff_size=16777216),
                    rospy.Subscriber('/drone_reloc/status',String,self.on_status,queue_size=5),
                    rospy.Subscriber('/drone_reloc/result',String,self.on_result,queue_size=5)]
         # Wall clock like runtime.watch_inputs: a frozen /clock must not keep a dead localization on screen.
         self.stop=threading.Event();rospy.on_shutdown(self.stop.set)
-        self.publish_label();self.tick();self.thread=threading.Thread(target=self.loop,daemon=True);self.thread.start()
-
-    def publish_label(self):
-        # Names the map origin; drone_map_view has drone_map's coordinates, RViz draws the axes there.
-        m=self.Marker();m.header.frame_id=VIEW;m.header.stamp=self.rospy.Time(0)
-        m.ns='drone_reloc_view';m.id=1;m.type=m.TEXT_VIEW_FACING;m.action=m.ADD;m.text='map (0,0,0)'
-        m.pose.position.z=.4;m.pose.orientation.w=1.;m.scale.z=.2
-        m.color.r,m.color.g,m.color.b=.2,.9,1.;m.color.a=1.  # cyan: scan is white, status is yellow/green/red
-        self.pub_label.publish(m)
+        self.tick();self.thread=threading.Thread(target=self.loop,daemon=True);self.thread.start()
 
     def on_map(self,m):
         m.header.frame_id=VIEW;self.pub_map.publish(m)
@@ -85,7 +76,7 @@ class ViewNode:
         elif s is None:text,rgb='NO /drone_reloc/status - not localized',(1.,.25,.2)
         else:
             state=str(s.get('state','?'))
-            text='%s - not localized, start assumed at map origin'%state
+            text='%s - not localized, start assumed at drone_map origin'%state
             rgb=(1.,.25,.2) if state in ('STALE','FAILED') else (1.,.8,.1)
         if (text,rgb)==self.text:return
         m=self.Marker();m.header.frame_id='base_link';m.header.stamp=self.rospy.Time(0);m.frame_locked=True

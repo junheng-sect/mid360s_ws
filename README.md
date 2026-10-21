@@ -10,7 +10,7 @@ export ROS_IP=192.168.31.32 && source /opt/ros/noetic/setup.bash && source ~/mid
 roslaunch drone_relocalization relocalize.launch
 ```
 
-上述 launch 启动重定位和显示节点 `reloc_view`，默认地图 `~/test_data/mapping/20261021_110311_indoor`；传感器链需已运行且设备保持静止，成功时终端打印当前位置。本机看对照视图（彩色地图 + 白色实时点云，定位前错位、定位后重合）：`./scripts/run_rviz.sh --reloc`。中文接口、离线命令见包内 [说明](src/drone_relocalization/README.md) 与 [验收报告](src/drone_relocalization/ACCEPTANCE.md)（10-20 离线验收，旧图）。10-21 在新图上实机静止启动试过 3 次，都能锁定，没有用物理真值验收。
+上述 launch 启动重定位和显示节点 `reloc_view`，默认地图 `~/test_data/mapping/20261021_110311_indoor`；传感器链需已运行且设备保持静止，成功时终端打印当前位置。本机看对照视图（彩色地图 + 白色实时点云，定位前错位、定位后重合；加上车、充电桩原点的 map 坐标轴和二维车图）：`./scripts/run_rviz.sh --reloc`。中文接口、离线命令见包内 [说明](src/drone_relocalization/README.md) 与 [验收报告](src/drone_relocalization/ACCEPTANCE.md)（10-20 离线验收，旧图）。10-21 在新图上实机静止启动试过 3 次，都能锁定，没有用物理真值验收。
 
 ## 本地运行 RViz
 

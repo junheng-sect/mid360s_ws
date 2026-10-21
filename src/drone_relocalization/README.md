@@ -36,7 +36,7 @@ roslaunch drone_relocalization relocalize.launch map_dir:=$HOME/test_data/mappin
 双确认成功时终端打印一行 `定位成功，当前位置（地图系，原点=建图起点的雷达 IMU）：x=… y=… z=… m，航向 …°，离地图地面 … m`，
 和 `/drone_reloc/pose` 同一条变换链（取最新一帧里程计）：位置是雷达 IMU，航向是机体（base_link）航向。
 雷达相对机体约有 1.6° 安装偏航，所以按建图时的姿势放回起点，航向约 −1.4°（10-21 回放），不是 0°。之后的位置看 `/drone_reloc/pose`。
-launch 起重定位节点和显示节点 `reloc_view`（`view:=false` 关闭），可用 `rviz:=true` 在板端起 RViz；板端是 llvmpipe 软件渲染，会和重定位抢 CPU，建议在本机看（见下节）。
+launch 起重定位节点和显示节点 `reloc_view`（`view:=false` 关闭）、`car_view`（`car:=false` 关闭，见下节），可用 `rviz:=true` 在板端起 RViz；板端是 llvmpipe 软件渲染，会和重定位抢 CPU，建议在本机看（见下节）。
 
 ## RViz 对照显示
 
@@ -46,7 +46,16 @@ launch 起重定位节点和显示节点 `reloc_view`（`view:=false` 关闭）�
 ./scripts/run_rviz.sh --reloc
 ```
 
-彩色是先验地图（按高度着色），白色是 FAST-LIO 实时点云 `/cloud_registered`；两组 0.3 m 坐标轴（红 x、绿 y、蓝 z）：带青色 `map (0,0,0)` 标签的是地图原点，上方有状态文字的是无人机 `base_link`。
+彩色是先验地图（按高度着色），白色是 FAST-LIO 实时点云 `/cloud_registered`；三组 0.3 m 坐标轴（红 x、绿 y、蓝 z）：
+- 带青色 `map (0,0,0)` 标签的是统一 map：原点是车 App 的「充电桩」点，x 是车插在桩上时的车头方向（从桩指向房间里），y 朝左，地面 z=0。
+- 带橙色 `car base_footprint` 标签的是车体（`/tracked_pose` 的位置和航向），固定画在离地 0.2 m（车激光高度）。车 2 s 没数据或换了地图时标签变红并写明原因。
+  车的位姿由车端 Cartographer 纯定位持续拿激光对地图修正。
+- 带紫色 `drone base_link` 标签、上方有状态文字的是无人机机体。它在 map 里的位姿是一次重定位得到的固定 `drone_map←world`
+  乘上 FAST-LIO 里程计（`world` 就是无人机的 odom 系），锁定后不再对地图修正，FAST-LIO 漂多少就差多少。
+
+窗口布局：左栏是 Displays、Views 和摄像头预览 `OV13855 Preview`（同 `fastlio_mid360s.rviz`，相机节点没跑时显示 No Image）；
+右侧上面三维，下面是二维车图 `Car map`：按车 App 的画法（车图 x 朝右、y 朝上，map 的 x 正好朝上），画 map 坐标轴、车身框（650×550 mm）和车头、
+定位有效时的无人机位置与离地高度，顶部一行是车定位分数和无人机状态。
 定位前按「起点就是地图原点」画实时点云，无人机不在地图原点起步时两者错位；`/drone_reloc/status` 有效后两者重合；
 定位失效（STALE/FAILED，或 status 2.5 秒没更新）又退回错位。
 
@@ -54,6 +63,13 @@ launch 起重定位节点和显示节点 `reloc_view`（`view:=false` 关闭）�
 在 `/tf_static` 上发 `world→drone_map_view`，未定位为单位变换，定位有效时为 `drone_map←world` 的逆。
 真实的 `/tf` `drone_map→world` 和 `/drone_reloc/pose` 仍只在定位有效时由重定位节点发布；不要用 `drone_map_view` 做导航或控制。
 状态文字话题 `/drone_reloc/view/status_text`（英文，RViz 字体不支持中文）。
+
+车和 map 由 `car_view` 节点显示，同样只服务显示：
+- 只经车端 rosbridge（默认 `car_rosbridge:=192.168.31.231:9090`）订阅 `/tracked_pose`、`/map`、`/current_floormap`、`/local_global_score`，不给车发任何东西；车不在线时每 2 s 重连，不影响重定位。依赖 `websocket-client`（pip）。
+- 标定在 `config/map_frame.yaml`（`map_frame:=` 可换）：map←drone_map、map←car_map，来自 10-21 车图 10.21 与无人机图 `20261021_110311_indoor` 的离线配准（约 2 cm / 0.3°）。
+- 在 `/tf_static` 发 `drone_map_view→map_view→car_map_view`，在 `/tf` 发 `car_map_view→car_view`；`/car_view/labels` 是文字标签，`/car_view/map_image/compressed` 是 2 Hz 的 PNG 二维车图。
+- 车 `/current_floormap` 的 mapId 不是标定时的 `1792549441088` 时不发车的 TF；`map_dir` 不是标定用的无人机图时 map 和车都不发。换了任一张图都要重新配准、改 `map_frame.yaml`。
+- 这些帧都带 `_view` 后缀，真实 `/tf` 里还没有 `map` / `car_map`，不要拿来导航或控制。
 
 没有实机数据时可用回放演示（板端，私有 master `192.168.31.32:11531`；实时点云被人为挪开 1.3 m、转 60°，前 25 秒模拟手持晃动）：
 

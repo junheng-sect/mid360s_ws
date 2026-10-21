@@ -12,7 +12,7 @@ Visualization Manager:
       Name: Grid
       Enabled: true
       Plane Cell Count: 20
-      Reference Frame: <Fixed Frame>
+      Reference Frame: map_view
     - Class: rviz/PointCloud2
       Name: Prior map
       Enabled: true
@@ -38,23 +38,34 @@ Visualization Manager:
       Length: 0.3
       Radius: 0.03
     - Class: rviz/Axes
-      Name: Map frame
+      Name: Map
       Enabled: true
-      Reference Frame: drone_map_view
+      Reference Frame: map_view
+      Length: 0.3
+      Radius: 0.03
+    - Class: rviz/Axes
+      Name: Car
+      Enabled: true
+      Reference Frame: car_view
       Length: 0.3
       Radius: 0.03
     - Class: rviz/Marker
-      Name: Map label
+      Name: Labels
       Enabled: true
-      Marker Topic: /drone_reloc/view/map_label
+      Marker Topic: /car_view/labels
     - Class: rviz/Marker
       Name: Reloc status
       Enabled: true
       Marker Topic: /drone_reloc/view/status_text
+    - Class: rviz/Image
+      Name: Car map
+      Enabled: true
+      Image Topic: /car_view/map_image
+      Transport Hint: compressed
   Views:
     Current:
       Class: rviz/Orbit
       Distance: 9
       Focal Point: {X: -0.9, Y: -0.1, Z: 0.5}
       Pitch: 1.1
-      Yaw: 3.1416
+      Yaw: -1.5615

@@ -5,8 +5,14 @@
   <arg name="rviz" default="false"/>
   <!-- Display only: map in drone_map_view, world->drone_map_view identity until localized. -->
   <arg name="view" default="true"/>
+  <!-- Display only: car frame, map (charging-pile origin) and a 2D car map image, read from the car's rosbridge. -->
+  <arg name="car" default="true"/>
+  <arg name="car_rosbridge" default="192.168.31.231:9090"/>
+  <arg name="map_frame" default="$(find drone_relocalization)/config/map_frame.yaml"/>
   <node pkg="drone_relocalization" type="relocalize" name="drone_reloc" output="screen"
         args="--map $(arg map_dir) --config $(arg config)"/>
   <node if="$(arg view)" pkg="drone_relocalization" type="reloc_view" name="reloc_view" output="screen"/>
+  <node if="$(arg car)" pkg="drone_relocalization" type="car_view" name="car_view" output="screen"
+        args="--map $(arg map_dir) --frames $(arg map_frame) --car $(arg car_rosbridge)"/>
   <node if="$(arg rviz)" pkg="rviz" type="rviz" name="drone_reloc_rviz" args="-d $(find drone_relocalization)/rviz/indoor.rviz"/>
 </launch>

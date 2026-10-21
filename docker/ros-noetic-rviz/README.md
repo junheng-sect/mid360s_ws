@@ -14,7 +14,9 @@
 
 `--reloc` 打开重定位对照视图（`rviz/drone_reloc.rviz`，个人副本 `home/ros/.rviz/drone_reloc.rviz`，规则同下）：
 Fixed Frame `drone_map_view`，彩色先验地图 + 白色实时点云，定位前错位、定位后重合。
-需要板端运行 `drone_relocalization` 的 `relocalize.launch`（含显示节点 `reloc_view`），说明见该包 README「RViz 对照显示」。
+需要板端运行 `drone_relocalization` 的 `relocalize.launch`（含显示节点 `reloc_view` 和 `car_view`），说明见该包 README「RViz 对照显示」。
+三维里有 map（充电桩原点）、车、无人机三组坐标轴；左栏下方是摄像头预览，三维视图下面是二维车图 `Car map`。两个 Image 面板都走 compressed，
+启动时 RViz 会报一条 `Tried to advertise a service that is already advertised ... /rviz/compressed/set_parameters`，是两个面板共用 compressed 参数服务，不影响显示。
 
 ## 两台电脑共用一份仓库
 
