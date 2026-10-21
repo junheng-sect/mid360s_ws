@@ -15,6 +15,8 @@ usage() {
 用法: run_rviz.sh [选项]
 
   --config PATH       容器内 RViz 配置路径（默认本机 home/ros/.rviz/fastlio_mid360s.rviz）
+  --reloc             打开重定位对照视图（个人副本 home/ros/.rviz/drone_reloc.rviz，首次从
+                      rviz/drone_reloc.rviz 复制）：彩色先验地图 + 白色实时点云，定位前错位、定位后重合
   --ros-master URI    ROS Master 地址（默认 http://192.168.31.32:11311）
   --ros-ip IP         覆盖自动识别的本机 ROS IP
   --name NAME         容器名（默认 rviz_mid360s，同名容器会自动清理）
@@ -35,10 +37,10 @@ fastlio_gravity_bridge 节点发布；板端没跑时 RViz 会提示该 frame �
 EOF
 }
 
-# 默认打开被 Git 忽略的个人副本，保存布局不会改动公共模板。
-personal_config="$CONFIG_DIR/home/ros/.rviz/fastlio_mid360s.rviz"
-personal_config_in_container="/home/ros/.rviz/fastlio_mid360s.rviz"
-rviz_config="${RVIZ_CONFIG:-$personal_config_in_container}"
+# 默认打开被 Git 忽略的个人副本，保存布局不会改动公共模板；--reloc 换成重定位对照模板。
+rviz_template="fastlio_mid360s.rviz"
+reloc=0
+rviz_config=""
 ros_master_uri="${RVIZ_ROS_MASTER:-}"
 ros_ip_override="${RVIZ_ROS_IP:-}"
 run_mode="rviz"
@@ -52,6 +54,7 @@ panel_check_delay=6
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) rviz_config="$2"; shift 2 ;;
+    --reloc) rviz_template="drone_reloc.rviz"; reloc=1; shift ;;
     --ros-master) ros_master_uri="$2"; shift 2 ;;
     --ros-ip) ros_ip_override="$2"; shift 2 ;;
     --name) CONTAINER_NAME="$2"; shift 2 ;;
@@ -71,6 +74,14 @@ while [ $# -gt 0 ]; do
     *) usage >&2; die "未知参数：$1" ;;
   esac
 done
+
+personal_config="$CONFIG_DIR/home/ros/.rviz/$rviz_template"
+personal_config_in_container="/home/ros/.rviz/$rviz_template"
+# 优先级：--config > --reloc > local.env 的 RVIZ_CONFIG > 默认个人副本。
+if [ -z "$rviz_config" ]; then
+  if [ "$reloc" -eq 1 ]; then rviz_config="$personal_config_in_container"
+  else rviz_config="${RVIZ_CONFIG:-$personal_config_in_container}"; fi
+fi
 
 [ -n "$ros_master_uri" ] || ros_master_uri="$(resolve_ros_master)"
 
@@ -201,7 +212,7 @@ if [ "$run_mode" = rviz ] && [ "$rviz_config" = "$personal_config_in_container" 
   if [ ! -e "$personal_config" ]; then
     mkdir -p "$(dirname "$personal_config")"
     # 不覆盖另一个同时启动的入口已创建的个人配置。
-    cp -n "$CONFIG_DIR/rviz/fastlio_mid360s.rviz" "$personal_config"
+    cp -n "$CONFIG_DIR/rviz/$rviz_template" "$personal_config"
     log "个人 RViz 配置：$personal_config（首次从公共模板初始化）"
   fi
 fi

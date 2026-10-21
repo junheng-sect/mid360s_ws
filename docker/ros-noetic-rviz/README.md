@@ -9,7 +9,12 @@
 ./scripts/run_rviz.sh
 ./scripts/run_rviz.sh --detach
 ./scripts/run_rviz.sh --help
+./scripts/run_rviz.sh --reloc
 ```
+
+`--reloc` 打开重定位对照视图（`rviz/drone_reloc.rviz`，个人副本 `home/ros/.rviz/drone_reloc.rviz`，规则同下）：
+Fixed Frame `drone_map_view`，彩色先验地图 + 白色实时点云，定位前错位、定位后重合。
+需要板端运行 `drone_relocalization` 的 `relocalize.launch`（含显示节点 `reloc_view`），说明见该包 README「RViz 对照显示」。
 
 ## 两台电脑共用一份仓库
 
