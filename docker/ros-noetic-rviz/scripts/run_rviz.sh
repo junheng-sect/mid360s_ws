@@ -16,7 +16,8 @@ usage() {
 
   --config PATH       容器内 RViz 配置路径（默认本机 home/ros/.rviz/fastlio_mid360s.rviz）
   --reloc             打开重定位对照视图（个人副本 home/ros/.rviz/drone_reloc.rviz，首次从
-                      rviz/drone_reloc.rviz 复制）：彩色先验地图 + 白色实时点云，定位前错位、定位后重合
+                      rviz/drone_reloc.rviz 复制）：Fixed Frame map，先验地图、实时点云、map/车/无人机三组
+                      坐标轴和二维车图；本机同时起显示辅助节点 local_view/reloc_display（板端不跑显示节点）
   --ros-master URI    ROS Master 地址（默认 http://192.168.31.32:11311）
   --ros-ip IP         覆盖自动识别的本机 ROS IP
   --name NAME         容器名（默认 rviz_mid360s，同名容器会自动清理）
@@ -89,6 +90,11 @@ log "1/5 检查 Docker"
 check_docker
 check_image
 if [ "$use_gpu" -eq 1 ]; then check_nvidia_runtime; fi
+if [ "$reloc" -eq 1 ]; then
+  # 重定位视图换成带本机显示辅助节点的 launch。
+  LAUNCH_FILE_IN_CONTAINER="/opt/rviz-ws/launch/display_reloc.launch"
+  LAUNCH_FILE_ON_HOST="$CONFIG_DIR/launch/display_reloc.launch"
+fi
 if [ "$run_mode" = rviz ]; then check_launch_file; fi
 
 log "2/5 检查 GPU"
@@ -174,7 +180,14 @@ case "$run_mode" in
   # 显示模式：roslaunch 打开 RViz（required="true"，关窗/Ctrl+C/docker stop 时退出）。
   # drone_odom -> camera_init 静态 TF 由板端 fastlio_gravity_bridge 发布，本机不发布。
   # --config 只作为 config 参数透传，不改用户给的配置。
-  rviz)  set -- roslaunch "$LAUNCH_FILE_IN_CONTAINER" "config:=$rviz_config" ;;
+  rviz)
+    if [ "$reloc" -eq 1 ]; then
+      # local_view 不编译：入口脚本 source 过 ROS 之后再把它加进 ROS_PACKAGE_PATH，roslaunch 才找得到 reloc_display.py。
+      set -- bash -c 'export ROS_PACKAGE_PATH=/opt/rviz-ws/local_view:$ROS_PACKAGE_PATH; exec roslaunch "$0" "config:=$1"' \
+        "$LAUNCH_FILE_IN_CONTAINER" "$rviz_config"
+    else
+      set -- roslaunch "$LAUNCH_FILE_IN_CONTAINER" "config:=$rviz_config"
+    fi ;;
   shell) set -- bash ;;
   cmd)   set -- bash -lc "$run_cmd" ;;
 esac

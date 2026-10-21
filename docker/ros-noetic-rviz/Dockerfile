@@ -14,6 +14,7 @@ RUN set -eux; \
       x11-utils \
       xauth \
       iproute2 \
+      python3-websocket \
       net-tools \
       procps; \
     rm -rf /var/lib/apt/lists/*

@@ -13,9 +13,12 @@
 ```
 
 `--reloc` 打开重定位对照视图（`rviz/drone_reloc.rviz`，个人副本 `home/ros/.rviz/drone_reloc.rviz`，规则同下）：
-Fixed Frame `drone_map_view`，彩色先验地图 + 白色实时点云，定位前错位、定位后重合。
-需要板端运行 `drone_relocalization` 的 `relocalize.launch`（含显示节点 `reloc_view` 和 `car_view`），说明见该包 README「RViz 对照显示」。
-三维里有 map（充电桩原点）、车、无人机三组坐标轴；左栏下方是摄像头预览，三维视图下面是二维车图 `Car map`。两个 Image 面板都走 compressed，
+Fixed Frame `map`，彩色先验地图 + 白色实时点云，三维里有 map（充电桩原点）、车 `car_base`、无人机 `drone_base` 三组坐标轴（都是板端真实 TF）；
+左栏下方是摄像头预览，三维视图下面是二维车图 `Car map`。需要板端运行 `drone_relocalization` 的 `relocalize.launch`（带 `car_bridge`），
+板端不跑显示节点：`--reloc` 会在容器里用 `launch/display_reloc.launch` 同时起 RViz 和显示辅助节点 `local_view/reloc_display.py`
+（二维车图、标签、状态文字；车栅格图直接从车端 rosbridge `192.168.31.231:9090` 取，只订阅 `/map`）。`local_view` 不用编译，
+启动时加进 `ROS_PACKAGE_PATH`；它要 `python3-websocket`，镜像已带上（改过 Dockerfile 后先 `./scripts/build_image.sh`）。
+说明见 `drone_relocalization` 包 README「RViz 对照显示（本机）」。两个 Image 面板都走 compressed，
 启动时 RViz 会报一条 `Tried to advertise a service that is already advertised ... /rviz/compressed/set_parameters`，是两个面板共用 compressed 参数服务，不影响显示。
 
 ## 两台电脑共用一份仓库

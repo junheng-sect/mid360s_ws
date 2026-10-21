@@ -1,18 +1,17 @@
 <launch>
-  <!-- Only localization and map visualization; reuse existing driver/LIO/bridge. -->
+  <!-- Board side: localization plus the car pose bridge; reuse existing driver/LIO/bridge.
+       No display nodes here: RViz and its helpers run on the laptop (docker/ros-noetic-rviz, the run_rviz.sh reloc view). -->
   <arg name="map_dir" default="$(env HOME)/test_data/mapping/20261021_110311_indoor"/>
   <arg name="config" default="$(find drone_relocalization)/config/indoor.yaml"/>
-  <arg name="rviz" default="false"/>
-  <!-- Display only: map in drone_map_view, drone_odom->drone_map_view identity until localized. -->
-  <arg name="view" default="true"/>
-  <!-- Display only: car frame, map (charging-pile origin) and a 2D car map image, read from the car's rosbridge. -->
+  <!-- Car pose into the real TF tree: map->drone_map, map->car_map->car_base (see car_bridge). -->
   <arg name="car" default="true"/>
   <arg name="car_rosbridge" default="192.168.31.231:9090"/>
-  <arg name="map_frame" default="$(find drone_relocalization)/config/map_frame.yaml"/>
+  <arg name="map_frame" default="$(find car_bridge)/config/map_frame.yaml"/>
   <node pkg="drone_relocalization" type="relocalize" name="drone_reloc" output="screen"
         args="--map $(arg map_dir) --config $(arg config)"/>
-  <node if="$(arg view)" pkg="drone_relocalization" type="reloc_view" name="reloc_view" output="screen"/>
-  <node if="$(arg car)" pkg="drone_relocalization" type="car_view" name="car_view" output="screen"
-        args="--map $(arg map_dir) --frames $(arg map_frame) --car $(arg car_rosbridge)"/>
-  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="drone_reloc_rviz" args="-d $(find drone_relocalization)/rviz/indoor.rviz"/>
+  <include if="$(arg car)" file="$(find car_bridge)/launch/car_bridge.launch">
+    <arg name="drone_map" value="$(arg map_dir)"/>
+    <arg name="frames" value="$(arg map_frame)"/>
+    <arg name="car_rosbridge" value="$(arg car_rosbridge)"/>
+  </include>
 </launch>

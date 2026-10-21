@@ -1,0 +1,17 @@
+<launch>
+  <!--
+    本机重定位对照视图（run_rviz.sh 的 reloc 模式用）：RViz 加本机显示辅助节点 reloc_display。
+    板端不跑任何显示节点，只提供真实 TF（map、drone_map、drone_odom、drone_base、car_map、car_base）
+    和 /drone_reloc/*、/car/status；二维车图、标签、状态文字都由这里的 reloc_display 生成。
+    reloc_display 在 local_view 目录（不编译，run_rviz.sh 把它加进 ROS_PACKAGE_PATH）；它挂了会自动重启，
+    RViz 关窗/Ctrl+C/docker stop 时整体退出。
+  -->
+  <arg name="config" default="/opt/rviz-ws/rviz/drone_reloc.rviz" />
+  <arg name="car_rosbridge" default="192.168.31.231:9090" />
+
+  <node pkg="local_view" type="reloc_display.py" name="reloc_display"
+        args="--car $(arg car_rosbridge)" output="screen" respawn="true" respawn_delay="3" />
+  <node pkg="rviz" type="rviz" name="rviz"
+        args="-d $(arg config)"
+        output="screen" required="true" />
+</launch>

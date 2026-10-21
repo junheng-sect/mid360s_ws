@@ -35,7 +35,7 @@ Visualization Manager:
         Z: 0
       Plane: XY
       Plane Cell Count: 20
-      Reference Frame: map_view
+      Reference Frame: map
       Value: true
     - Alpha: 1
       Autocompute Intensity Bounds: true
@@ -60,7 +60,7 @@ Visualization Manager:
       Size (Pixels): 2
       Size (m): 0.029999999329447746
       Style: Points
-      Topic: /drone_reloc/view/map
+      Topic: /drone_reloc/map
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: true
@@ -108,7 +108,7 @@ Visualization Manager:
       Length: 0.30000001192092896
       Name: Map
       Radius: 0.029999999329447746
-      Reference Frame: map_view
+      Reference Frame: map
       Show Trail: false
       Value: true
     - Alpha: 1
@@ -117,12 +117,12 @@ Visualization Manager:
       Length: 0.30000001192092896
       Name: Car
       Radius: 0.029999999329447746
-      Reference Frame: car_view
+      Reference Frame: car_base
       Show Trail: false
       Value: true
     - Class: rviz/Marker
       Enabled: true
-      Marker Topic: /car_view/labels
+      Marker Topic: /reloc_display/labels
       Name: Labels
       Namespaces:
         {}
@@ -130,7 +130,7 @@ Visualization Manager:
       Value: true
     - Class: rviz/Marker
       Enabled: true
-      Marker Topic: /drone_reloc/view/status_text
+      Marker Topic: /reloc_display/status_text
       Name: Reloc status
       Namespaces:
         {}
@@ -150,7 +150,7 @@ Visualization Manager:
       Value: true
     - Class: rviz/Image
       Enabled: true
-      Image Topic: /car_view/map_image
+      Image Topic: /reloc_display/car_map
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -164,7 +164,7 @@ Visualization Manager:
   Global Options:
     Background Color: 0; 0; 0
     Default Light: true
-    Fixed Frame: drone_map_view
+    Fixed Frame: map
     Frame Rate: 30
   Name: root
   Tools:
@@ -189,9 +189,9 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -0.8999999761581421
-        Y: -0.10000000149011612
-        Z: 0.5
+        X: 0.98
+        Y: -0.35
+        Z: 0.66
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
@@ -199,7 +199,7 @@ Visualization Manager:
       Near Clip Distance: 0.009999999776482582
       Pitch: 1.100000023841858
       Target Frame: <Fixed Frame>
-      Yaw: -1.5615
+      Yaw: 3.1416
     Saved: ~
 Window Geometry:
   Car map:

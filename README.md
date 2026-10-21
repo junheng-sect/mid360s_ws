@@ -10,7 +10,7 @@ export ROS_IP=192.168.31.32 && source /opt/ros/noetic/setup.bash && source ~/mid
 roslaunch drone_relocalization relocalize.launch
 ```
 
-上述 launch 启动重定位和显示节点 `reloc_view`，默认地图 `~/test_data/mapping/20261021_110311_indoor`；传感器链需已运行且设备保持静止，成功时终端打印当前位置。本机看对照视图（彩色地图 + 白色实时点云，定位前错位、定位后重合；加上车、充电桩原点的 map 坐标轴和二维车图）：`./scripts/run_rviz.sh --reloc`。中文接口、离线命令见包内 [说明](src/drone_relocalization/README.md) 与 [验收报告](src/drone_relocalization/ACCEPTANCE.md)（10-20 离线验收，旧图）。10-21 在新图上实机静止启动试过 3 次，都能锁定，没有用物理真值验收。
+上述 launch 启动重定位和车位姿桥接 `car_bridge`（车位姿和统一 map 进板端真实 TF），默认地图 `~/test_data/mapping/20261021_110311_indoor`；传感器链需已运行且设备保持静止，成功时终端打印当前位置。板端不跑显示节点；本机看对照视图（Fixed Frame map，先验地图、实时点云、map/车/无人机三组坐标轴和二维车图，显示辅助节点在本机 docker 里跑）：`./scripts/run_rviz.sh --reloc`。中文接口、离线命令见包内 [说明](src/drone_relocalization/README.md) 与 [验收报告](src/drone_relocalization/ACCEPTANCE.md)（10-20 离线验收，旧图）。10-21 在新图上实机静止启动试过 3 次，都能锁定，没有用物理真值验收。
 
 ## 本地运行 RViz
 
@@ -38,7 +38,8 @@ mid360s_ws/
 │   │   ├── config/voxelslam_mid360s.yaml
 │   │   ├── launch/voxelslam.launch
 │   │   └── scripts/build_map      # 入口
-│   ├── drone_relocalization/      # 室内一次性 SE3 重定位、双窗口确认、状态与先验地图显示
+│   ├── drone_relocalization/      # 室内一次性 SE3 重定位、双窗口确认、状态与先验地图
+│   ├── car_bridge/                # 车位姿进板端 TF（只读车端 rosbridge）：map→drone_map、map→car_map→car_base
 │   ├── voxel_slam/                # Voxel-SLAM 算法包（离线建图用，飞行定位仍用 FAST-LIO2）
 │   ├── FAST_LIO/                  # FAST-LIO2 算法包
 │   │   ├── config/mid360s.yaml    # MID-360S 传感器配置参数

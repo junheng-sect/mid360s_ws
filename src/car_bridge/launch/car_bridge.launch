@@ -1,0 +1,10 @@
+<launch>
+  <!-- 车位姿进板端 TF：只读车端 rosbridge，不给车发任何指令。
+       发 map->drone_map、map->car_map（静态，config/map_frame.yaml）和 car_map->car_base（10 Hz），
+       另有 /car/pose、/car/status。显示（二维车图、标签）都在本地 docker RViz 那边。 -->
+  <arg name="drone_map" default="$(env HOME)/test_data/mapping/20261021_110311_indoor"/>
+  <arg name="frames" default="$(find car_bridge)/config/map_frame.yaml"/>
+  <arg name="car_rosbridge" default="192.168.31.231:9090"/>
+  <node pkg="car_bridge" type="car_bridge" name="car_bridge" output="screen"
+        args="--drone-map $(arg drone_map) --frames $(arg frames) --car $(arg car_rosbridge)"/>
+</launch>

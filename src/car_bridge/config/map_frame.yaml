@@ -1,13 +1,13 @@
-# 统一 map 系（只给 car_view 显示用，帧名带 _view，不进真实 /tf）。
+# 统一 map 系标定，car_bridge 据此在板端发真实 TF：map->drone_map、map->car_map（静态）和 car_map->car_base。
 # 原点：车 App 的「充电桩」点（车 base_footprint 停在桩前的位置），z=0 取地面。
 # x：车插在桩上时的车头方向（从桩指向房间里），y 朝左，z 朝上。
 # 来源：10-21 16:25 车图 10.21 与无人机图 20261021_110311_indoor 的离线配准，
 #   car_map<-drone_map = (0.6803, 0.8924, -1.8151 deg)，精度约 2 cm / 0.3 deg。
-# 换了车图或无人机图都要重新配准；car_view 发现地图对不上时不发对应的 TF。
+# 换了车图或无人机图都要重新配准；car_bridge 发现地图对不上时不发对应的 TF。
 drone_map: 20261021_110311_indoor
 car_map_id: 1792549441088
 # p_map = Rz(yaw) @ p + (x, y, z)；无人机图地面在 z=-0.1589，所以 z 加 0.1589
 map_from_drone_map: {x: 1.06774, y: -1.25381, z: 0.1589, yaw_deg: -90.53119}
 map_from_car_map: {x: 0.16030, y: -0.59366, z: 0.0, yaw_deg: -88.71600}
-# 车坐标轴离地高度（车激光 base_footprint->/scan 也是 0.2 m）
-car_frame_height: 0.20
+# car_base 离地高度：取车激光高度（车 TF 里 base_footprint->scan 是 0.2 m），x/y/yaw 和车的 base_footprint 相同
+car_base_height: 0.20
