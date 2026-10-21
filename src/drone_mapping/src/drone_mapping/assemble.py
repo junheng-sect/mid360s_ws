@@ -6,6 +6,11 @@
   不用 Voxel-SLAM 自己存的逐帧点云：那是 0.1 m 体素平均过的，点更稀，面也显得更薄（10-19 对比时统一用原始点）。
 - world：z 朝上，原点 = 起点时的雷达 IMU，yaw 不动（同 FAST-LIO 那一路）；只按它估的重力再摆一次（通常 < 0.1°）。
   不按地面二次摆正：10-20 试过，重定位的可信次数反而变少。
+- 去人（10-21 加，carve）：手持建图时拿设备的人会被扫进图里。设备走过的空间里不会有静止物体，所以离轨迹水平
+  CARVE_R、上下 CARVE_H 以内（扁椭球），且只在不到 CARVE_SECS 个不同的秒里被看到的 CARVE_CELL 格子整格去掉。
+  - 只看距离会误删：10-21 那次设备从一个静止物体旁约 0.1 m 擦过，它全程 144 s 都看得到，靠「被看到的秒数」留下。
+  - 上下只取 ±0.12 m：起点时雷达 IMU 离地约 0.16 m，地面不能切；比设备低很多的东西（桌面等）受 FOV 限制本来就
+    只在走近时短暂可见，没法按时长区分，所以不往下延伸。人在设备高度的部分（手臂、肩、头）能去掉，腿和腰留着。
 """
 import json
 import math
@@ -19,6 +24,12 @@ from drone_mapping import mapio
 
 # livox_ros_driver2/CustomMsg 里 points 的一个元素：offset_time（相对 header.stamp，ns）x y z reflectivity tag line
 PT = np.dtype([('t', '<u4'), ('x', '<f4'), ('y', '<f4'), ('z', '<f4'), ('r', 'u1'), ('tag', 'u1'), ('line', 'u1')])
+
+CARVE_R = 0.25      # 去人：离轨迹的水平半径（m），0 关闭
+CARVE_H = 0.12      # 去人：上下半高（m），要小于起点时雷达 IMU 离地的高度（10-21 那次 0.16 m）
+CARVE_SECS = 5      # 去人：格子在少于这么多个不同的秒里被看到才算人（静止物体基本每秒都看得到）
+CARVE_CELL = 0.1    # 去人按这么大的格子判断、整格去掉；是地图体素 0.05 的整数倍，格子互相嵌套。
+                    # 不用 0.05：静止物体边缘的 0.05 小格只偶尔被扫到，10-21 那次会把擦边物体削掉约 35 个点
 
 
 def read_state(path):
@@ -66,11 +77,11 @@ def to_world(xyz, T, traj, Rg):
 
 
 def gather(bag, traj, prm, Rg):
-    """逐帧解原始 CustomMsg（不经 rospy 反序列化），返回 world 系点、强度、用到的雷达帧数"""
+    """逐帧解原始 CustomMsg（不经 rospy 反序列化），返回 world 系点、强度、时间（相对轨迹起点，s）、用到的雷达帧数"""
     import rosbag
     t_lo, t_hi = traj[0, 0], traj[-1, 0]
     rot = not np.array_equal(prm['R'], np.eye(3))
-    pts, inten, n_msg = [], [], 0
+    pts, inten, tim, n_msg = [], [], [], 0
     with rosbag.Bag(bag) as b:
         for _, raw, _ in b.read_messages(topics=['/livox/lidar'], raw=True):
             d = raw[1]
@@ -93,24 +104,86 @@ def gather(bag, traj, prm, Rg):
             xyz = xyz[k] @ prm['R'].T if rot else xyz[k]
             pts.append(to_world(xyz + prm['T'], T[k], traj, Rg).astype(np.float32))
             inten.append(c['r'][k].astype(np.float32))
+            tim.append((T[k] - t_lo).astype(np.float32))
             n_msg += 1
     if not pts:
         raise RuntimeError('%s 里没有落在轨迹时间段内的雷达点' % bag)
-    return np.concatenate(pts), np.concatenate(inten), n_msg
+    return np.concatenate(pts), np.concatenate(inten), np.concatenate(tim), n_msg
 
 
-def build(d, bag, state, config, voxel, meta=None, say=print):
-    """在目录 d 里写 map_world.pcd / preview.png / meta.json；meta 里已有的键（run、voxelslam 等）保留"""
+def path_samples(tw, step):
+    """轨迹折线按不超过 step 的间隔加密"""
+    seg = np.diff(tw, axis=0)
+    n = np.maximum(1, np.ceil(np.linalg.norm(seg, axis=1) / step).astype(np.int64))
+    a = np.repeat(np.arange(len(seg)), n)
+    f = (np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n) + 1) / np.repeat(n, n)
+    return np.r_[tw[:1], tw[a] + seg[a] * f[:, None]]
+
+
+def near_path(c, tw, r, h):
+    """c 里哪些点在轨迹 tw 的水平 r、上下 h 扁椭球以内：z 放大 r/h 倍后就是半径 r 的管子"""
+    s = np.array([1.0, 1.0, r / h])
+    q, cs = path_samples(tw * s, r / 4), c * s
+    B = 1 << 18
+
+    def key(k):
+        k = k + B
+        return k[:, 0] + 2 * B * (k[:, 1] + 2 * B * k[:, 2])
+    # 粗筛：边长 r 的格子，只有轨迹样本所在格子及其 26 邻格里的点才逐个算距离
+    off = np.array([(i, j, l) for i in (-1, 0, 1) for j in (-1, 0, 1) for l in (-1, 0, 1)])
+    kq = np.floor(q / r).astype(np.int64)
+    idx = np.nonzero(np.isin(key(np.floor(cs / r).astype(np.int64)), np.unique(key((kq[:, None] + off).reshape(-1, 3)))))[0]
+    cand, hit = cs[idx], np.zeros(len(idx), bool)
+    for i in range(0, len(q), 64):   # 轨迹按 64 个样本（约 4 m）一段，段的包围盒里的候选点才算距离，内存有界
+        qq = q[i:i + 64]
+        j = np.nonzero(~hit & np.all((cand >= qq.min(0) - r) & (cand <= qq.max(0) + r), axis=1))[0]
+        if len(j):
+            hit[j[((cand[j, None] - qq[None]) ** 2).sum(-1).min(1) < r * r]] = True
+    out = np.zeros(len(c), bool)
+    out[idx[hit]] = True
+    return out
+
+
+def carve(P, T, tw, r=CARVE_R, h=CARVE_H, secs=CARVE_SECS, cell=CARVE_CELL):
+    """去人：返回要保留的点（bool）和统计。格子是 floor(p / cell)，整格去掉"""
+    k = np.floor(P / cell).astype(np.int64)
+    k -= k.min(axis=0)
+    m = k.max(axis=0) + 1
+    _, inv, cnt = np.unique(k[:, 0] + m[0] * (k[:, 1] + m[1] * k[:, 2]), return_inverse=True, return_counts=True)
+    c = np.stack([np.bincount(inv, P[:, j], len(cnt)) for j in range(3)], 1) / cnt[:, None]
+    near = near_path(c, tw, r, h)
+    sel = near[inv]
+    sec = np.floor(T[sel]).astype(np.int64)
+    w = int(sec.max()) + 1 if len(sec) else 1
+    nsec = np.bincount(np.unique(inv[sel] * w + sec) // w, minlength=len(cnt))   # 每格被看到的不同秒数
+    drop = near & (nsec < secs)
+    keep = ~drop[inv]
+    return keep, dict(radius_m=r, half_height_m=h, min_secs=secs, cell_m=cell, cells_near_path=int(near.sum()),
+                      cells_dropped=int(drop.sum()), points_dropped=int((~keep).sum()))
+
+
+def build(d, bag, state, config, voxel, meta=None, say=print, carve_r=CARVE_R):
+    """在目录 d 里写 map_world.pcd / preview.png / meta.json；meta 里已有的键（run、voxelslam 等）保留。
+    carve_r：去人的水平半径，0 不去"""
     t0 = time.time()
     meta = dict(meta or {})
     traj, g = read_state(state)
     Rg = mapio.R_from_gravity(g)
-    P, I, n_msg = gather(bag, traj, load_params(config), Rg)
+    P, I, T, n_msg = gather(bag, traj, load_params(config), Rg)
+    n_raw = len(P)
+    tw = traj[:, 1:4] @ Rg.T
+    cv = dict(radius_m=0)
+    if carve_r > 0:
+        keep, cv = carve(P, T, tw, carve_r)
+        P, I = P[keep], I[keep]
+        say('去人：轨迹附近 %d 个 %.2f m 格子里去掉 %d 个、%d 点（水平 %.2f m、上下 %.2f m 以内，只在不到 %d 个不同的秒里被看到）'
+            % (cv['cells_near_path'], cv['cell_m'], cv['cells_dropped'], cv['points_dropped'], carve_r, cv['half_height_m'],
+               cv['min_secs']))
+    n_carved = n_raw - len(P)
     q, qi = mapio.voxel_down(P, I, voxel)
     mapio.write_pcd(os.path.join(d, 'map_world.pcd'), q, qi)
     fl = mapio.floor_fit(q)
 
-    tw = traj[:, 1:4] @ Rg.T
     step = np.linalg.norm(np.diff(tw, axis=0), axis=1)
 
     def yaw(row):  # body 的 x 轴投到水平面上的朝向
@@ -122,14 +195,14 @@ def build(d, bag, state, config, voxel, meta=None, say=print):
         world_from_voxelslam=dict(q_xyzw=mapio.R_quat(Rg), t=[0.0, 0.0, 0.0],
                                   source='Voxel-SLAM 估计的重力（位姿文件第 18–20 列均值）转到 -z 的最小旋转'),
         gravity_voxelslam=g.tolist(), lidar_msgs_used=n_msg,
-        voxel_m=voxel, points_raw=int(len(P)), points_world=int(len(q)),
+        voxel_m=voxel, points_raw=int(n_raw), points_world=int(len(q)), carve=cv,
         extent_world=dict(min=q.min(axis=0).tolist(), max=q.max(axis=0).tolist()), floor=fl,
         trajectory=dict(n=int(len(traj)), duration_s=float(traj[-1, 0] - traj[0, 0]), path_m=float(step.sum()),
                         start_world=tw[0].tolist(), end_world=tw[-1].tolist(), end_minus_start_m=(tw[-1] - tw[0]).tolist(),
                         end_minus_start_dist_m=float(np.linalg.norm(tw[-1] - tw[0])), yaw_change_deg=math.degrees(dyaw)))
     tr = meta['trajectory']
-    text = ('Voxel-SLAM: points raw %d -> world %d (voxel %.2f m)   frame: world = start lidar IMU, z up\n'
-            % (len(P), len(q), voxel)
+    text = ('Voxel-SLAM: points raw %d -> world %d (voxel %.2f m)%s   frame: world = start lidar IMU, z up\n'
+            % (n_raw, len(q), voxel, '   carve -%d raw pts near path' % n_carved if carve_r > 0 else '')
             + 'trajectory %.0f s, %.1f m, end-start %.3f m / yaw %+.1f deg   ' %
             (tr['duration_s'], tr['path_m'], tr['end_minus_start_dist_m'], tr['yaw_change_deg'])
             + ('floor %.3f m below start, tilt %.2f deg, rms %.3f m, %d pts%s' % (fl['height_m'], fl['tilt_deg'], fl['rms_m'],
@@ -138,7 +211,7 @@ def build(d, bag, state, config, voxel, meta=None, say=print):
     with open(os.path.join(d, 'meta.json'), 'w') as f:
         json.dump(meta, f, ensure_ascii=False, indent=1)
     say('拼图 %.1f s：%d 帧 %d 点 → %d 点（%.2f m 体素），范围 x %.1f…%.1f、y %.1f…%.1f、z %.1f…%.1f m'
-        % (time.time() - t0, n_msg, len(P), len(q), voxel, *[v for pair in zip(q.min(axis=0), q.max(axis=0)) for v in pair]))
+        % (time.time() - t0, n_msg, n_raw, len(q), voxel, *[v for pair in zip(q.min(axis=0), q.max(axis=0)) for v in pair]))
     say('轨迹 %.0f s、%.1f m；终点 − 起点 = %.3f m、yaw %+.2f°（回到起点停的话就是闭环差）'
         % (tr['duration_s'], tr['path_m'], tr['end_minus_start_dist_m'], tr['yaw_change_deg']))
     say('地面：起点离地 %.3f m，残余倾斜 %.2f°，rms %.3f m（%d 点%s）' % (fl['height_m'], fl['tilt_deg'], fl['rms_m'], fl['n'],

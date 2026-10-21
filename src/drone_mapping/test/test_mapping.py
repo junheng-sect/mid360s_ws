@@ -75,6 +75,38 @@ class TestAssemble(unittest.TestCase):
             np.testing.assert_array_equal(prm['R'], np.eye(3))
             self.assertEqual((prm['blind'], prm['every']), (0.5, 3))
 
+    def test_near_path_matches_segments(self):
+        """扁椭球判定和到折线的精确距离一致：加密间隔 r/4 只会在边界上差几毫米，而且只会漏、不会多"""
+        rng = np.random.default_rng(1)
+        tw = np.cumsum(rng.normal(0, 0.3, (60, 3)) * [1, 1, 0.2], axis=0)
+        c = tw[rng.integers(0, 60, 4000)] + rng.uniform(-0.5, 0.5, (4000, 3))
+        r, h = 0.25, 0.12
+        got = assemble.near_path(c, tw, r, h)
+        s = np.array([1, 1, r / h])
+        p, a, b = c * s, tw[:-1] * s, tw[1:] * s
+        t = np.clip(((p[:, None] - a) * (b - a)).sum(-1) / ((b - a) ** 2).sum(-1), 0, 1)
+        d = np.linalg.norm(p[:, None] - (a + t[..., None] * (b - a)), axis=-1).min(1)
+        self.assertGreater(got.sum(), 500)
+        self.assertFalse((got & (d >= r)).any())
+        self.assertTrue(np.all(np.abs(d[got != (d < r)] - r) < 0.005))
+
+    def test_carve_drops_transient_keeps_static(self):
+        """沿 x 走 10 s：轨迹上只出现 1 s 的点（人）去掉；全程都看得到的擦边静止物体、
+        轨迹下方 0.16 m 的地面（起点离地高度）、水平 0.4 m 外的墙都留下"""
+        tw = np.c_[np.linspace(0, 4, 101), np.zeros(101), np.full(101, 1.2)]
+        groups = {'person': ([2.0, 0.0, 1.25], np.linspace(5.0, 5.9, 30)),
+                  'static': ([3.0, 0.1, 1.2], np.linspace(0.0, 9.9, 30)),
+                  'floor': ([1.0, 0.0, 1.04], np.linspace(1.0, 1.9, 30)),
+                  'wall': ([1.5, 0.4, 1.2], np.linspace(1.0, 1.9, 30))}
+        P = np.concatenate([np.tile(xyz, (30, 1)) for xyz, _ in groups.values()]).astype(np.float32)
+        T = np.concatenate([t for _, t in groups.values()]).astype(np.float32)
+        keep, cv = assemble.carve(P, T, tw)
+        keep = dict(zip(groups, keep.reshape(4, 30)))
+        self.assertFalse(keep['person'].any())
+        for g in ('static', 'floor', 'wall'):
+            self.assertTrue(keep[g].all(), g)
+        self.assertEqual((cv['cells_near_path'], cv['cells_dropped'], cv['points_dropped']), (2, 1, 30))
+
     def test_launch_xml_well_formed(self):
         """生成的 launch 和包里的 launch 都要是合法 XML（注释里写 -- 会让 roslaunch 解析失败，10-20 踩过）"""
         import xml.etree.ElementTree as ET
