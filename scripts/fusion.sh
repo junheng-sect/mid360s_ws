@@ -1,49 +1,60 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 融合快速启动（fusion）：一条 roslaunch 拉起整条链路
-#   MAVROS(飞控串口) + MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接(位姿送飞控)
-#   + RC 开关触发录包节点（遥控器通道 6 拨到触发位即开始录 bag）
-#   + 系留绕线器自动控制（默认开启，非系留使用 --no-winch）
-#   + OV13855 相机预览（独立的第二个 roslaunch，见 launch/camera.launch）
+# 融合快速启动（fusion）：roscore + 几个单独的 roslaunch 拉起整条链路
+#   定位核心（required，整组进退）：MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接(位姿送飞控)
+#   + MAVROS(飞控串口，节点自动重启) + 附属（RC 通道 6 触发录包自动重启、系留绕线器不重启）
+#   + 系留绕线器默认开启（非系留使用 --no-winch）
+#   + OV13855 相机预览（独立 roslaunch，见 launch/camera.launch）
 #
 # 路径: /home/orangepi/mid360s_ws/scripts/fusion.sh
-# launch: /home/orangepi/mid360s_ws/scripts/launch/fusion.launch
+# launch: scripts/launch/ 下 fusion_core / mavros / fusion_aux / camera（fusion.launch 是手动合集）
 # 用法: ./fusion.sh [选项]
 #   --no-record         不启动 RC 触发录包节点（本次不会有 bag）
 #   --no-winch          不启动绕线器控制（非系留测试）
 #   --no-camera         不启动相机预览（OV13855 驱动 + AprilTag 视觉节点）
 #   --bag-prefix NAME   包名前缀（默认 noprop，产出 NAME_000001.bag）
 #   --bag-dir PATH      包输出目录（默认 /home/orangepi/test_data/bags）
-#   --allow-unsynced-clock  板端时间没对上也照样启动（没外网时用，只告警）
+#   --allow-unsynced-clock  不等对时，直接按板端本地时间启动（没外网时用）
 #   -h|--help           帮助
 #
-# 前置检查只做四件事：环境文件（ROS/工作空间 + rospack 找包）、飞控串口权限、
-# 防重复启动（锁 + 残留进程/节点）、板端时钟已由 chrony 对上（运行中不会再跳）。
-# 检查通过后、roslaunch 之前用 fc_set_time.py 把板端时间写进飞控 RTC（只影响 ulog
-# 文件名/日期；板端没对上或飞控已解锁时跳过，失败只告警）。
-# 不 ping 雷达、不拉取核对飞控参数、不逐话题
-# 测频、不等 EKF 就绪 —— 要逐项体检请用同目录 start_handheld_test.sh；两个入口
-# 共用 /tmp/mid360s_fusion.lock，互相排斥。
+# 目标：Wi-Fi 没连、断开、换网、重连都不让 FAST-LIO 停止、重启或重新初始化，飞控外部定位不因此中断。
+#   1. 网络：ROS 核心用板内固定地址（dummy 网卡 ros0 10.250.32.1，master 走 127.0.0.1，见 ros_net.sh），
+#      不跟随 Wi-Fi；本机 RViz 经到 10.250.32.1 的路由访问，换网只影响远程连接。
+#   2. 时钟：启动前最多等 60 s 让 chrony 对时，没外网就按板端本地时间继续（标 UTC 未同步、不给飞控校时）；
+#      核心起来前停掉 chronyd、收尾后再启动（clock_guard.sh），运行中系统时间不跳、不调速。
+#   3. 进程：roscore 单独起，不随任何 roslaunch 进退；定位核心（fusion_core.launch）带 required，任一节点
+#      退出整组停下、本脚本以失败退出、不自动重启（重启会重置 drone_odom 原点）；MAVROS（mavros.launch）
+#      与附属（fusion_aux.launch）里的录包节点 respawn，退出只重启自己、不连带核心；绕线器不 respawn
+#      （auto_enable: true，重启会丢人工禁用 / FAULT 锁存而重新自动使能），退出后只告警。
+#      收尾时按环境变量标记（clock_guard.sh 的 clock_env）收拢 roslaunch 被强杀后留下的孤儿节点，全退了才恢复 chronyd。
+#      MAVROS 重启后与飞控的时间同步要重新收敛，期间外部定位时间戳可能不准，看到重启告警应降落。
 #
-# 手动启动（不经本脚本，launch 里的注释指的就是这段）：
+# 前置检查：环境文件（ROS/工作空间 + rospack 找包）、飞控串口权限、防重复启动（锁 + 残留
+# 进程/节点）、板内固定地址、板端时钟。之后用 fc_set_time.py 把板端时间写进飞控 RTC（只影响
+# ulog 文件名/日期；板端没对上或飞控已解锁时跳过，失败只告警）。
+# 不 ping 雷达、不拉取核对飞控参数、不逐话题测频、不等 EKF 就绪 —— 要逐项体检请用同目录
+# start_handheld_test.sh；两个入口共用 /tmp/mid360s_fusion.lock，互相排斥。
+#
+# 手动启动（不经本脚本，没有时钟冻结；launch 里的注释指的就是这段）：
 #   cd /home/orangepi/mid360s_ws
-#   source /opt/ros/noetic/setup.bash && source devel/setup.bash
+#   source scripts/ros_net.sh && source /opt/ros/noetic/setup.bash && source devel/setup.bash
 #   source /home/orangepi/orange/devel/setup.bash --extend
 #   export ROS_PACKAGE_PATH="$PWD/scripts:$ROS_PACKAGE_PATH"   # rc_record 靠它定位
-#   roslaunch --screen --required scripts/launch/fusion.launch
+#   roscore &                                                   # 然后分别：
+#   roslaunch --screen --required scripts/launch/fusion_core.launch
+#   roslaunch --screen scripts/launch/mavros.launch respawn_mavros:=true
+#   roslaunch --screen scripts/launch/fusion_aux.launch
 #
-# 前台运行。roslaunch 被放进独立会话，信号只由本脚本统一转发：Ctrl+C / SIGTERM
-# 都只发一次 SIGINT 给本次启动的 roslaunch，由它按顺序收拢全部节点（录包节点收到
-# SIGINT 会把 bag 正常收尾写索引）。所有等待都是短轮询（≤ 3 s 一轮）并顺带检查
-# roslaunch 是否还活着，所以启动/等首帧/稳态各阶段收到信号都能及时收尾。
-# 收尾后校验本次生成的 bag 索引是否读得出来，最后按信号返回 130 / 143；roslaunch
-# 自己退出时透传它的退出码，并在「没收到停止信号」时按异常返回 1（补掉 roslaunch
+# 前台运行。每个 roslaunch / roscore 都放进独立会话，信号只由本脚本统一转发：Ctrl+C / SIGTERM
+# 按 相机 → 附属（录包节点先把 bag 收尾写索引）→ 核心 → MAVROS → roscore 的顺序各发一次 SIGINT。
+# 所有等待都是短轮询（≤ 3 s 一轮）并顺带检查核心是否还活着，所以启动/等首帧/稳态各阶段收到
+# 信号都能及时收尾。收尾后校验本次生成的 bag 索引是否读得出来，最后按信号返回 130 / 143；
+# 核心 roslaunch 自己退出时透传它的退出码，并在「没收到停止信号」时按异常返回 1（补掉 roslaunch
 # 对 required 节点退出也返回 0 的坑）。本脚本不改飞控参数、不改源码、不做开机自启；
 # 信号处理与退出码按后续接入 systemd 的需要保留。
 #
-# 相机预览单独走一个不带 --required 的 roslaunch（节点 respawn），在主链路节点注册后
-# 拉起、收尾时先于主 roslaunch 停掉：相机掉帧超时节点会退出，若并进 fusion.launch，
-# --required 会把整条定位链路一起带下来。相机起不来只告警，不影响主链路与退出码。
+# 相机预览在核心节点注册后拉起，输出只进单独日志；相机掉帧超时节点会退出，所以不并进核心组。
+# 相机、附属、MAVROS 起不来或中途退出只告警，不影响核心与退出码。
 # ==============================================================================
 set -o pipefail
 
@@ -52,7 +63,9 @@ WS="$(cd "$DIR/.." && pwd)"
 ROS_SETUP="/opt/ros/noetic/setup.bash"
 WS_SETUP="$WS/devel/setup.bash"
 ORANGE_SETUP="/home/orangepi/orange/devel/setup.bash"
-FUSION_LAUNCH="$DIR/launch/fusion.launch"
+CORE_LAUNCH="$DIR/launch/fusion_core.launch"
+MAVROS_LAUNCH="$DIR/launch/mavros.launch"
+AUX_LAUNCH="$DIR/launch/fusion_aux.launch"
 CAMERA_LAUNCH="$DIR/launch/camera.launch"
 FC_TIME_PY="$DIR/fc_set_time.py"
 RC_RECORD_DIR="$DIR/rc_record"
@@ -60,9 +73,10 @@ LOG_DIR="$WS/logs/fusion"
 # 与 start_handheld_test.sh 共用同一把锁文件：新旧入口互斥
 LOCK_FILE="/tmp/mid360s_fusion.lock"
 
-export ROS_MASTER_URI="http://192.168.31.32:11311"
-export ROS_IP="192.168.31.32"
-unset ROS_HOSTNAME 2>/dev/null || true
+# ROS 核心用板内固定地址（ros0 10.250.32.1，master 走 127.0.0.1），Wi-Fi 断开 / 换网不影响核心
+source "$DIR/ros_net.sh" || exit 1
+# 核心运行期间冻结板端时钟（停 chronyd，收尾再启动），见该文件头注释
+source "$DIR/clock_guard.sh"
 
 TTY="/dev/ttyS3"
 FCU_URL="${TTY}:921600"
@@ -105,16 +119,39 @@ LOGFILE="$LOG_DIR/fusion_${STAMP}.log"
 # 本次运行专属目录：放 roslaunch 身份文件和 bag 清单，退出时整个删掉，
 # 与上一次运行的文件彻底隔离，不会读到历史残留。
 RUN_DIR="$(mktemp -d /tmp/mid360s_fusion.XXXXXX)"
-PIDFILE="$RUN_DIR/roslaunch.pid"
+ROSCORE_PIDFILE="$RUN_DIR/roscore.pid"
+CORE_PIDFILE="$RUN_DIR/core.pid"
+MAVROS_PIDFILE="$RUN_DIR/mavros.pid"
+AUX_PIDFILE="$RUN_DIR/aux.pid"
+WATCH_PIDFILE="$RUN_DIR/watch.pid"
+WATCH_CSV="$LOG_DIR/core_watch_${STAMP}.csv"
 CAM_PIDFILE="$RUN_DIR/camera.pid"
 CAM_LOGFILE="$LOG_DIR/camera_${STAMP}.log"
-trap 'rm -rf "$RUN_DIR"' EXIT
 
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE"; }
 ok()   { printf '[%s] [ OK ] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE"; }
 warn() { printf '[%s] [WARN] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE"; }
 err()  { printf '[%s] [FAIL] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE" >&2; }
 hr()   { printf '%s\n' "----------------------------------------------------------------" | tee -a "$LOGFILE"; }
+
+# 任何退出路径（正常、信号、启动失败）都放开时钟冻结：核心进程全退了 chronyd 才启动得了，
+# 时间若有大偏差在这时一次校正
+on_exit() {
+  local _rc
+  if [ "$CLOCK_FROZEN" -eq 1 ]; then
+    clock_release; _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+      log "chronyd 已恢复（核心已退出，时间若有大偏差在此时一次校正）"
+    elif [ "$_rc" -eq 2 ]; then
+      warn "本次启动的进程还有残留（pid $(tagged_pids | tr '\n' ' ')），chronyd 保持停止、防启动检查也会挡住它"
+      warn "处理掉这些进程后执行 sudo systemctl start chrony"
+    else
+      warn "chronyd 没起来：多半还有核心进程占着 $CLOCK_FREEZE_LOCK，等它们退出后执行 sudo systemctl start chrony"
+    fi
+  fi
+  rm -rf "$RUN_DIR"
+}
+trap on_exit EXIT
 
 EXPECT_NODES="/mavros /livox_lidar_publisher2 /laserMapping /gravity_bridge"
 [ "$DO_WINCH" -eq 1 ] && EXPECT_NODES="$EXPECT_NODES /tether_winch_control"
@@ -150,11 +187,7 @@ if ! flock -n 200; then
 fi
 printf 'fusion.sh pid=%s start=%s\n' "$$" "$STAMP" >&200
 
-SETSID_PID=""         # setsid 包装进程（启动窗口内还没拿到真实 PID 时的兜底身份）
-SETSID_ST=""          # 上面那个进程的启动时刻，发信号前核对，防 PID 复用
-ROSLAUNCH_PID=""      # 真实 roslaunch PID，由子进程写进 PIDFILE 后回填
-LAUNCH_TRIED=0        # 是否已经发起过 roslaunch（收尾时区分「还没起」和「起过又退了」）
-CAM_TRIED=0           # 是否已经发起过相机 roslaunch
+CORE_SETSID_PID=""    # 核心 roslaunch 的 setsid --wait 包装进程：最后 wait 它拿退出码
 SHUTTING_DOWN=0
 MISSING_NODES=""
 FC_TIME_PID=""        # 飞控校时脚本（timeout 包装）的 PID，收尾时停掉它以释放串口
@@ -172,32 +205,45 @@ proc_starttime() {
   printf '%s\n' "${20}"
 }
 
-# 本次 roslaunch 的身份以子进程自己写的 PIDFILE 为准（setsid 有没有 fork 都准），
-# 拿到 PID 后核对启动时刻，防止进程早已退出、PID 被别的进程复用时误停无关进程。
-# PIDFILE 落地前有个很短的启动窗口，所以这里要能现取 —— 信号如果正好落在这个窗口，
-# 收尾路径也拿得到进程，不会把已经起来的 roslaunch 漏在独立会话里。
-roslaunch_pid_now() {
-  local _pid _st _now
-  if [ -n "$ROSLAUNCH_PID" ]; then
-    _pid="$ROSLAUNCH_PID"
-    _st="$(awk 'NR==1{print $2}' "$PIDFILE" 2>/dev/null)"
+# 包装进程先把「自己的 PID + 启动时刻」写进 pidfile 再 exec：exec 不改这两项，所以收尾时读到的
+# 身份依然有效，可用来核对、防 PID 复用（进程早已退出、PID 被别的进程复用时绝不误停）。
+SPAWN_WRAPPER='
+  _pf="$1"; shift; _cmd=("$@")
+  _s="$(cat /proc/$$/stat 2>/dev/null)"; _s="${_s##*)}"
+  set -- $_s
+  printf "%s %s\n" "$$" "${20:-}" >"$_pf"
+  exec "${_cmd[@]}"
+'
+# spawn PIDFILE OUT CMD...：放进独立会话（setsid）后台运行，终端信号不会绕过本脚本直接打到它，
+# 由收尾统一发一次 SIGINT，避免重复信号打断 roslaunch 的收尾流程。OUT=tee 时输出进终端和主日志
+# （tee 忽略 SIGINT：否则 Ctrl+C 会先杀掉 tee，roslaunch 再写日志就吃 SIGPIPE），否则追加进该文件。
+# SPAWN_PID 是 setsid --wait 包装进程（wait 它拿得到命令的退出码）；等 pidfile 落地最多 12 s。
+# 冻结时钟的锁（fd 201）随之被继承；另按 pidfile 名（core / mavros …）打上 clock_env 环境变量标记，
+# 一路继承到 roslaunch 用 setsid 起的节点：roslaunch 被强杀留下的孤儿节点收尾时据此找回来。
+spawn() {
+  local _pf="$1" _out="$2" _i=0
+  shift 2
+  rm -f "$_pf"
+  : >"$_pf.tried"   # 先置位再 fork：这段窗口里收到信号，收尾也知道「已经发起过」
+  # shellcheck disable=SC2046
+  if [ "$_out" = tee ]; then
+    env $(clock_env "$(basename "$_pf" .pid)") setsid --wait bash -c "$SPAWN_WRAPPER" _ "$_pf" "$@" \
+      </dev/null > >( trap '' INT; exec tee -a "$LOGFILE" ) 2>&1 &
   else
-    read -r _pid _st <"$PIDFILE" 2>/dev/null || return 1
+    env $(clock_env "$(basename "$_pf" .pid)") setsid --wait bash -c "$SPAWN_WRAPPER" _ "$_pf" "$@" \
+      </dev/null >>"$_out" 2>&1 &
   fi
-  [ -n "$_pid" ] || return 1
-  kill -0 "$_pid" 2>/dev/null || return 1
-  if [ -n "$_st" ]; then
-    _now="$(proc_starttime "$_pid")" || return 1
-    [ "$_now" = "$_st" ] || return 1
-  fi
-  printf '%s\n' "$_pid"
+  SPAWN_PID=$!
+  while [ ! -s "$_pf" ] && [ "$_i" -lt 60 ]; do
+    sleep 0.2; _i=$((_i + 1))
+  done
+  [ -s "$_pf" ]
 }
-roslaunch_alive() { roslaunch_pid_now >/dev/null 2>&1; }
 
-# 相机 roslaunch 的身份同样由包装进程写进 CAM_PIDFILE（PID + 启动时刻），按它核对。
-camera_pid_now() {
+# 按 pidfile 核对身份（PID + 启动时刻）后输出 PID；进程不在或 PID 已被复用返回 1
+proc_pid_now() {
   local _pid _st _now
-  read -r _pid _st <"$CAM_PIDFILE" 2>/dev/null || return 1
+  read -r _pid _st <"$1" 2>/dev/null || return 1
   [ -n "$_pid" ] || return 1
   kill -0 "$_pid" 2>/dev/null || return 1
   if [ -n "$_st" ]; then
@@ -206,32 +252,72 @@ camera_pid_now() {
   fi
   printf '%s\n' "$_pid"
 }
-camera_alive() { camera_pid_now >/dev/null 2>&1; }
+proc_alive() { proc_pid_now "$1" >/dev/null 2>&1; }
+core_alive() { proc_alive "$CORE_PIDFILE"; }
 
-# 相机预览：第二个 roslaunch，不带 --required，同样放进独立会话由本脚本统一收尾。
-# 输出只进单独日志，避免 15 Hz 相机日志刷屏主终端。失败只告警，不影响主链路。
+# stop_proc 名称 PIDFILE 超时秒：只停本次启动的那个进程（按 pidfile 核对身份，绝不按进程名扫描）。
+# SIGINT 让 roslaunch 按顺序收拢自己的节点；启动瞬间那一下可能落在「fork 完、还没 exec」的窗口里
+# 被丢掉（后台任务的子进程在 exec 前忽略 SIGINT），所以每 5 s 补一次 —— 重复 SIGINT 不会打断
+# roslaunch 的收尾（实测连发 3 次仍然无残留、bag 索引完好）。超时 SIGTERM 兜底。没起过的直接跳过。
+# 主进程退了（或本来就已被强杀）之后，再按环境变量标记收拢这一组留下的孤儿节点：roslaunch 用 setsid
+# 起节点，roslaunch 一死节点不会跟着退。
+stop_proc() {
+  local _name="$1" _pf="$2" _limit="$3" _i=0
+  [ -e "$_pf.tried" ] || return 0
+  while [ ! -s "$_pf" ] && [ "$_i" -lt 30 ]; do
+    sleep 0.1; _i=$((_i + 1))
+  done
+  stop_leader "$_name" "$_pf" "$_limit"; _i=$?
+  reap_tagged "$(basename "$_pf" .pid)" "$_name" 2>&1 | tee -a "$LOGFILE"
+  [ "${PIPESTATUS[0]}" -eq 0 ] && return "$_i"
+  return 1
+}
+stop_leader() {
+  local _name="$1" _pf="$2" _limit="$3" _pid _cur _i=0
+  _pid="$(proc_pid_now "$_pf")" || { log "$_name 已不在运行"; return 0; }
+  log "SIGINT -> $_name $_pid"
+  kill -INT "$_pid" 2>/dev/null || true
+  _i=0
+  while [ "$_i" -lt $((_limit * 2)) ]; do
+    proc_alive "$_pf" || return 0
+    sleep 0.5; _i=$((_i + 1))
+    if [ $((_i % 10)) -eq 0 ]; then
+      _cur="$(proc_pid_now "$_pf")" && kill -INT "$_cur" 2>/dev/null
+    fi
+  done
+  warn "$_name 未在 ${_limit} s 内退出，SIGTERM 兜底"
+  _cur="$(proc_pid_now "$_pf")" && kill -TERM "$_cur" 2>/dev/null
+  _i=0
+  while [ "$_i" -lt 10 ]; do
+    proc_alive "$_pf" || return 0
+    sleep 0.5; _i=$((_i + 1))
+  done
+  warn "$_name 仍在运行（pid=$_pid），需手动 kill -INT 处理"
+  return 1
+}
+
+# 收尾顺序：相机 → 附属（录包节点先把 bag 收尾写索引）→ 核心 → MAVROS → roscore
+# （master 最后停，先停它会让其余节点注销时卡住）
+stop_all() {
+  stop_proc "相机 roslaunch" "$CAM_PIDFILE" 15
+  stop_proc "附属 roslaunch（录包节点会先把 bag 收尾）" "$AUX_PIDFILE" "$STOP_TIMEOUT"
+  stop_proc "核心 roslaunch" "$CORE_PIDFILE" "$STOP_TIMEOUT"
+  stop_proc "MAVROS roslaunch" "$MAVROS_PIDFILE" "$STOP_TIMEOUT"
+  stop_proc "数据连续性监控（退出时打印最终汇总）" "$WATCH_PIDFILE" 10
+  stop_proc "roscore" "$ROSCORE_PIDFILE" 15
+}
+
+# 相机预览：单独的 roslaunch，不带 required。输出只进单独日志，避免 15 Hz 相机日志刷屏主终端。
+# 失败只告警，不影响核心。
 start_camera() {
   local _i=0 _cur _miss _n
   log "启动相机预览（launch/camera.launch，日志：$CAM_LOGFILE）"
-  rm -f "$CAM_PIDFILE"
-  CAM_TRIED=1
-  setsid bash -c '
-    _pf="$1"; shift; _cmd=("$@")
-    _s="$(cat /proc/$$/stat 2>/dev/null)"; _s="${_s##*)}"
-    set -- $_s
-    printf "%s %s\n" "$$" "${20:-}" >"$_pf"
-    exec "${_cmd[@]}"
-  ' _ "$CAM_PIDFILE" roslaunch --screen "$CAMERA_LAUNCH" </dev/null >>"$CAM_LOGFILE" 2>&1 &
-  while [ ! -s "$CAM_PIDFILE" ] && [ "$_i" -lt 60 ]; do
-    sleep 0.2; _i=$((_i + 1))
-  done
-  if ! camera_alive; then
+  if ! spawn "$CAM_PIDFILE" "$CAM_LOGFILE" roslaunch --screen "$CAMERA_LAUNCH" || ! proc_alive "$CAM_PIDFILE"; then
     warn "相机 roslaunch 没起来，RViz 将没有预览图（看 $CAM_LOGFILE）"
     return 1
   fi
-  _i=0
   while [ "$_i" -lt 20 ]; do
-    camera_alive || break
+    proc_alive "$CAM_PIDFILE" || break
     _cur="$(timeout 5 rosnode list 2>/dev/null)"
     _miss=""
     for _n in /ov13855_cam /ov13855_full_cam /ov13855_apriltag_vision_node; do
@@ -243,110 +329,22 @@ start_camera() {
     fi
     sleep 1; _i=$((_i + 1))
   done
-  warn "相机节点未全部注册（缺：${_miss:-roslaunch 已退出}），主链路不受影响；看 $CAM_LOGFILE"
-  return 1
-}
-
-# 先于主 roslaunch 调用：主 roslaunch 带着 ROS Master，先停它会让相机节点注销时卡住。
-stop_camera() {
-  local _pid _cur _i=0
-  [ "$CAM_TRIED" -eq 1 ] || return 0
-  while [ ! -s "$CAM_PIDFILE" ] && [ "$_i" -lt 30 ]; do
-    sleep 0.1; _i=$((_i + 1))
-  done
-  _pid="$(camera_pid_now)" || { log "相机 roslaunch 已不在运行"; return 0; }
-  log "SIGINT -> 相机 roslaunch $_pid"
-  kill -INT "$_pid" 2>/dev/null || true
-  _i=0
-  while [ "$_i" -lt 30 ]; do
-    camera_alive || return 0
-    sleep 0.5; _i=$((_i + 1))
-    if [ $((_i % 10)) -eq 0 ]; then
-      _cur="$(camera_pid_now)" && kill -INT "$_cur" 2>/dev/null
-    fi
-  done
-  warn "相机 roslaunch 未在 15 s 内退出，SIGTERM 兜底"
-  _cur="$(camera_pid_now)" && kill -TERM "$_cur" 2>/dev/null
-  _i=0
-  while [ "$_i" -lt 10 ]; do
-    camera_alive || return 0
-    sleep 0.5; _i=$((_i + 1))
-  done
-  warn "相机 roslaunch 仍在运行（pid=$_pid），需手动 kill -INT 处理"
+  warn "相机节点未全部注册（缺：${_miss:-roslaunch 已退出}），核心不受影响；看 $CAM_LOGFILE"
   return 1
 }
 
 # ------------------------------------------------------------------- 收尾 ------
-# 只停本次启动的 roslaunch（按 PID，绝不按进程名扫描，避免误伤别的实例）。
-# 录包节点是 roslaunch 的子进程，收到 roslaunch 转发的 SIGINT 会把 bag 收尾写索引。
-stop_roslaunch() {
-  local _pid="" _cur="" _i=0
-
-  # 身份先用 PIDFILE 现取：信号正好落在「fork 完、PIDFILE 还没落地」这个窗口时，
-  # 回填的 ROSLAUNCH_PID 还是空的，不补这一步就会以为没进程可收而漏掉整条链路。
-  if [ "$LAUNCH_TRIED" -eq 1 ]; then
-    while [ ! -s "$PIDFILE" ] && [ "$_i" -lt 30 ]; do
-      sleep 0.1; _i=$((_i + 1))
-    done
-  fi
-  _pid="$(roslaunch_pid_now)"
-  # 还没落地就退一步认 setsid 包装进程（setsid 没 fork 时它与 roslaunch 同 PID），
-  # 同样核对启动时刻
-  if [ -z "$_pid" ] && [ -n "$SETSID_PID" ] && kill -0 "$SETSID_PID" 2>/dev/null; then
-    if [ -z "$SETSID_ST" ] || [ "$(proc_starttime "$SETSID_PID")" = "$SETSID_ST" ]; then
-      _pid="$SETSID_PID"
-    fi
-  fi
-  if [ -z "$_pid" ]; then
-    _raw="$(awk 'NR==1{print $1}' "$PIDFILE" 2>/dev/null)"
-    if [ -n "$_raw" ] && kill -0 "$_raw" 2>/dev/null; then
-      warn "pid $_raw 的启动时刻与记录对不上（该 PID 已被别的进程复用），跳过不动它"
-    else
-      log "没有找到本次启动的 roslaunch（还没起来，或已经退出）"
-    fi
-    return 0
-  fi
-  ROSLAUNCH_PID="$_pid"
-
-  log "SIGINT -> roslaunch $_pid（录包节点会先把 bag 收尾）"
-  kill -INT "$_pid" 2>/dev/null || true
-  _i=0
-  while [ "$_i" -lt $((STOP_TIMEOUT * 2)) ]; do
-    roslaunch_alive || break
-    sleep 0.5; _i=$((_i + 1))
-    # 启动瞬间那一下可能落在「子进程 fork 完、还没 exec」的窗口里被丢掉：后台任务的
-    # 子进程在 exec 前是忽略 SIGINT 的，信号进不去也收不到。每 5 s 补一次即可 ——
-    # 重复 SIGINT 不会打断 roslaunch 的收尾（实测：连发 3 次仍然无残留、bag 索引完好）。
-    # 补发前重新核对身份，防止这期间 PID 被复用误伤别的进程。
-    if [ $((_i % 10)) -eq 0 ]; then
-      _cur="$(roslaunch_pid_now)" && kill -INT "$_cur" 2>/dev/null
-    fi
-  done
-  if roslaunch_alive; then
-    warn "roslaunch 未在 ${STOP_TIMEOUT} s 内退出，SIGTERM 兜底"
-    _cur="$(roslaunch_pid_now)" && kill -TERM "$_cur" 2>/dev/null
-    _i=0
-    while [ "$_i" -lt 10 ]; do
-      roslaunch_alive || break
-      sleep 0.5; _i=$((_i + 1))
-    done
-  fi
-  if roslaunch_alive; then
-    warn "roslaunch 仍在运行（pid=$_pid），需手动 kill -INT 处理"
-    return 1
-  fi
-  return 0
-}
-
 # 收尾检查：只报告，不再顺手杀别的进程
 verify_clean() {
   hr; log "收尾检查"
   local _left=""
+  alive "rosmaste[r]"            && _left="$_left rosmaster"
   alive "mavros_nod[e]"          && _left="$_left mavros_node"
   alive "livox_ros_driver2_nod[e]" && _left="$_left livox_ros_driver2_node"
   alive "fastlio_mappin[g]"      && _left="$_left fastlio_mapping"
   alive "gravity_bridge_nod[e]"  && _left="$_left gravity_bridge_node"
   alive "bag_recorder_node.p[y]" && _left="$_left bag_recorder_node.py"
+  alive "core_watch.p[y]"        && _left="$_left core_watch.py"
   if [ "$DO_WINCH" -eq 1 ] && alive "tether_winch_nod[e]"; then
     _left="$_left tether_winch_node"
   fi
@@ -356,7 +354,7 @@ verify_clean() {
   fi
   if [ -n "$_left" ]; then
     warn "仍有节点进程残留：$_left"
-    warn "核对：ps -eo pid,args | grep -E 'mavros_node|livox_ros_driver2_node|fastlio_mapping|gravity_bridge_node|bag_recorder_node|tether_winch_node|ov13855_'"
+    warn "核对：ps -eo pid,args | grep -E 'rosmaster|mavros_node|livox_ros_driver2_node|fastlio_mapping|gravity_bridge_node|bag_recorder_node|tether_winch_node|ov13855_'"
   else
     ok "链路节点已全部退出"
   fi
@@ -412,7 +410,7 @@ on_signal() {
     return
   fi
   SHUTTING_DOWN=1
-  hr; warn "收到 SIG$_sig：只收拢本次启动的 roslaunch（pid=${ROSLAUNCH_PID:-未启动}）"
+  hr; warn "收到 SIG$_sig：只收拢本次启动的 roscore / roslaunch"
   if [ -n "$FC_TIME_PID" ]; then
     # timeout 把 SIGTERM 转给校时脚本，脚本先关掉飞控上的 MAVLink shell 再退出（< 1 s）；
     # 等它放开串口，下面的收尾检查才不会误报串口被占用
@@ -422,8 +420,7 @@ on_signal() {
       sleep 0.2; _i=$((_i + 1))
     done
   fi
-  stop_camera
-  stop_roslaunch
+  stop_all
   verify_clean
   log "退出（日志：$LOGFILE）"
   exit "$_code"
@@ -443,7 +440,9 @@ hr; log "步骤 1/3：前置检查（环境 / 串口 / 防重复启动 / 板端�
 
 [ -f "$ROS_SETUP" ] || { err "缺少 $ROS_SETUP"; exit 1; }
 [ -f "$WS_SETUP" ]  || { err "缺少 $WS_SETUP，请先在板端 catkin build"; exit 1; }
-[ -f "$FUSION_LAUNCH" ] || { err "缺少 $FUSION_LAUNCH"; exit 1; }
+for f in "$CORE_LAUNCH" "$MAVROS_LAUNCH" "$AUX_LAUNCH"; do
+  [ -f "$f" ] || { err "缺少 $f"; exit 1; }
+done
 if [ "$DO_CAMERA" -eq 1 ]; then
   [ -f "$CAMERA_LAUNCH" ] || { err "缺少 $CAMERA_LAUNCH；或使用 --no-camera"; exit 1; }
 fi
@@ -485,7 +484,7 @@ fi
 
 stale=""
 for pat in "rosmaste[r]" "roslaunc[h]" "mavros_nod[e]" "livox_ros_driver2_nod[e]" \
-           "fastlio_mappin[g]" "gravity_bridge_nod[e]" "bag_recorder_node.p[y]"; do
+           "fastlio_mappin[g]" "gravity_bridge_nod[e]" "bag_recorder_node.p[y]" "core_watch.p[y]"; do
   alive "$pat" && stale="$stale ${pat//[\[\]]/}"
 done
 if [ "$DO_WINCH" -eq 1 ] && alive "tether_winch_nod[e]"; then
@@ -523,7 +522,9 @@ fi
 # 板端 RTC 掉电不保持：开机先用 fake-hwclock 存的旧时间，chrony 连上外网时间源后
 # 再一次性跳到正确时间（makestep 1 3；实测开机约 30 s 时跳了 +1045 s）。MID-360S 没接
 # PTP，雷达/IMU 时间戳就是板端系统时间：链路运行中时间一跳，往前跳 FAST-LIO 的 IMU
-# 积分会出错，往回跳桥接直接 fatal。所以先等 chrony 对上、剩余偏差足够小再启动。
+# 积分会出错，往回跳桥接直接 fatal。所以启动前先给 chrony 最多 CLOCK_SYNC_TIMEOUT 对时；
+# 没外网对不上就按板端本地时间继续（标 UTC 未同步、不给飞控校时），核心起来前再停掉
+# chronyd（clock_freeze），运行中不论何时联网都不会跳，收尾后才恢复对时。
 # 每轮只阻塞 ≤ 3 s，等待期间 Ctrl+C 照样能及时处理；计时用 /proc/uptime（开机以来的
 # 单调时间），不受等待期间时钟跳变影响。
 clock_status() {  # 输出 "<Leap status> <剩余偏差绝对值(秒)>"；chronyd 不可达时返回非 0
@@ -536,10 +537,13 @@ clock_status() {  # 输出 "<Leap status> <剩余偏差绝对值(秒)>"；chrony
 }
 uptime_s() { awk '{ printf "%d\n", $1 }' /proc/uptime; }
 check_clock() {
-  local _t0="" _leap="" _off="" _why="" _waiting=0
+  local _t0="" _leap="" _off="" _why="" _waiting=0 _limit="$CLOCK_SYNC_TIMEOUT"
+  [ "$ALLOW_UNSYNCED_CLOCK" -eq 1 ] && _limit=0
   if ! command -v chronyc >/dev/null 2>&1; then
     _why="找不到 chronyc"
   else
+    # 上次异常退出时 chronyd 可能还停着（锁被残留进程占着），先拉起来再对时
+    clock_ensure_running || warn "chronyd 没在运行，也没能启动"
     _t0="$(uptime_s)"
     while :; do
       if read -r _leap _off < <(clock_status); then
@@ -555,7 +559,7 @@ check_clock() {
       else
         _why="chronyd 无响应"
       fi
-      [ $(( $(uptime_s) - _t0 )) -ge "$CLOCK_SYNC_TIMEOUT" ] && break
+      [ $(( $(uptime_s) - _t0 )) -ge "$_limit" ] && break
       if [ "$_waiting" -eq 0 ]; then
         _waiting=1
         log "板端时间还没对上（${_why}），等 chrony 对时，最多 ${CLOCK_SYNC_TIMEOUT} s"
@@ -563,15 +567,11 @@ check_clock() {
       sleep 2
     done
   fi
-  if [ "$ALLOW_UNSYNCED_CLOCK" -eq 1 ]; then
-    warn "板端时间没对上（${_why}），按 --allow-unsynced-clock 继续启动"
-    warn "运行中一旦连上外网，chrony 可能一次性跳时间，FAST-LIO 出错或桥接 fatal，整条链路会停"
-    return 0
-  fi
-  err "板端时间没对上（${_why}）"
-  err "现在启动，运行中 chrony 一旦拿到时间源就可能一次性跳时间，FAST-LIO/桥接会断"
-  err "确认外网后重试（chronyc tracking 看 Leap status）；确定没外网也要启动，加 --allow-unsynced-clock"
-  return 1
+  # 对不上也启动：运行中时钟冻结（clock_freeze），不会因为后来联网而跳
+  warn "板端 UTC 时间未同步（${_why}），按板端本地时间启动"
+  warn "运行中时钟冻结、不会跳；但 bag / 日志的绝对时间可能不准，本次不给飞控校时"
+  [ "$ALLOW_UNSYNCED_CLOCK" -eq 1 ] || warn "确定没外网时可加 --allow-unsynced-clock，跳过这 ${CLOCK_SYNC_TIMEOUT} s 等待"
+  return 0
 }
 check_clock || exit 1
 # 等对时期间时钟可能已经跳过，收尾筛「本次生成的 bag」的起点按对时之后重取
@@ -621,7 +621,7 @@ sync_fc_time() {
 sync_fc_time
 
 # ============================================================== 启动 =========
-hr; log "步骤 2/3：启动统一 launch（scripts/launch/fusion.launch）"
+hr; log "步骤 2/3：启动 roscore 与核心 / MAVROS / 附属（scripts/launch/）"
 if [ "$DO_RECORD" -eq 1 ]; then
   log "录包：RC 通道 6 触发，前缀 $BAG_PREFIX，目录 $BAG_DIR"
   REC_ARG=true
@@ -639,45 +639,76 @@ else
   log "已指定 --no-winch：不启动绕线器控制，不由 fusion 发送 DUTY"
 fi
 if [ "$DO_CAMERA" -eq 1 ]; then
-  log "相机预览：主链路节点注册后单独拉起（非 required，掉线不影响定位）"
+  log "相机预览：核心节点注册后单独拉起（非 required，掉线不影响定位）"
 else
   log "已指定 --no-camera：不启动相机预览"
 fi
 
-# roslaunch 放进独立会话（setsid）：终端信号不会绕过本脚本直接打到它，由 on_signal
-# 统一发一次 SIGINT，避免重复信号打断 roslaunch 的收尾流程。真实 PID 由子进程自己
-# 写进 PIDFILE，不依赖 setsid 有没有 fork。
-# tee 忽略 SIGINT：否则 Ctrl+C 会先杀掉 tee，roslaunch 再写日志就吃 SIGPIPE。
-rm -f "$PIDFILE"
-LAUNCH_TRIED=1   # 先置位再 fork：这段窗口里收到信号，收尾也知道「已经发起过」
-# 包装进程先把「自己的 PID + 启动时刻」写进 PIDFILE 再 exec：exec 不改这两项，
-# 所以收尾时读到的身份依然有效，可用来核对、防 PID 复用。
-setsid --wait bash -c '
-  _pf="$1"; shift; _cmd=("$@")
-  _s="$(cat /proc/$$/stat 2>/dev/null)"; _s="${_s##*)}"
-  set -- $_s
-  printf "%s %s\n" "$$" "${20:-}" >"$_pf"
-  exec "${_cmd[@]}"
-' _ "$PIDFILE" \
-  roslaunch --screen --required "$FUSION_LAUNCH" \
-    fcu_url:="$FCU_URL" fcu_protocol:=v1.0 tgt_system:=1 tgt_component:=1 \
-    send_to_mavros:=true "record:=$REC_ARG" "winch:=$WINCH_ARG" bag_prefix:="$BAG_PREFIX" bag_dir:="$BAG_DIR" \
-  </dev/null > >( trap '' INT; exec tee -a "$LOGFILE" ) 2>&1 &
-SETSID_PID=$!
-SETSID_ST="$(proc_starttime "$SETSID_PID" 2>/dev/null)"
-
-for _ in $(seq 1 60); do
-  [ -s "$PIDFILE" ] && break
-  sleep 0.2
-done
-ROSLAUNCH_PID="$(awk 'NR==1{print $1}' "$PIDFILE" 2>/dev/null)"
-if [ -z "$ROSLAUNCH_PID" ]; then
-  err "roslaunch 没能在 12 s 内起来（PID 文件为空：$PIDFILE）"
-  err "看日志：$LOGFILE"
-  wait "$SETSID_PID" 2>/dev/null
+# 核心起来前冻结时钟：停掉 chronyd，运行中不论何时联网、chrony 被谁重启都不会跳时间；
+# 冻结锁（fd 201）会被下面的 roslaunch 继承，收尾时 on_exit 再恢复。冻结不了就不启动。
+clock_freeze; _rc=$?
+if [ "$_rc" -eq 1 ]; then
+  err "时钟冻结锁 $CLOCK_FREEZE_LOCK 被占用：还有别的定位核心实例在运行"
+  exit 1
+elif [ "$_rc" -ne 0 ]; then
+  err "停不掉 chronyd（/etc/sudoers.d/mid360s-chrony 没装？），运行中可能跳时间，不启动"
   exit 1
 fi
-log "roslaunch pid=$ROSLAUNCH_PID（节点日志同时进终端和 $LOGFILE）"
+ok "已停 chronyd：运行中系统时钟不跳、不调速，收尾后恢复对时"
+
+# 启动顺序：roscore → 核心 → MAVROS → 附属，各自一个独立会话（spawn），身份按 pidfile 核对。
+# roscore / 核心起不来就收掉已起的进程、以失败退出；MAVROS / 附属起不来只告警，核心照常运行。
+start_fail() {
+  SHUTTING_DOWN=1
+  err "$1"; err "看日志：$LOGFILE"
+  stop_all; verify_clean
+  exit 1
+}
+
+log "启动 roscore（master 走 127.0.0.1:11311，不随任何 roslaunch 进退）"
+spawn "$ROSCORE_PIDFILE" "$LOGFILE" roscore || start_fail "roscore 没能在 12 s 内起来"
+_i=0
+until timeout 3 rosnode list >/dev/null 2>&1; do
+  proc_alive "$ROSCORE_PIDFILE" || start_fail "roscore 起来后又退出了"
+  _i=$((_i + 1))
+  [ "$_i" -lt 15 ] || start_fail "15 s 内 master 没有响应"
+  sleep 1
+done
+ok "master 已就绪（roscore pid=$(proc_pid_now "$ROSCORE_PIDFILE")，ROS_IP=$ROS_IP）"
+# 记下本次 UTC 是否对上：回放 / 分析 bag 时据此判断绝对时间可不可信
+if [ "$CLOCK_SYNCED" -eq 1 ]; then
+  rosparam set /fusion/utc_synced true
+else
+  rosparam set /fusion/utc_synced false
+  warn "已置 /fusion/utc_synced=false：本次 bag / 日志按板端本地时间"
+fi
+# 数据连续性监控先于核心起：从第一帧开始记。只读消息头，断流 / 时间戳倒退 / 时间跳变 / 飞控本地位置与
+# 视觉位姿偏差即时打到终端，逐秒明细进 CSV。起不来只告警。
+if spawn "$WATCH_PIDFILE" tee python3 -u "$DIR/core_watch.py" --csv "$WATCH_CSV"; then
+  log "数据连续性监控 pid=$(proc_pid_now "$WATCH_PIDFILE")（逐秒明细：$WATCH_CSV）"
+else
+  warn "数据连续性监控没起来（核心照常运行）"
+fi
+
+spawn "$CORE_PIDFILE" tee roslaunch --screen --required "$CORE_LAUNCH" send_to_mavros:=true \
+  || start_fail "核心 roslaunch 没能在 12 s 内起来"
+CORE_SETSID_PID="$SPAWN_PID"
+log "核心 roslaunch pid=$(proc_pid_now "$CORE_PIDFILE")（雷达驱动 / FAST-LIO / 重力桥，任一退出整组停）"
+if spawn "$MAVROS_PIDFILE" tee roslaunch --screen "$MAVROS_LAUNCH" \
+     fcu_url:="$FCU_URL" fcu_protocol:=v1.0 tgt_system:=1 tgt_component:=1 respawn_mavros:=true; then
+  log "MAVROS roslaunch pid=$(proc_pid_now "$MAVROS_PIDFILE")（节点退出自动重启，不连带核心）"
+else
+  warn "MAVROS roslaunch 没能在 12 s 内起来：飞控收不到外部定位（核心照常运行）"
+fi
+if [ "$DO_RECORD" -eq 1 ] || [ "$DO_WINCH" -eq 1 ]; then
+  if spawn "$AUX_PIDFILE" tee roslaunch --screen "$AUX_LAUNCH" \
+       "record:=$REC_ARG" "winch:=$WINCH_ARG" bag_prefix:="$BAG_PREFIX" bag_dir:="$BAG_DIR"; then
+    log "附属 roslaunch pid=$(proc_pid_now "$AUX_PIDFILE")（录包节点退出自动重启；绕线器退出不重启、只告警）"
+  else
+    warn "附属 roslaunch 没能在 12 s 内起来：录包 / 绕线器不可用（核心照常运行）"
+  fi
+fi
+log "节点日志同时进终端和 $LOGFILE"
 
 # ============================================================== 就绪 =========
 hr; log "步骤 3/3：等待节点注册与桥接输出"
@@ -685,7 +716,7 @@ T0=$SECONDS
 wait_for_nodes() {
   local _t=0 _cur _miss _n
   while [ "$_t" -lt "$NODES_TIMEOUT" ]; do
-    roslaunch_alive || return 2
+    core_alive || return 2
     _cur="$(timeout 5 rosnode list 2>/dev/null)"
     _miss=""
     for _n in $EXPECT_NODES; do
@@ -700,7 +731,7 @@ wait_for_nodes() {
 wait_for_nodes; NODES_RC=$?
 
 if [ "$NODES_RC" -eq 2 ]; then
-  err "roslaunch 在节点注册完成前就退出了 —— 启动失败，看上面的日志"
+  err "核心 roslaunch 在节点注册完成前就退出了 —— 启动失败，看上面的日志"
 elif [ "$NODES_RC" -eq 0 ]; then
   ok "节点已启动（耗时 $((SECONDS - T0)) s）：$EXPECT_NODES"
   if [ "$DO_RECORD" -eq 1 ]; then
@@ -719,15 +750,15 @@ elif [ "$NODES_RC" -eq 0 ]; then
     if timeout "$READY_POLL" rostopic echo -n1 /fastlio/odom_world >/dev/null 2>&1; then
       _ready=1; break
     fi
-    roslaunch_alive || break
+    core_alive || break
     _t=$((_t + READY_POLL))
   done
   if [ "$_ready" -eq 1 ]; then
     ok "桥接已输出里程计（从启动到首帧共 $((SECONDS - T0)) s）"
     log "注意：这只说明 FAST-LIO→桥接这一段通了。MAVROS 有没有连上飞控、PX4 有没有"
     log "      接受外部定位，本入口不检查（要验收请用 start_handheld_test.sh）"
-  elif ! roslaunch_alive; then
-    warn "等首帧期间 roslaunch 已经退出（见上面的日志）"
+  elif ! core_alive; then
+    warn "等首帧期间核心 roslaunch 已经退出（见上面的日志）"
   else
     warn "${READY_TIMEOUT} s 内没等到 /fastlio/odom_world 首帧，链路仍在运行"
     warn "多数是初始化时机体没静止（重力初始化不过），或雷达无数据"
@@ -739,14 +770,15 @@ else
 fi
 
 # ============================================================== 前台常驻 =====
-if roslaunch_alive; then
+if core_alive; then
   echo
   echo "=================================================================="
   echo "  链路运行中 —— 停止：Ctrl+C"
   echo "=================================================================="
   echo "  包：$BAG_DIR/${BAG_PREFIX}_000001.bag（每拨一次新增一个序号）"
   echo "  日志：$LOGFILE"
-  echo "  roslaunch pid=$ROSLAUNCH_PID（独立会话，收尾只能靠本脚本）"
+  echo "  roscore / 核心 / MAVROS / 附属 都在独立会话里，收尾只能靠本脚本"
+  echo "  本机 RViz：板内地址 $ROS_IP，经板端 Wi-Fi ${ROS_NET_WIFI_IP:-（未连接）} 转发"
   echo
   if [ "$DO_RECORD" -eq 1 ]; then
     cat <<'TIP'
@@ -760,45 +792,63 @@ TIP
     echo
   fi
   HB=0
-  while roslaunch_alive; do
+  _utc="utc=ok"; [ "$CLOCK_SYNCED" -eq 1 ] || _utc="utc=未同步"
+  WINCH_GONE=0
+  while core_alive; do
     sleep 2
     HB=$((HB + 2))
+    # 绕线器不 respawn（见 fusion_aux.launch）：退出后立即告警一次
+    if [ "$DO_WINCH" -eq 1 ] && [ "$WINCH_GONE" -eq 0 ] && ! alive "tether_winch_nod[e]"; then
+      WINCH_GONE=1
+      warn "绕线器节点已退出且不会自动重启（重启会丢人工禁用 / FAULT 锁存、重新自动使能）：人工检查后再重启 fusion"
+    fi
     if [ "$HB" -ge 30 ]; then
       HB=0
       _armed="$(timeout 5 rostopic echo -n1 /mavros/state 2>/dev/null | sed -n 's/^armed: //p' | head -1)"
       _rec="$(timeout 5 rostopic echo -n1 /rc_record/status 2>/dev/null | sed -n 's/^data: "\(state=[^ ]*\).*/\1/p')"
+      _mav="mavros=up"; proc_alive "$MAVROS_PIDFILE" || _mav="mavros=down"
+      _aux=""
+      if [ -e "$AUX_PIDFILE.tried" ]; then
+        if proc_alive "$AUX_PIDFILE"; then _aux=" · aux=up"; else _aux=" · aux=down"; fi
+      fi
       _cam=""
       if [ "$DO_CAMERA" -eq 1 ]; then
-        if camera_alive; then _cam=" · cam=up"; else _cam=" · cam=down"; fi
+        if proc_alive "$CAM_PIDFILE"; then _cam=" · cam=up"; else _cam=" · cam=down"; fi
       fi
-      log "运行中 · armed=${_armed:-?} · ${_rec:-rec=n/a}${_cam}"
+      _winch=""
+      if [ "$DO_WINCH" -eq 1 ]; then
+        if [ "$WINCH_GONE" -eq 0 ]; then _winch=" · winch=up"; else _winch=" · winch=已退出"; fi
+      fi
+      log "运行中 · armed=${_armed:-?} · ${_mav}${_aux}${_winch} · ${_rec:-rec=n/a}${_cam} · ${_utc}"
     fi
   done
 fi
 
 # ============================================================== 退出码 =======
-if [ -n "$SETSID_PID" ]; then
-  wait "$SETSID_PID"; RL_RC=$?
+if [ -n "$CORE_SETSID_PID" ]; then
+  wait "$CORE_SETSID_PID"; RL_RC=$?
 else
   RL_RC=0
 fi
 hr
 # 能走到这里说明没收到过停止信号（收到信号的都在 on_signal 里 exit 掉了），
-# 所以 roslaunch 是自己退的：--required 之下就是某个节点先退出把整条链路带下来了。
+# 所以核心 roslaunch 是自己退的：required 之下就是雷达驱动 / FAST-LIO / 重力桥某个先退出，
+# 把整组带下来了。不自动重启（会重置 drone_odom 原点），收掉其余进程后以失败退出。
 # roslaunch 遇到 required 节点退出也给退出码 0，这里补一个非 0，
 # 免得 systemd / 上层脚本把「节点崩了」当成「正常结束」。
 if [ "$RL_RC" -ne 0 ]; then
-  err "roslaunch 异常退出（退出码 $RL_RC），往上翻日志里的第一个报错"
+  err "核心 roslaunch 异常退出（退出码 $RL_RC），往上翻日志里的第一个报错"
   EXIT_RC="$RL_RC"
 elif [ "$SHUTTING_DOWN" -eq 0 ]; then
-  err "roslaunch 在没收到停止信号的情况下自行退出"
-  err "多半是某个节点先退出触发了 required 全体收拢，找日志里的 \"REQUIRED process [...] has died!\" 确认是哪个"
+  err "核心 roslaunch 在没收到停止信号的情况下自行退出：飞控已收不到外部定位"
+  err "多半是某个核心节点先退出触发了 required 全体收拢，找日志里的 \"REQUIRED process [...] has died!\" 确认是哪个"
   EXIT_RC=1
 else
-  ok "roslaunch 已退出（退出码 0）"
+  ok "核心 roslaunch 已退出（退出码 0）"
   EXIT_RC=0
 fi
-stop_camera
+SHUTTING_DOWN=1
+stop_all
 verify_clean
 log "退出（日志：$LOGFILE）"
 exit "$EXIT_RC"

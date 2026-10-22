@@ -2,7 +2,7 @@
 
 > 位置：`/home/orangepi/mid360s_ws/scripts/rc_record/`（属于 mid360s_ws 仓库）。
 > 融合快速启动：`cd /home/orangepi/mid360s_ws/scripts && ./fusion.sh`
-> —— 一条 `launch/fusion.launch` 起 MAVROS + 雷达/FAST-LIO + 本录包节点，
+> —— 本录包节点在附属组 `launch/fusion_aux.launch` 里（节点退出自动重启，不连带定位核心），
 > 用 `RC_BAG_PREFIX`/`RC_BAG_DIR` 把包名前缀（默认 `noprop`）与输出目录传进来。
 > 逐项体检入口：`./start_handheld_test.sh`（会 ping 雷达、核对飞控参数、测频）。
 > 两个入口共用同一把锁，互相排斥。下面的说明也可单独手动启动。
@@ -164,7 +164,7 @@ E2E 脚本会在临时目录里用 `channels[5] = 1000/2000/1000/2000/1000` 的�
 ## 备注
 
 - 这仍然不是 catkin 包：不在 `src/` 下，不参与 `catkin build`，也不产出任何可执行文件。
-  为了能进 `launch/fusion.launch` 的 `<node>`（ROS1 要求 `pkg` 能被 rospack 找到、`type`
+  为了能进 `launch/fusion_aux.launch` 的 `<node>`（ROS1 要求 `pkg` 能被 rospack 找到、`type`
   是包目录里的可执行文件），目录里放了一个**仅用于定位**的 `package.xml`，`type` 直接
   复用 `start_rc_record.sh`。代价是启动前要把 `scripts/` 加进 `ROS_PACKAGE_PATH`：
   `fusion.sh` 里已经做了，手动 `roslaunch` 时要自己 `export`，否则报

@@ -9,8 +9,31 @@ if [ -f "$CONFIG_DIR/local.env" ]; then
 fi
 IMAGE_TAG="${RVIZ_IMAGE_TAG:-${IMAGE_TAG:-ros-noetic-rviz:noetic}}"
 CONTAINER_NAME="${RVIZ_CONTAINER_NAME:-${CONTAINER_NAME:-rviz_mid360s}}"
-DEFAULT_ROS_MASTER="http://192.168.31.32:11311"
-DEFAULT_BOARD_IP="192.168.31.32"
+# 板端 ROS 核心固定在板内地址 10.250.32.1（dummy 网卡 ros0，不跟随 Wi-Fi，见 scripts/ros_net.sh），
+# 本机经到它的 /32 路由访问，下一跳是板端当前 Wi-Fi 地址（DEFAULT_BOARD_IP）。
+BOARD_CORE_IP="10.250.32.1"
+# 板端 Wi-Fi 地址按本机所在网段自动选，与 ~/.ssh/config 的 orange 同一规则：Xiaomi 192.168.31.32 优先，
+# 其次 chuangxiangG209 192.168.8.32，都不在（手机热点等）解析 mDNS 名 orangepi5max.local；BOARD_IP 可覆盖。
+pick_board_ip() {
+  local cand
+  for cand in 192.168.31.32 192.168.8.32; do
+    ip -4 -o addr show | grep -qF " inet ${cand%.*}." && { printf '%s' "$cand"; return 0; }
+  done
+  getent hosts orangepi5max.local | awk '{printf "%s", $1; exit}' || true
+}
+DEFAULT_BOARD_IP="${BOARD_IP:-$(pick_board_ip)}"
+DEFAULT_ROS_MASTER="http://${BOARD_CORE_IP}:11311"
+
+# 确保到板内地址的 /32 路由经板端当前 Wi-Fi 地址。本机 Xiaomi / chuangxiangG209 的 Wi-Fi 连接自带这条静态路由，
+# 其他情况（手机热点、只插网线等）用 sudo 补一条临时路由，换网或重启后失效，下次启动再补。
+ensure_core_route() {
+  local via="$1" cur
+  [ -n "$via" ] || return 1
+  cur="$(ip route get "$BOARD_CORE_IP" 2>/dev/null | head -n 1)"
+  case "$cur" in *" via $via "*) return 0 ;; esac
+  log "本机还没有经 $via 到板内地址 $BOARD_CORE_IP 的路由，用 sudo 补一条临时路由"
+  sudo ip route replace "$BOARD_CORE_IP/32" via "$via"
+}
 RVIZ_CONFIG_IN_CONTAINER="/opt/rviz-ws/rviz/fastlio_mid360s.rviz"
 # 显示 launch 仅启动 RViz；drone_odom 静态 TF 来自板端。
 LAUNCH_FILE_IN_CONTAINER="/opt/rviz-ws/launch/display_gravity_aligned.launch"

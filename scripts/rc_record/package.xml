@@ -7,7 +7,7 @@
   执行文件，这两条它都满足（type 就是同目录的 start_rc_record.sh）。
 
   代价是启动前必须把 /home/orangepi/mid360s_ws/scripts 加进 ROS_PACKAGE_PATH：
-  scripts/fusion.sh 已经做了；手动 roslaunch scripts/launch/fusion.launch 时要自己
+  scripts/fusion.sh 已经做了；手动 roslaunch scripts/launch/fusion_aux.launch（或合集 fusion.launch）时要自己
   export，否则会报 "cannot find package rc_record"。
 -->
 <package format="2">

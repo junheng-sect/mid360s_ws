@@ -51,7 +51,7 @@ cp -n docker/ros-noetic-rviz/local.env.example docker/ros-noetic-rviz/local.env
 `xauth`、`xhost`、`xdpyinfo`、`xdotool`、`xwininfo`、`xprop` 和 Python 3。
 若本机没有镜像，在本目录执行 `./scripts/build_image.sh`。不需要编译板端 ROS 工作空间。
 
-默认 ROS Master 为 `http://192.168.31.32:11311`，自动识别本机 ROS IP；
+默认 ROS Master 为板内地址 `http://10.250.32.1:11311`（板端 dummy 网卡 ros0，不跟随 Wi-Fi），本机经到它的 /32 路由访问，下一跳按本机网段自动选板端 Wi-Fi 地址（Xiaomi `192.168.31.32` 优先，其次 chuangxiangG209 `192.168.8.32`，都不在则解析 `orangepi5max.local`），缺路由时用 sudo 补一条；自动识别本机 ROS IP；
 可通过 `--ros-master URI --ros-ip IP` 覆盖。保留原入口全部参数。
 默认容器名 `rviz_mid360s`，同名容器会被替换；并行使用需传不同 `--name`。
 
@@ -65,7 +65,7 @@ cp -n docker/ros-noetic-rviz/local.env.example docker/ros-noetic-rviz/local.env
 - `OV13855 Preview` 图像面板订阅 `/ov13855_apriltag_vision/image_preview`，Transport Hint 为 `compressed`
   （960px 带标注预览，约 15Hz、1 MB/s，由 orange 工作空间视觉节点发布）。不要改成 raw 或订阅原分辨率话题，
   raw 约 55 MB/s 会占满 Wi-Fi。板端 `scripts/fusion.sh` 默认经 `scripts/launch/camera.launch` 拉起相机与视觉节点
-  （`--no-camera` 关闭）；单独启动相机/视觉时须先 `export ROS_IP=192.168.31.32`，否则本机收不到图像。
+  （`--no-camera` 关闭）；单独启动相机/视觉时须先 `source ~/mid360s_ws/scripts/ros_net.sh`，否则本机收不到图像。
   个人配置 `home/ros/.rviz/` 只在不存在时从模板复制，已有个人配置需自行 Add 该面板或删除后重新生成。
 - 保留 GPU 渲染、历史/当前点云与路径配置。2026-09-26 在旧入口完成隔离容器的 IPC 对照、滚动/加宽复测，用户确认手动最大化正常；不是板端实时点云验收。
 

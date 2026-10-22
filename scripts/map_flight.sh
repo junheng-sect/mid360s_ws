@@ -20,8 +20,7 @@ DO_BUILD=1
 FUSION_ARGS=()
 REC_BIN=/opt/ros/noetic/lib/rosbag/record
 RAW_HELPER="$DIR/rc_record/raw_bag_recorder.py"
-MASTER_URI="http://192.168.31.32:11311"
-ROS_IP_ADDR="192.168.31.32"
+source "$DIR/ros_net.sh" || exit 1   # ROS 核心用板内固定地址 10.250.32.1，master 走 127.0.0.1
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -115,7 +114,7 @@ trap ':' INT
 log "CH6 控制所有录包：${PREFIX}_rc_<序号>.bag + ${PREFIX}_raw_<同序号>.bag"
 log "开关先置关闭位；链路起来后拨 CH6 开，在地面静止录 5–10 s 再起飞"
 log "落地上锁后 CH6 关，等原始包收尾，再 Ctrl+C；日志 $REC_LOG"
-ROS_MASTER_URI="$MASTER_URI" ROS_IP="$ROS_IP_ADDR" setsid --wait bash -c '
+setsid --wait bash -c '
   ws="$1"; shift
   set +u; source /opt/ros/noetic/setup.bash; source "$ws/devel/setup.bash"; unset ROS_HOSTNAME
   exec python3 -u "$@"

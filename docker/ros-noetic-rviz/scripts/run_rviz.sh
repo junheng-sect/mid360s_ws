@@ -18,7 +18,8 @@ usage() {
   --reloc             打开重定位对照视图（个人副本 home/ros/.rviz/drone_reloc.rviz，首次从
                       rviz/drone_reloc.rviz 复制）：Fixed Frame map，先验地图、实时点云、map/车/无人机三组
                       坐标轴和二维车图；本机同时起显示辅助节点 local_view/reloc_display（板端不跑显示节点）
-  --ros-master URI    ROS Master 地址（默认 http://192.168.31.32:11311）
+  --ros-master URI    ROS Master 地址（默认板内地址 http://10.250.32.1:11311，经板端当前 Wi-Fi 地址转发：
+                      Xiaomi 192.168.31.32 / chuangxiangG209 192.168.8.32 / 其他网 orangepi5max.local）
   --ros-ip IP         覆盖自动识别的本机 ROS IP
   --name NAME         容器名（默认 rviz_mid360s，同名容器会自动清理）
   --shell             启动 bash 而不是 RViz
@@ -112,15 +113,20 @@ if make_xauth_file; then have_xauth=1; fi
 ensure_xhost_grant
 
 log "4/5 确定 ROS 网络参数"
+master_host="$(printf '%s' "$ros_master_uri" | sed -E 's#^[a-z]+://([^:/]+).*#\1#')"
+if [ "$master_host" = "$BOARD_CORE_IP" ]; then
+  ensure_core_route "$DEFAULT_BOARD_IP" \
+    || die "到板内地址 $BOARD_CORE_IP 的路由没配上（板端 Wi-Fi 地址：${DEFAULT_BOARD_IP:-没找到}）：确认本机和板端连在同一个 Wi-Fi（不在 Xiaomi / chuangxiangG209 时靠 mDNS 名 orangepi5max.local）。"
+fi
 if [ -n "$ros_ip_override" ]; then
   ros_ip="$ros_ip_override"
 else
-  board_ip="$(printf '%s' "$ros_master_uri" | sed -E 's#^[a-z]+://([^:/]+).*#\1#')"
+  board_ip="$master_host"
   case "$board_ip" in
     ''|*[!0-9.]*) board_ip="$DEFAULT_BOARD_IP" ;;
   esac
   ros_ip="$(detect_ros_ip "$board_ip")" \
-    || die "无法确定到 $board_ip 的本机源地址：确认 Wi-Fi 已连接且在 192.168.31.0/24 网段。"
+    || die "无法确定到板端（${board_ip:-地址未知}）的本机源地址：确认本机和板端连在同一个 Wi-Fi（不在 Xiaomi / chuangxiangG209 时靠 mDNS 名 orangepi5max.local）。"
 fi
 log "ROS_MASTER_URI=$ros_master_uri  ROS_IP=$ros_ip"
 if [ "$master_check" -eq 1 ]; then

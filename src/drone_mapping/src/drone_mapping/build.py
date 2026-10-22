@@ -21,7 +21,8 @@ Ctrl+C 收尾后离线跑 Voxel-SLAM，再拼图、摆正、降采样、出预�
   --keep-frames   保留 Voxel-SLAM 的逐帧点云 voxelslam_tmp/（默认成功后删掉，约 0.4 MB/s）
   --carve R       去人：拼图时去掉设备走过空间里（水平 R、上下 0.12 m 以内）只短暂出现的点，默认 0.25，0 关闭
                   （拿设备的人；静止物体全程都看得到，不会被去掉。见 assemble.py；FAST-LIO 那一路不做）
-  实机会先等 chrony 对上时间（同 fusion.sh，最多 60 s）；确定没外网也要建图，加 --allow-unsynced-clock
+  实机会先等 chrony 对上时间（同 fusion.sh，最多 60 s）；确定没外网也要建图，加 --allow-unsynced-clock。
+  录包期间同 fusion.sh 冻结板端时钟（停 chronyd，录完收拢残留再恢复），运行中联网不会跳时间
   --set NAME=VALUE  只对本次覆盖实时 FAST-LIO 的参数，可重复，例如 --set preprocess/blind=1.0 --set filter_size_surf=0.3
 产出（DIR = out-root/<YYYYmmdd_HHMMSS>[_NAME]）:
   raw.bag             实机：/livox/lidar /livox/imu /tf_static /fastlio/gravity_init /Odometry
@@ -57,7 +58,7 @@ WS_SETUP = os.path.join(WS, 'devel/setup.bash')
 PCD_DIR = os.path.join(WS, 'src/FAST_LIO/PCD')        # FAST-LIO 编译时写死的 ROOT_DIR/PCD
 VS_CONFIG = os.path.join(PKG_DIR, 'config/voxelslam_mid360s.yaml')
 VS_BIN = os.path.join(WS, 'devel/lib/voxel_slam/voxelslam')
-BOARD_IP, LIDAR_NET_IP, LIDAR_IP = '192.168.31.32', '192.168.1.5', '192.168.1.194'
+LIDAR_NET_IP, LIDAR_IP = '192.168.1.5', '192.168.1.194'
 MASTER_PORT = 11311
 LOCK_FILE = '/tmp/mid360s_build_map.lock'
 REC_BIN, PLAY_BIN = '/opt/ros/noetic/lib/rosbag/record', '/opt/ros/noetic/lib/rosbag/play'
@@ -114,6 +115,13 @@ def say(msg):
         LOG['f'].flush()
 
 
+def core_ip():
+    """板内固定地址（同 scripts/ros_net.sh：dummy 网卡 ros0 上的 10.250.32.1，不跟随 Wi-Fi），没建立返回 None"""
+    out = subprocess.run(['ip', '-4', '-o', 'addr', 'show', 'dev', 'ros0'], stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, universal_newlines=True).stdout
+    return '10.250.32.1' if ' inet 10.250.32.1/' in out else None
+
+
 def ensure_ros_env(entry):
     """没套过环境就套一层 bash 重新执行入口脚本：source ROS 和本工作空间，按 start_mid360s_fastlio.sh 设 ROS_IP，本机 RViz 能看"""
     if os.environ.get('BUILD_MAP_ENV') == '1':
@@ -122,11 +130,10 @@ def ensure_ros_env(entry):
         if not os.path.isfile(f):
             print('[ERROR] 找不到 %s（工作空间没编译？）' % f)
             sys.exit(3)
-    ip = BOARD_IP if BOARD_IP in subprocess.run(['ip', '-4', 'addr'], stdout=subprocess.PIPE,
-                                                universal_newlines=True).stdout else '127.0.0.1'
+    ip = core_ip() or '127.0.0.1'
     # source 前先清空位置参数，不然 --help 之类会传给 catkin 的 setup 脚本
-    cmd = ('ARGS=("$@"); set --; source %s && source %s && export BUILD_MAP_ENV=1 ROS_MASTER_URI=http://%s:%d ROS_IP=%s '
-           '&& unset ROS_HOSTNAME && exec python3 "$0" "${ARGS[@]}"' % (ROS_SETUP, WS_SETUP, ip, MASTER_PORT, ip))
+    cmd = ('ARGS=("$@"); set --; source %s && source %s && export BUILD_MAP_ENV=1 ROS_MASTER_URI=http://127.0.0.1:%d ROS_IP=%s '
+           '&& unset ROS_HOSTNAME && exec python3 "$0" "${ARGS[@]}"' % (ROS_SETUP, WS_SETUP, MASTER_PORT, ip))
     os.execvp('bash', ['bash', '-c', cmd, entry] + sys.argv[1:])
 
 
@@ -266,12 +273,7 @@ def post(d, voxel, carve_r=assemble.CARVE_R):
 
 # ---------------------------------------------------------------- 运行 ----
 def master_up():
-    try:
-        socket.create_connection((BOARD_IP, MASTER_PORT), timeout=1).close()
-        return True
-    except OSError:
-        pass
-    try:
+    try:            # master 一律走 127.0.0.1（见 scripts/ros_net.sh），绑定在所有网卡上，本机回环总能连上
         socket.create_connection(('127.0.0.1', MASTER_PORT), timeout=1).close()
         return True
     except OSError:
@@ -337,10 +339,83 @@ def wait_clock(allow):
             print('板端时间还没对上（%s），最多等 %.0f s……' % (why, CLOCK_SYNC_TIMEOUT), flush=True)
         time.sleep(2)
     if allow:
-        print('[WARN] 板端时间没对上（%s），按 --allow-unsynced-clock 继续；建图中时间一跳，这次地图就可能作废' % why)
+        print('[WARN] 板端时间没对上（%s），按 --allow-unsynced-clock 继续：录包期间时钟冻结、不会跳，'
+              '但包的绝对时间可能不准' % why)
         return True
     print('[ERROR] 板端时间没对上（%s）。确认外网后重试；确定没外网也要建图，加 --allow-unsynced-clock' % why)
     return False
+
+
+# 实机录包期间冻结板端时钟，同 scripts/clock_guard.sh：持锁并停掉 chronyd，录完收拢残留、全退了再启动 chronyd。
+# 录包起的进程打上环境变量标记（roslaunch 用 setsid 起节点、不传 fd，被强杀时节点成孤儿，靠标记找回）；
+# MID360S_CLOCK_FROZEN=1 也让 chrony 的防启动检查（/usr/local/sbin/mid360s-chrony-guard）认得出孤儿。
+CLOCK_FREEZE_LOCK = '/run/mid360s/clock_freeze.lock'
+RUN_TAG = 'MID360S_RUN=mid360s-%d-%d:build_map' % (os.getpid(), int(time.time()))
+
+
+def chrony_active():
+    return subprocess.run(['systemctl', 'is-active', '--quiet', 'chrony.service']).returncode == 0
+
+
+def clock_freeze():
+    """返回持锁的文件对象；冻结不了返回 None"""
+    try:
+        f = open(CLOCK_FREEZE_LOCK, 'a')
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        say('[ERROR] 冻结不了板端时钟（%s）：另一个定位核心实例在跑？' % e)
+        return None
+    if subprocess.run(['sudo', '-n', '/usr/bin/systemctl', 'stop', 'chrony.service'], stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode != 0 or chrony_active():
+        f.close()
+        say('[ERROR] 停不掉 chronyd（/etc/sudoers.d/mid360s-chrony 没装？），录包中可能跳时间，不启动')
+        return None
+    say('已停 chronyd：录包期间系统时钟不跳、不调速，录完恢复对时')
+    return f
+
+
+def tagged_env():
+    k, _, v = RUN_TAG.partition('=')
+    return dict(os.environ, **{k: v, 'MID360S_CLOCK_FROZEN': '1'})
+
+
+def tagged_pids():
+    want, pids = RUN_TAG.encode(), []
+    for d in os.listdir('/proc'):
+        if d.isdigit():
+            try:
+                with open('/proc/%s/environ' % d, 'rb') as f:
+                    if want in f.read().split(b'\0'):
+                        pids.append(int(d))
+            except OSError:
+                pass
+    return pids
+
+
+def clock_release(f):
+    """收拢孤儿（SIGINT 10 s → SIGTERM 5 s），全退了再放锁、启动 chronyd"""
+    for sig, limit in ((signal.SIGINT, 10.0), (signal.SIGTERM, 5.0)):
+        left = tagged_pids()
+        if not left:
+            break
+        say('[WARN] 录包进程还有残留 %s，%s 收拢' % (left, sig.name))
+        for p in left:
+            try:
+                os.kill(p, sig)
+            except OSError:
+                pass
+        t0 = time.time()
+        while tagged_pids() and time.time() - t0 < limit:
+            time.sleep(0.5)
+    f.close()
+    left = tagged_pids()
+    if left:
+        say('[WARN] 仍有残留进程 %s，chronyd 保持停止；处理掉后执行 sudo systemctl start chrony' % left)
+    elif subprocess.run(['sudo', '-n', '/usr/bin/systemctl', 'start', 'chrony.service'], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL).returncode == 0 and chrony_active():
+        say('chronyd 已恢复（时间若有大偏差在此时一次校正）')
+    else:
+        say('[WARN] chronyd 没起来，执行 sudo systemctl start chrony')
 
 
 def preflight(a):
@@ -446,13 +521,20 @@ class Odo:
 
 def record(a, out, launch, run_info):
     """起 roslaunch（实机：驱动 + FAST-LIO + 重力桥；fastlio 离线：不带驱动并回放包）并录包，
-    等 Ctrl+C / 回放结束 / 出错，再按顺序收尾：先停回放和录包，再停 roslaunch"""
+    等 Ctrl+C / 回放结束 / 出错，再按顺序收尾：先停回放和录包，再停 roslaunch。实机录包期间冻结板端时钟"""
+    clock = None
+    if not a.bag:
+        clock = clock_freeze()
+        if clock is None:
+            return False
+    env = tagged_env() if clock else None
     rl_log = open(os.path.join(out, 'roslaunch.log'), 'w')
     bag_log = open(os.path.join(out, 'rosbag.log'), 'w')
-    rl = subprocess.Popen(['roslaunch', '--screen', '--required', launch], stdout=rl_log, stderr=subprocess.STDOUT,
-                          stdin=subprocess.DEVNULL, start_new_session=True)
-    rec = play = odo = None
+    rl = rec = play = odo = None
     try:
+        rl = subprocess.Popen(['roslaunch', '--screen', '--required', launch], stdout=rl_log, stderr=subprocess.STDOUT,
+                              stdin=subprocess.DEVNULL, start_new_session=True, env=env,
+                              pass_fds=(clock.fileno(),) if clock else ())
         need = NODES + ([] if a.bag else [DRIVER_NODE])
         t_end = time.time() + 40
         while STOP['sig'] is None and rl.poll() is None and time.time() < t_end:
@@ -473,7 +555,8 @@ def record(a, out, launch, run_info):
                 return False
         topics = META_TOPICS if a.bag else RAW_TOPICS + META_TOPICS
         rec = subprocess.Popen([REC_BIN, '-O', os.path.join(out, 'odom.bag' if a.bag else 'raw.bag')] + topics,
-                               stdout=bag_log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+                               stdout=bag_log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
+                               env=env)
         odo = Odo()
         time.sleep(1.5)  # 等录包节点连上话题
         if a.bag:
@@ -524,6 +607,8 @@ def record(a, out, launch, run_info):
             odo.sub.unregister()
             rospy.signal_shutdown('build_map 收尾')
         rc = stop_proc(rl, 'roslaunch', STOP_TIMEOUT)
+        if clock is not None:
+            clock_release(clock)
         run_info.update(end=time.strftime('%F %T'), roslaunch_rc=rc,
                         stop=('signal %d' % STOP['sig']) if STOP['sig'] else 'auto')
         for fn in ('raw.bag.active', 'odom.bag.active'):

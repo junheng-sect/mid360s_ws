@@ -1,0 +1,35 @@
+<launch>
+  <!--
+    定位核心：MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接（位姿送 /mavros/vision_pose/pose_cov）。
+    fusion.sh 单独起它，并给 roslaunch 传 required 选项：三者任一退出就整组停下、fusion.sh 以失败退出，不自动重启。
+    FAST-LIO 重启会重置 drone_odom 原点，宁可让飞控明确丢外部定位，也不在飞行中输出看似正常、原点却变了的定位。
+    MAVROS（mavros.launch，自动重启）和录包 / 绕线器（fusion_aux.launch，自动重启）是单独的 roslaunch，
+    它们退出不连带本组；master 由 fusion.sh 单独起的 roscore 提供，也不随本组进退。
+
+    启动后机体保持静止，FAST-LIO 重力初始化通过后桥接才输出 /fastlio/odom_world。
+    桥接默认用固定安装补偿（mounting_source:=fixed，实测安装角 roll 0.5 / pitch 18.8 /
+    yaw 1.6 度，取 gravity_bridge.launch 的默认值），初始化时机体**静止即可、无须水平**；
+    只有显式改用旧的 mounting_source:=gravity 才要求水平。
+    桥接遇到时间戳回退会进 fatal、只停输出不退出，所以运行中板端时钟由 fusion.sh 冻结（clock_guard.sh）。
+
+    板端一律关闭 RViz；飞控参数不在本文件里改（px4_config.yaml 的 vision_pose/tf/listen 已经是 false，
+    桥接用消息订阅而不是 TF）。
+  -->
+  <arg name="send_to_mavros" default="true"/>
+
+  <!-- MID-360S 驱动：关 RViz，也关驱动自带的 rosbag（录包统一交给通道 6 触发） -->
+  <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360s.launch">
+    <arg name="rviz_enable"   value="false"/>
+    <arg name="rosbag_enable" value="false"/>
+  </include>
+
+  <!-- FAST-LIO2：关 RViz -->
+  <include file="$(find fast_lio)/launch/mapping_mid360s.launch">
+    <arg name="rviz" value="false"/>
+  </include>
+
+  <!-- 重力对齐桥接：带协方差位姿送 /mavros/vision_pose/pose_cov -->
+  <include file="$(find fastlio_gravity_bridge)/launch/gravity_bridge.launch">
+    <arg name="send_to_mavros" value="$(arg send_to_mavros)"/>
+  </include>
+</launch>

@@ -1,0 +1,30 @@
+<launch>
+  <!--
+    附属节点：RC 通道 6 触发录包 + 系留绕线器。fusion.sh 单独起它、不带 required：任一附属节点退出
+    不连带定位核心（fusion_core.launch）和 MAVROS。
+    录包节点 respawn：崩溃时当前包没有索引（fusion.sh 收尾检查会报出来），重启后开关仍在触发位会马上开新包。
+    绕线器**不** respawn：配置是 auto_enable: true，重启后定位和 TCP 一恢复就会重新自动使能，人工禁用和
+    FAULT 锁存都会丢。崩溃后保持退出（fusion.sh 心跳会告警），需人工检查后重启 fusion。
+    录包和绕线器都关掉时 fusion.sh 不起本文件（没有节点的 roslaunch 会立即退出）。
+
+    录包节点的 type 就是 rc_record 目录里的启动包装脚本，它自己 rosparam load rc_record.yaml 再 exec
+    bag_recorder_node.py；前缀 / 目录用环境变量覆盖，与 start_handheld_test.sh 走的是同一条路径。
+    rc_record 不是 catkin 包，要先把 scripts 加进 ROS_PACKAGE_PATH（fusion.sh 已经做了）。
+  -->
+  <arg name="record"     default="true"/>
+  <arg name="winch"      default="true"/>
+  <arg name="bag_prefix" default="noprop"/>
+  <arg name="bag_dir"    default="/home/orangepi/test_data/bags"/>
+
+  <group if="$(arg record)">
+    <node name="rc_bag_recorder" pkg="rc_record" type="start_rc_record.sh" output="screen"
+          respawn="true" respawn_delay="2">
+      <env name="RC_BAG_PREFIX" value="$(arg bag_prefix)"/>
+      <env name="RC_BAG_DIR"    value="$(arg bag_dir)"/>
+    </node>
+  </group>
+  <!-- winch:=false 完全跳过该包解析与节点启动 -->
+  <group if="$(arg winch)">
+    <include file="$(find tether_winch_control)/launch/tether_winch.launch" />
+  </group>
+</launch>

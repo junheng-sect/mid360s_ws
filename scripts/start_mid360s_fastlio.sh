@@ -12,6 +12,9 @@ set -euo pipefail
 # 初始化时机体保持静止即可、**无须水平**；改安装角用 gravity_bridge.launch 的
 # mounting_roll_deg / mounting_pitch_deg / mounting_yaw_deg 参数。旧的
 # mounting_source:=gravity 才要求初始化时机体水平。
+#
+# 运行期间同 fusion.sh 冻结板端时钟（clock_guard.sh）：起 roslaunch 前停 chronyd，退出后收拢
+# 残留节点、全退了再启动 chronyd。没外网也能启动，运行中联网不会跳时间。
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +24,6 @@ WS_SETUP="${WS_DIR}/devel/setup.bash"
 LOCK_FILE="/tmp/mid360s_fastlio.lock"
 COMBINED_LAUNCH="/tmp/mid360s_fastlio_combined.launch"
 
-EXPECTED_WIFI_IP="192.168.31.32"
 EXPECTED_LIDAR_NET_IP="192.168.1.5"
 LIDAR_DEVICE_IP="192.168.1.194"
 ROS_MASTER_PORT=11311
@@ -67,9 +69,12 @@ source "$ROS_SETUP"
 source "$WS_SETUP"
 set -u
 
-export ROS_MASTER_URI="http://${EXPECTED_WIFI_IP}:${ROS_MASTER_PORT}"
-export ROS_IP="${EXPECTED_WIFI_IP}"
-unset ROS_HOSTNAME
+# ROS 核心用板内固定地址（ros0 10.250.32.1，master 走 127.0.0.1），不依赖 Wi-Fi；地址不在时第 3 步报错。
+# WIFI_IP 只用于提示本机 RViz 怎么连，没连 Wi-Fi 为空
+if source "${SCRIPT_DIR}/ros_net.sh"; then CORE_NET_OK=1; else CORE_NET_OK=0; fi
+WIFI_IP="${ROS_NET_WIFI_IP}"
+# 运行期间冻结板端时钟，见文件头
+source "${SCRIPT_DIR}/clock_guard.sh"
 
 # ------------------------------------------------------------------------------
 # 2. 依赖检查
@@ -128,11 +133,16 @@ fi
 # ------------------------------------------------------------------------------
 # 3. 网络与连通性检查 (带超时)
 # ------------------------------------------------------------------------------
-if ! ip -4 addr show | grep -qw "$EXPECTED_WIFI_IP"; then
-    echo "[ERROR] 板端 Wi-Fi IP 未配置 $EXPECTED_WIFI_IP" >&2
+if [[ $CORE_NET_OK -ne 1 ]]; then
+    echo "[ERROR] 板内固定地址 ${ROS_CORE_IP} 不在（nmcli con up ros-core）" >&2
     if [[ $CHECK_ONLY -eq 1 ]]; then CHECK_FAILED=1; else exit 1; fi
 else
-    [[ $CHECK_ONLY -eq 1 ]] && echo "[PASS] 板端 Wi-Fi IP 检查正常 ($EXPECTED_WIFI_IP)"
+    [[ $CHECK_ONLY -eq 1 ]] && echo "[PASS] ROS 核心地址正常 ($ROS_IP，master 走 127.0.0.1)"
+fi
+if [[ -z "$WIFI_IP" ]]; then
+    echo "[WARN] Wi-Fi 未连接：核心照常运行，只是本机 RViz / ssh 暂时连不上" >&2
+else
+    [[ $CHECK_ONLY -eq 1 ]] && echo "[PASS] 板端 Wi-Fi IP $WIFI_IP（本机 RViz 经它访问 $ROS_IP）"
 fi
 
 if ! ip -4 addr show | grep -qw "$EXPECTED_LIDAR_NET_IP"; then
@@ -191,7 +201,7 @@ else
 fi
 
 # 检查 ROS Master 状态与节点
-if nc -z -w 1 "$EXPECTED_WIFI_IP" "$ROS_MASTER_PORT" >/dev/null 2>&1; then
+if nc -z -w 1 127.0.0.1 "$ROS_MASTER_PORT" >/dev/null 2>&1; then
     [[ $CHECK_ONLY -eq 1 ]] && echo "[PASS] 检测到运行中的 ROS Master: $ROS_MASTER_URI"
     
     sim_time=$(rosparam get /use_sim_time 2>/dev/null || echo "false")
@@ -295,4 +305,36 @@ echo "[INFO] ROS_IP:         $ROS_IP"
 echo "[INFO] 按 Ctrl+C 统一停止全部节点"
 echo "============================================================"
 
-exec roslaunch --screen --required "$COMBINED_LAUNCH" "${ROSLAUNCH_ARGS[@]}"
+# 冻结板端时钟：chronyd 没在跑就先拉起来看一眼对没对上（不等），再停掉；冻结不了就不启动
+clock_ensure_running || true
+if timeout 3 chronyc -n tracking 2>/dev/null | grep -q "^Leap status *: Not synchronised"; then
+    echo "[WARN] 板端 UTC 时间未同步：按板端本地时间运行（运行中时钟冻结、不会跳，退出后再对时）"
+fi
+if ! clock_freeze; then
+    echo "[ERROR] 冻结不了板端时钟（另一个定位核心实例在跑，或 /etc/sudoers.d/mid360s-chrony 没装），运行中可能跳时间，不启动" >&2
+    exit 1
+fi
+echo "[INFO] 已停 chronyd：运行中系统时钟不跳、不调速，退出后恢复对时"
+
+# roslaunch 作为子进程跑（不再 exec），这样退出后还能收拢孤儿节点、恢复 chronyd。
+# Ctrl+C / SIGTERM 转发给 roslaunch；终端 Ctrl+C 时它自己也会收到一份，重复 SIGINT 不影响收尾。
+set +e
+# shellcheck disable=SC2046
+env $(clock_env fastlio) roslaunch --screen --required "$COMBINED_LAUNCH" "${ROSLAUNCH_ARGS[@]}" &
+RL_PID=$!
+trap 'kill -INT "$RL_PID" 2>/dev/null' INT TERM
+while :; do
+    wait "$RL_PID"; RL_RC=$?
+    kill -0 "$RL_PID" 2>/dev/null || break
+done
+trap - INT TERM
+reap_tagged fastlio "雷达/FAST-LIO/桥接"
+clock_release; _rc=$?
+if [[ $_rc -eq 0 ]]; then
+    echo "[INFO] chronyd 已恢复（时间若有大偏差在此时一次校正）"
+elif [[ $_rc -eq 2 ]]; then
+    echo "[WARN] 还有残留进程（pid $(tagged_pids | tr '\n' ' ')），chronyd 保持停止；处理掉后执行 sudo systemctl start chrony" >&2
+else
+    echo "[WARN] chronyd 没起来，处理残留后执行 sudo systemctl start chrony" >&2
+fi
+exit "$RL_RC"

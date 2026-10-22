@@ -3,9 +3,9 @@
     相机预览：OV13855 驱动 + AprilTag 视觉节点（产出 /ov13855_apriltag_vision/image_preview，
     供本机 RViz 的 OV13855 Preview 面板经 /compressed 查看）。
 
-    由 fusion.sh 在主链路节点注册后作为「第二个、非 required 的」roslaunch 拉起，
-    不并进 fusion.launch：fusion.sh 给主 roslaunch 传 required 选项（强制全部节点 required），相机掉帧超时节点会退出，
-    并进去就会把 MAVROS/FAST-LIO 整条定位链路一起带下来。这里的节点都 respawn，
+    由 fusion.sh 在核心节点注册后作为单独的、非 required 的 roslaunch 拉起，
+    不并进核心组 fusion_core.launch：fusion.sh 给核心 roslaunch 传 required 选项，相机掉帧超时节点会退出，
+    并进去就会把 FAST-LIO 整组定位一起带下来。这里的节点都 respawn，
     相机断流只影响预览和读码，不影响定位与录包。
 
     OV13855 双路（与 ov13855.launch 一致）：ov13855_cam 是自通路 1280x960，给 AprilTag；

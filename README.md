@@ -6,7 +6,7 @@
 新增 [drone_relocalization](src/drone_relocalization/README.md)：复用已有雷达、FAST-LIO 和重力桥，两个独立静止窗口确认后锁定 `drone_map → drone_odom`；后续仅传播里程计，不接入飞控。只使用室内先验图。
 
 ```bash
-export ROS_IP=192.168.31.32 && source /opt/ros/noetic/setup.bash && source ~/mid360s_ws/devel/setup.bash
+source ~/mid360s_ws/scripts/ros_net.sh && source /opt/ros/noetic/setup.bash && source ~/mid360s_ws/devel/setup.bash
 roslaunch drone_relocalization relocalize.launch
 ```
 
@@ -330,8 +330,9 @@ cd /home/orangepi/mid360s_ws/scripts
 
 Ctrl+C会统一结束本次fusion启动的节点，绕线器正常退出尝试发送YAML的fallback_duty，
 不会套用本机脉冲脚本Ctrl+C发送300的规则；网络断开时不能保证备用指令送达。
-沿用原有 `roslaunch --required` 规则：绕线器进程异常退出会结束本次整条链路；
-绕线器报告FAULT但进程仍在时不会触发整链退出。
+绕线器在附属组（`scripts/launch/fusion_aux.launch`）里，进程异常退出不再结束整条链路，定位核心（雷达驱动 /
+FAST-LIO / 重力桥）照常运行；它**不**自动重启：配置是 `auto_enable: true`，重启后定位和 TCP 一恢复就会重新自动使能，
+人工禁用和 FAULT 锁存都会丢。退出后 fusion.sh 立即告警，需人工检查后再重启 fusion。绕线器报告FAULT但进程仍在时同样不影响其余节点。
 
 
 ## 小车定位（car_reloc.py）

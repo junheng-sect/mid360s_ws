@@ -36,11 +36,11 @@ LOG_DIR="$WS/logs/handheld"
 # 与 fusion.sh 共用同一把锁文件：新旧入口互斥
 LOCK_FILE="/tmp/mid360s_fusion.lock"
 
-export ROS_MASTER_URI="http://192.168.31.32:11311"
-export ROS_IP="192.168.31.32"
-unset ROS_HOSTNAME 2>/dev/null || true
+# ROS 核心用板内固定地址（ros0 10.250.32.1，master 走 127.0.0.1），不依赖 Wi-Fi；
+# WIFI_IP 只用于提示本机 RViz 怎么连，没连 Wi-Fi 为空
+source "$DIR/ros_net.sh" || exit 1
 
-WIFI_IP="192.168.31.32"
+WIFI_IP="$ROS_NET_WIFI_IP"
 LIDAR_IFACE_IP="192.168.1.5"
 LIDAR_IP="192.168.1.194"
 TTY="/dev/ttyS3"
@@ -336,8 +336,12 @@ else
 fi
 
 if [ "$NET_CHECK" -eq 1 ]; then
-  ip -4 addr show 2>/dev/null | grep -qw "$WIFI_IP" || { err "Wi-Fi 未配置 $WIFI_IP"; exit 1; }
-  ok "板端 Wi-Fi IP $WIFI_IP"
+  ok "ROS 核心地址 $ROS_IP（板内固定，master 走 127.0.0.1）"
+  if [ -n "$WIFI_IP" ]; then
+    ok "板端 Wi-Fi IP $WIFI_IP（本机 RViz 经它访问 $ROS_IP）"
+  else
+    warn "Wi-Fi 未连接：核心照常运行，只是本机 RViz / ssh 暂时连不上"
+  fi
   if ! ip -4 addr show 2>/dev/null | grep -qw "$LIDAR_IFACE_IP"; then
     err "雷达网口未配置 $LIDAR_IFACE_IP（enP3p49s0 无载波：雷达没上电或网线没插）"
     err "排查：ip -4 -br addr show enP3p49s0  |  nmcli device status"

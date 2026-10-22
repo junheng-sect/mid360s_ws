@@ -26,7 +26,7 @@ source ~/mid360s_ws/devel/setup.bash
 另一个板端终端执行，设备保持静止直至 `/drone_reloc/status` 为 `LOCALIZED`、`valid=true`：
 
 ```bash
-export ROS_IP=192.168.31.32 && source /opt/ros/noetic/setup.bash && source ~/mid360s_ws/devel/setup.bash
+source ~/mid360s_ws/scripts/ros_net.sh && source /opt/ros/noetic/setup.bash && source ~/mid360s_ws/devel/setup.bash
 roslaunch drone_relocalization relocalize.launch map_dir:=$HOME/test_data/mapping/20261021_110311_indoor
 ```
 
