@@ -272,14 +272,6 @@ def post(d, voxel, carve_r=assemble.CARVE_R):
 
 
 # ---------------------------------------------------------------- 运行 ----
-def master_up():
-    try:            # master 一律走 127.0.0.1（见 scripts/ros_net.sh），绑定在所有网卡上，本机回环总能连上
-        socket.create_connection(('127.0.0.1', MASTER_PORT), timeout=1).close()
-        return True
-    except OSError:
-        return False
-
-
 def rosnodes():
     try:
         r = subprocess.run(['rosnode', 'list'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -441,9 +433,9 @@ def preflight(a):
             bad.append('板端没有雷达网口地址 %s（enP3p49s0 DOWN / 网线没插）' % LIDAR_NET_IP)
         elif subprocess.run(['ping', '-c', '1', '-W', '2', LIDAR_IP], stdout=subprocess.DEVNULL).returncode:
             bad.append('雷达 %s ping 不通（没上电？）' % LIDAR_IP)
-    if not (a.bag and a.algo == 'voxelslam'):   # 离线 Voxel-SLAM 用自己的 master（127.0.0.1 空闲端口），不和在跑的链路冲突
-        if master_up():
-            bad.append('已经有 ROS master 在跑（fusion / start_mid360s_fastlio / roscore？），先停掉')
+    # 离线 Voxel-SLAM 用自己的 master（127.0.0.1 空闲端口），不和在跑的链路冲突。其余情况用 11311 上开机常驻的
+    # master（scripts/resident/，上面还常驻着 MAVROS），不再要求没有 master，只拦真正冲突的链路进程
+    if not (a.bag and a.algo == 'voxelslam'):
         for n in CONFLICT_PROCS:
             if subprocess.run(['pgrep', '-f', n], stdout=subprocess.DEVNULL).returncode == 0:
                 bad.append('已有 %s 进程在跑' % n)

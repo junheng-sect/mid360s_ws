@@ -1,14 +1,21 @@
 <launch>
   <!--
     MAVROS 入口：include 系统的 px4.launch（/opt 下的文件不改），再把帧名换成和本工作空间 TF 树一致的名字，
-    换法见 mavros_frames.yaml。fusion.sh（单独起、respawn_mavros:=true）、fusion.launch 和 start_handheld_test.sh 都走这里。
+    换法见 mavros_frames.yaml。由常驻服务 mid360s-mavros.service（scripts/resident/run_mavros.sh）开机拉起，
+    fusion.sh、start_handheld_test.sh 都不再起 MAVROS，只用它。
     帧名不能在 roslaunch 之前用 rosparam set 预先设好：node.launch 给 mavros 节点开了 clear_params，
     启动时会清掉 /mavros 下的旧参数。写在同一个 roslaunch 里就没问题——roslaunch 先清、再统一设参数，
     同名的项以后加载的这份为准。
     参数和 px4.launch 一样，默认值也照它（板端 px4.launch 已改成 /dev/ttyS3:921600、v1.0）。
+
+    本地口 gcs_url：串口一直被 MAVROS 占着，fc_set_time.py 校时改走这个口（MAVROS 原样转发 MAVLink）。
+    只绑 127.0.0.1，局域网连不上。gcs_quiet_mode：只在最近 conn/timeout（px4_config.yaml 是 10 s）内
+    收到过本地口的消息时才往外转发，没人用时不白转（10-30 实测停发后约 10 s 停，只剩 1 Hz 心跳）。
+    respawn_mavros 默认 false：节点是 required，一退 roslaunch 跟着退，由 systemd 重启整个服务。
   -->
   <arg name="fcu_url"        default="/dev/ttyS3:921600"/>
-  <arg name="gcs_url"        default=""/>
+  <arg name="gcs_url"        default="udp://127.0.0.1:14555@"/>
+  <arg name="gcs_quiet_mode" default="true"/>
   <arg name="tgt_system"     default="1"/>
   <arg name="tgt_component"  default="1"/>
   <arg name="log_output"     default="screen"/>
@@ -25,4 +32,5 @@
     <arg name="respawn_mavros" value="$(arg respawn_mavros)"/>
   </include>
   <rosparam command="load" ns="mavros" file="$(dirname)/mavros_frames.yaml"/>
+  <param name="mavros/gcs_quiet_mode" value="$(arg gcs_quiet_mode)"/>
 </launch>

@@ -21,6 +21,20 @@ Fixed Frame `map`，彩色先验地图 + 白色实时点云，三维里有 map�
 说明见 `drone_relocalization` 包 README「RViz 对照显示（本机）」。两个 Image 面板都走 compressed，
 启动时 RViz 会报一条 `Tried to advertise a service that is already advertised ... /rviz/compressed/set_parameters`，是两个面板共用 compressed 参数服务，不影响显示。
 
+## 无人机状态桥（网页无人机面板）
+
+```bash
+./scripts/run_drone_status.sh          # 后台起容器 drone_status；--fg 前台看日志，--stop 停
+curl -s http://127.0.0.1:8091/status   # 汇总好的 JSON
+```
+
+`local_view/drone_status.py` 在容器里只读订阅板端常驻 MAVROS 的低频话题（state、battery、sys_status、extended_state、
+estimator_status、statustext、送给飞控的视觉位姿），加上每 2 s 问一次板端 master（fusion 核心节点在不在、MAVROS 有没有重启），
+汇总成一份 JSON，带“可以起飞 / 不可起飞”的判断。板端不加进程，只多一个订阅者；本节点不发布、不调服务、不写参数。
+页面是 orange 仓库的 `tools/car_web`（顶栏“无人机”“机电量”，点“无人机”展开），默认取 `http://<打开页面的主机>:8091/status`，
+手机经台式机 IP 打开也能用。镜像里没有 mavros_msgs，节点按发布者连接头里的消息定义现场解析，不用重建镜像。
+板端没开时照样起，页面显示“连不上板端”；板端重启（master 换了）节点自己重来。本机换网后 ROS_IP 变了，要重跑一次。
+
 ## 两台电脑共用一份仓库
 
 公共脚本、Dockerfile、默认 RViz 配置正常提交和同步；每台电脑单独配置驱动、Docker 和 NVIDIA runtime。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""飞控校时：趁 MAVROS 还没占用串口，把板端 UTC 时间写进飞控 RTC。
+"""飞控校时：经常驻 MAVROS 的本地口，把板端 UTC 时间写进飞控 RTC。
 
 背景（2026-10-16 实测）：Pixhawk 6C 上 PX4 1.16 固件的 RTC 用 HSE 计时
 （CONFIG_STM32H7_RTC_HSECLOCK），飞控断电时 RTC 停走，数值靠备份电源保留，开机后接着走，
@@ -11,14 +11,20 @@
 
 只影响 ulog 文件名、日期这类 UTC 时间；EKF 融合用的是飞控开机时间 + TIMESYNC，不受影响。
 
-用法: fc_set_time.py [--dev /dev/ttyS3] [--baud 921600] [--tolerance 1.0] [--check]
+连接：串口 /dev/ttyS3 一直被常驻 MAVROS（mid360s-mavros.service）占着，默认改连它的本地口
+udp 127.0.0.1:14555（mavros.launch 的 gcs_url，MAVROS 原样转发 MAVLink）。这个口开了 gcs_quiet_mode：
+MAVROS 收到第一个包才知道往哪回，而且最近 10 s 内收到过本地口的消息才转发，所以收包前每隔 1 s
+补一个 PING 保活。不能发心跳：PX4 会把 GCS 类型的心跳当成地面站连上，脚本走后又判地面站丢失，
+NAV_DLL_ACT>0 时拦解锁。MAVROS 停着时也可以 --dev /dev/ttyS3 直连串口。
+
+用法: fc_set_time.py [--dev udpout:127.0.0.1:14555 | /dev/ttyS3] [--baud 921600] [--tolerance 1.0] [--check]
+  --dev        默认 MAVROS 本地口；串口时 --baud 才有用
   --tolerance  偏差在这个范围内（秒）就不写；date -s 只有秒精度，默认 1.0
   --check      只读偏差，不写
 退出码: 0 已写入并核对通过，或本来就在容差内 / --check 读到了偏差
         1 失败（没心跳、没 SYSTEM_TIME、shell 无回显、核对不过、板端时间明显不对）
         2 飞控已解锁，跳过    3 缺 pymavlink    143 被 SIGTERM 停下（已关掉 shell）
-直接占用串口，MAVROS 运行时不要用。板端时间是否可信由调用方负责：fusion.sh 只在
-chrony 已对上时才调用。
+板端时间是否可信由调用方负责：fusion.sh 只在 chrony 已对上时才调用。
 """
 
 import argparse
@@ -43,6 +49,31 @@ BOARD_TIME_SANE = 1.7e9   # 2023-11 以前的板端时间肯定不对，不往�
 def fail(msg):
     print(msg)
     sys.exit(1)
+
+
+def keep_local_port_open(m):
+    """经 MAVROS 本地口时，让 m.recv_match 每次等包前隔 1 s 补一个 PING（只发 PING，不发心跳，原因见文件头）。
+    阻塞等待拆成 0.5 s 一段，等得再久也不会断了保活。10-30 实测经本地口校时和直连串口结果一样。"""
+    recv, last = m.recv_match, [0.0]
+
+    def ping():
+        if time.time() - last[0] >= 1.0:
+            m.mav.ping_send(int(time.time() * 1e6), 0, 0, 0)
+            last[0] = time.time()
+
+    def recv_match(condition=None, type=None, blocking=False, timeout=None):
+        if not blocking:
+            ping()
+            return recv(condition=condition, type=type, blocking=False)
+        t_end = time.time() + (1e9 if timeout is None else timeout)
+        while True:
+            ping()
+            msg = recv(condition=condition, type=type, blocking=True,
+                       timeout=min(0.5, max(0.0, t_end - time.time())))
+            if msg is not None or time.time() >= t_end:
+                return msg
+
+    m.recv_match = recv_match
 
 
 def wait_autopilot_heartbeat(m, timeout):
@@ -89,12 +120,14 @@ def fmt_off(off):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--dev", default="/dev/ttyS3")
+    p.add_argument("--dev", default="udpout:127.0.0.1:14555")
     p.add_argument("--baud", type=int, default=921600)
     p.add_argument("--tolerance", type=float, default=1.0)
     p.add_argument("--check", action="store_true")
     a = p.parse_args()
 
+    local_port = a.dev.startswith("udp")
+    link = a.dev if local_port else "%s @ %d" % (a.dev, a.baud)
     if time.time() < BOARD_TIME_SANE:
         fail("板端时间明显不对（%s），不往飞控写" % time.strftime("%F %T"))
     try:
@@ -103,10 +136,12 @@ def main():
                                        autoreconnect=False)
     except Exception as e:  # 串口打不开（权限、被占用）
         fail("打不开 %s：%s" % (a.dev, e))
+    if local_port:
+        keep_local_port_open(m)
 
     hb = wait_autopilot_heartbeat(m, 5.0)
     if hb is None:
-        fail("5 s 内没收到飞控心跳（%s @ %d）" % (a.dev, a.baud))
+        fail("5 s 内没收到飞控心跳（%s%s）" % (link, "；常驻 MAVROS 没在跑？" if local_port else ""))
     sysid = hb.get_srcSystem()
     before = clock_offset(m, sysid)
     if before is None:

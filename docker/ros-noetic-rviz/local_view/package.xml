@@ -2,7 +2,7 @@
 <package format="2">
   <!-- 本机 docker 里跑的显示节点，不 catkin 编译：run_rviz.sh 把这个目录加进 ROS_PACKAGE_PATH，roslaunch 直接找 scripts/。 -->
   <name>local_view</name><version>0.1.0</version>
-  <description>本机 RViz 的显示辅助节点（二维车图、标签、定位状态文字）。只读板端话题和车端 rosbridge，板端不跑任何显示节点。</description>
+  <description>本机 RViz 的显示辅助节点（二维车图、标签、定位状态文字），以及给网页无人机面板用的只读状态桥 drone_status（run_drone_status.sh 起）。只读板端话题和车端 rosbridge，板端不跑任何显示节点。</description>
   <maintainer email="kawhi224@gmail.com">junhengsect</maintainer><license>GPLv2</license>
   <buildtool_depend>catkin</buildtool_depend>
 </package>

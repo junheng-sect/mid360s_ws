@@ -189,7 +189,7 @@ drone_odom ──静态(q_a)──> camera_init ──FAST-LIO──> body ─�
 
 帧名 10-21 改过：`world` → `drone_odom`，`base_link` → `drone_base`。改名前录的包仍能读，drone_relocalization 和
 drone_mapping 遇到旧名会按新名处理；话题名（`/fastlio/odom_world` 等）和地图文件名不变。MAVROS 统一经
-`scripts/launch/mavros.launch` 启动，它的帧名同时换成 `px4_map` / `px4_odom` / `drone_base`（见同目录
+`scripts/launch/mavros.launch` 启动（由常驻服务 `mid360s-mavros` 拉起），它的帧名同时换成 `px4_map` / `px4_odom` / `drone_base`（见同目录
 `mavros_frames.yaml`），辅助帧 `drone_base → drone_base_frd` 挂在同一个机体上。
 
 安装旋转 `q_IB`（`body ← drone_base`，即把机体系向量转到雷达 IMU 系）由 `mounting_source` 决定：
@@ -302,16 +302,34 @@ roslaunch mid360s_calib calib_record.launch
 - 提交与构建均在板端完成，构建产物、本地安装的 SDK、运行日志、bag 包及 PCD 文件默认被 `.gitignore` 忽略，不污染代码仓库。
 
 
+## 常驻 roscore / MAVROS（开机自启）
+
+roscore 和 MAVROS 是开机就起的两个 systemd 服务，fusion 没跑时也连着飞控（网页状态页靠它读电量、
+是否 ready 等）。`fusion.sh`、`start_handheld_test.sh`、实机建图都只用它们、不起不停。
+
+| 服务 | 做什么 |
+|---|---|
+| `mid360s-roscore` | 常驻 master，板内固定地址 `10.250.32.1`（master 走 `127.0.0.1:11311`），等 ros0 地址起来再起 |
+| `mid360s-mavros` | 常驻 MAVROS，走 `scripts/launch/mavros.launch`：飞控 `/dev/ttyS3:921600`，另开只绑 `127.0.0.1` 的本地口 udp `14555`（quiet mode） |
+
+- 安装 / 更新 / 卸载：`scripts/resident/install.sh`（`--uninstall` 卸载）；只有 `.service` 改了才要重跑，
+  launch 或启动脚本改了 `sudo systemctl restart mid360s-roscore`（MAVROS 跟着重启）。
+- 看状态和日志：`systemctl status mid360s-roscore mid360s-mavros`，`journalctl -u mid360s-mavros -n 50`。
+- MAVROS 退出由 systemd 自动重启；fusion 运行中盯着 `mavros_node` 的 PID，变了就告警（时间同步要重新收敛，在飞应降落）。
+- 串口一直被 MAVROS 占着：飞控校时 `fc_set_time.py` 默认经本地口；要直连串口（比如 pymavlink 调试）先
+  `sudo systemctl stop mid360s-mavros`，用完 `start`。
+- 常驻 master 的参数会一直留着；fusion 启动前检查 `/use_sim_time` 不是 true。
+
 ## fusion 系留控制开关
 
-板端默认启动定位、MAVROS、RC录包以及绕线器控制：
+板端默认启动定位、RC录包以及绕线器控制（MAVROS 开机常驻，见上一节）：
 
 ```bash
 cd /home/orangepi/mid360s_ws/scripts
 ./fusion.sh
 ```
 
-非系留测试关闭绕线器；仍保留定位、MAVROS和RC录包：
+非系留测试关闭绕线器；仍保留定位和RC录包：
 
 ```bash
 ./fusion.sh --no-winch

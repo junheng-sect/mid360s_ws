@@ -33,8 +33,8 @@ rosrun drone_mapping build_map --algo fastlio ...   # 旧做法：FAST-LIO 存 s
 
 流程（默认 `--algo voxelslam`）：
 
-1. 前置检查（同以前）：雷达网口和 ping、没有 ROS master 和冲突进程、磁盘、进程锁、等 chrony 对上；
-   `--bag` 离线时不要求没有 master（Voxel-SLAM 用自己的 master）。
+1. 前置检查：雷达网口和 ping、没有冲突进程（11311 上开机常驻的 master 和 MAVROS 照用）、磁盘、进程锁、等 chrony 对上；
+   `--bag` 离线 Voxel-SLAM 不碰 11311，用自己的 master。
 2. 实机：驱动 + FAST-LIO + 重力桥 + `rosbag record` 录 `raw.bag`；FAST-LIO 初始化完成后再静止 3 s 才提示可以走。
 3. Ctrl+C（SIGTERM、ssh 断开的 SIGHUP 也一样）：先停录包，再停 roslaunch，`raw.bag` 落盘。
 4. 离线 Voxel-SLAM（`drone_mapping/voxelslam.py`）：在 127.0.0.1 的空闲端口上起独立 roscore，

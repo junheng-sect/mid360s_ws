@@ -1,31 +1,19 @@
 <launch>
   <!--
-    手动调试用的合集：一条 roslaunch 起 定位核心 + MAVROS + 录包 / 绕线器。
-    实机请用入口脚本 /home/orangepi/mid360s_ws/scripts/fusion.sh：它把这三组分成单独的 roslaunch，并先起
-    roscore、冻结板端时钟，核心（fusion_core.launch）带 required 整组进退，MAVROS 和附属节点自动重启、
-    退出不连带核心。本文件里没有 required，任一节点退出不会停掉其余节点，也不冻结时钟。
+    手动调试用的合集：一条 roslaunch 起 定位核心 + 录包 / 绕线器。MAVROS 和 roscore 是开机常驻的
+    systemd 服务（scripts/resident/），这里不再 include mavros.launch，否则会和常驻 MAVROS 抢串口。
+    实机请用入口脚本 /home/orangepi/mid360s_ws/scripts/fusion.sh：它把这两组分成单独的 roslaunch，
+    冻结板端时钟，核心（fusion_core.launch）带 required 整组进退，附属节点退出不连带核心，并盯着常驻
+    MAVROS 有没有重启。本文件里没有 required，任一节点退出不会停掉其余节点，也不冻结时钟。
     手动启动的完整命令见 fusion.sh 头部注释（关键是先 source scripts/ros_net.sh，再把 scripts 加进
     ROS_PACKAGE_PATH）。相机预览不在本文件：见 camera.launch。
   -->
-  <arg name="fcu_url"        default="/dev/ttyS3:921600"/>
-  <arg name="fcu_protocol"   default="v1.0"/>
-  <arg name="tgt_system"     default="1"/>
-  <arg name="tgt_component"  default="1"/>
   <arg name="send_to_mavros" default="true"/>
   <arg name="record"         default="true"/>
   <arg name="winch"          default="true"/>
   <arg name="bag_prefix"     default="noprop"/>
   <arg name="bag_dir"        default="/home/orangepi/test_data/bags"/>
 
-  <include file="$(dirname)/mavros.launch">
-    <arg name="fcu_url"        value="$(arg fcu_url)"/>
-    <arg name="fcu_protocol"   value="$(arg fcu_protocol)"/>
-    <arg name="tgt_system"     value="$(arg tgt_system)"/>
-    <arg name="tgt_component"  value="$(arg tgt_component)"/>
-    <arg name="gcs_url"        value=""/>
-    <arg name="log_output"     value="screen"/>
-    <arg name="respawn_mavros" value="true"/>
-  </include>
   <include file="$(dirname)/fusion_core.launch">
     <arg name="send_to_mavros" value="$(arg send_to_mavros)"/>
   </include>

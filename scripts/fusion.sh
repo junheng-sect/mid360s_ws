@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 融合快速启动（fusion）：roscore + 几个单独的 roslaunch 拉起整条链路
+# 融合快速启动（fusion）：在常驻 roscore / MAVROS 上，用几个单独的 roslaunch 拉起整条链路
 #   定位核心（required，整组进退）：MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接(位姿送飞控)
-#   + MAVROS(飞控串口，节点自动重启) + 附属（RC 通道 6 触发录包自动重启、系留绕线器不重启）
+#   + 附属（RC 通道 6 触发录包自动重启、系留绕线器不重启）；MAVROS 开机常驻，不归本脚本起停
 #   + 系留绕线器默认开启（非系留使用 --no-winch）
 #   + OV13855 相机预览（独立 roslaunch，见 launch/camera.launch）
 #
 # 路径: /home/orangepi/mid360s_ws/scripts/fusion.sh
-# launch: scripts/launch/ 下 fusion_core / mavros / fusion_aux / camera（fusion.launch 是手动合集）
+# launch: scripts/launch/ 下 fusion_core / fusion_aux / camera（fusion.launch 是手动合集）
 # 用法: ./fusion.sh [选项]
 #   --no-record         不启动 RC 触发录包节点（本次不会有 bag）
 #   --no-winch          不启动绕线器控制（非系留测试）
@@ -22,39 +22,38 @@
 #      不跟随 Wi-Fi；本机 RViz 经到 10.250.32.1 的路由访问，换网只影响远程连接。
 #   2. 时钟：启动前最多等 60 s 让 chrony 对时，没外网就按板端本地时间继续（标 UTC 未同步、不给飞控校时）；
 #      核心起来前停掉 chronyd、收尾后再启动（clock_guard.sh），运行中系统时间不跳、不调速。
-#   3. 进程：roscore 单独起，不随任何 roslaunch 进退；定位核心（fusion_core.launch）带 required，任一节点
-#      退出整组停下、本脚本以失败退出、不自动重启（重启会重置 drone_odom 原点）；MAVROS（mavros.launch）
-#      与附属（fusion_aux.launch）里的录包节点 respawn，退出只重启自己、不连带核心；绕线器不 respawn
-#      （auto_enable: true，重启会丢人工禁用 / FAULT 锁存而重新自动使能），退出后只告警。
+#   3. 进程：roscore 和 MAVROS 是开机常驻的 systemd 服务（scripts/resident/，mid360s-roscore / mid360s-mavros），
+#      本脚本只用不起不停，fusion 没跑时也连着飞控（网页状态页靠它）。定位核心（fusion_core.launch）带 required，
+#      任一节点退出整组停下、本脚本以失败退出、不自动重启（重启会重置 drone_odom 原点）；附属（fusion_aux.launch）
+#      里的录包节点 respawn，退出只重启自己、不连带核心；绕线器不 respawn（auto_enable: true，重启会丢人工禁用 /
+#      FAULT 锁存而重新自动使能），退出后只告警。MAVROS 退出由 systemd 重启；本脚本盯着 mavros_node 的 PID，
+#      运行中变了就告警：重启后与飞控的时间同步要重新收敛，期间外部定位时间戳可能不准，看到告警应降落。
 #      收尾时按环境变量标记（clock_guard.sh 的 clock_env）收拢 roslaunch 被强杀后留下的孤儿节点，全退了才恢复 chronyd。
-#      MAVROS 重启后与飞控的时间同步要重新收敛，期间外部定位时间戳可能不准，看到重启告警应降落。
 #
-# 前置检查：环境文件（ROS/工作空间 + rospack 找包）、飞控串口权限、防重复启动（锁 + 残留
-# 进程/节点）、板内固定地址、板端时钟。之后用 fc_set_time.py 把板端时间写进飞控 RTC（只影响
-# ulog 文件名/日期；板端没对上或飞控已解锁时跳过，失败只告警）。
+# 前置检查：环境文件（ROS/工作空间 + rospack 找包）、常驻 roscore / MAVROS、防重复启动（锁 + 残留
+# 进程/节点）、板内固定地址、板端时钟。之后用 fc_set_time.py 经 MAVROS 本地口把板端时间写进飞控 RTC
+# （只影响 ulog 文件名/日期；板端没对上或飞控已解锁时跳过，失败只告警）。
 # 不 ping 雷达、不拉取核对飞控参数、不逐话题测频、不等 EKF 就绪 —— 要逐项体检请用同目录
 # start_handheld_test.sh；两个入口共用 /tmp/mid360s_fusion.lock，互相排斥。
 #
-# 手动启动（不经本脚本，没有时钟冻结；launch 里的注释指的就是这段）：
+# 手动启动（不经本脚本，没有时钟冻结；launch 里的注释指的就是这段；roscore / MAVROS 已常驻）：
 #   cd /home/orangepi/mid360s_ws
 #   source scripts/ros_net.sh && source /opt/ros/noetic/setup.bash && source devel/setup.bash
 #   source /home/orangepi/orange/devel/setup.bash --extend
 #   export ROS_PACKAGE_PATH="$PWD/scripts:$ROS_PACKAGE_PATH"   # rc_record 靠它定位
-#   roscore &                                                   # 然后分别：
-#   roslaunch --screen --required scripts/launch/fusion_core.launch
-#   roslaunch --screen scripts/launch/mavros.launch respawn_mavros:=true
+#   roslaunch --screen --required scripts/launch/fusion_core.launch      # 然后另开终端：
 #   roslaunch --screen scripts/launch/fusion_aux.launch
 #
-# 前台运行。每个 roslaunch / roscore 都放进独立会话，信号只由本脚本统一转发：Ctrl+C / SIGTERM
-# 按 相机 → 附属（录包节点先把 bag 收尾写索引）→ 核心 → MAVROS → roscore 的顺序各发一次 SIGINT。
+# 前台运行。每个 roslaunch 都放进独立会话，信号只由本脚本统一转发：Ctrl+C / SIGTERM
+# 按 相机 → 附属（录包节点先把 bag 收尾写索引）→ 核心 的顺序各发一次 SIGINT。
 # 所有等待都是短轮询（≤ 3 s 一轮）并顺带检查核心是否还活着，所以启动/等首帧/稳态各阶段收到
 # 信号都能及时收尾。收尾后校验本次生成的 bag 索引是否读得出来，最后按信号返回 130 / 143；
 # 核心 roslaunch 自己退出时透传它的退出码，并在「没收到停止信号」时按异常返回 1（补掉 roslaunch
-# 对 required 节点退出也返回 0 的坑）。本脚本不改飞控参数、不改源码、不做开机自启；
+# 对 required 节点退出也返回 0 的坑）。本脚本不改飞控参数、不改源码、本身不做开机自启；
 # 信号处理与退出码按后续接入 systemd 的需要保留。
 #
 # 相机预览在核心节点注册后拉起，输出只进单独日志；相机掉帧超时节点会退出，所以不并进核心组。
-# 相机、附属、MAVROS 起不来或中途退出只告警，不影响核心与退出码。
+# 相机、附属起不来或中途退出、MAVROS 不在或重启都只告警，不影响核心与退出码。
 # ==============================================================================
 set -o pipefail
 
@@ -64,7 +63,6 @@ ROS_SETUP="/opt/ros/noetic/setup.bash"
 WS_SETUP="$WS/devel/setup.bash"
 ORANGE_SETUP="/home/orangepi/orange/devel/setup.bash"
 CORE_LAUNCH="$DIR/launch/fusion_core.launch"
-MAVROS_LAUNCH="$DIR/launch/mavros.launch"
 AUX_LAUNCH="$DIR/launch/fusion_aux.launch"
 CAMERA_LAUNCH="$DIR/launch/camera.launch"
 FC_TIME_PY="$DIR/fc_set_time.py"
@@ -77,9 +75,9 @@ LOCK_FILE="/tmp/mid360s_fusion.lock"
 source "$DIR/ros_net.sh" || exit 1
 # 核心运行期间冻结板端时钟（停 chronyd，收尾再启动），见该文件头注释
 source "$DIR/clock_guard.sh"
+# 常驻 roscore / MAVROS 的服务名、MAVROS 本地口（FC_LOCAL_URL）和 mavros_pid / resident_proc
+source "$DIR/resident/resident.sh"
 
-TTY="/dev/ttyS3"
-FCU_URL="${TTY}:921600"
 NODES_TIMEOUT=90      # 等全部节点注册（秒）
 READY_TIMEOUT=180     # 等首帧 /fastlio/odom_world（秒）
 READY_POLL=3          # 等首帧时每轮阻塞上限（秒）：短轮询，好让信号能及时被处理
@@ -119,9 +117,7 @@ LOGFILE="$LOG_DIR/fusion_${STAMP}.log"
 # 本次运行专属目录：放 roslaunch 身份文件和 bag 清单，退出时整个删掉，
 # 与上一次运行的文件彻底隔离，不会读到历史残留。
 RUN_DIR="$(mktemp -d /tmp/mid360s_fusion.XXXXXX)"
-ROSCORE_PIDFILE="$RUN_DIR/roscore.pid"
 CORE_PIDFILE="$RUN_DIR/core.pid"
-MAVROS_PIDFILE="$RUN_DIR/mavros.pid"
 AUX_PIDFILE="$RUN_DIR/aux.pid"
 WATCH_PIDFILE="$RUN_DIR/watch.pid"
 WATCH_CSV="$LOG_DIR/core_watch_${STAMP}.csv"
@@ -167,9 +163,11 @@ while [ "$_pp" -gt 1 ]; do
   _pp="$_parent"
 done
 
+# 常驻服务里的进程（roscore、MAVROS 的 roslaunch / mavros_node）不算残留，按 cgroup 排除
 alive() {
   for _pid in $(pgrep -f "$1" 2>/dev/null); do
     case "$SELF_PIDS" in *" $_pid "*) continue ;; esac
+    resident_proc "$_pid" && continue
     return 0
   done
   return 1
@@ -190,7 +188,9 @@ printf 'fusion.sh pid=%s start=%s\n' "$$" "$STAMP" >&200
 CORE_SETSID_PID=""    # 核心 roslaunch 的 setsid --wait 包装进程：最后 wait 它拿退出码
 SHUTTING_DOWN=0
 MISSING_NODES=""
-FC_TIME_PID=""        # 飞控校时脚本（timeout 包装）的 PID，收尾时停掉它以释放串口
+FC_TIME_PID=""        # 飞控校时脚本（timeout 包装）的 PID，收尾时停掉它（它会先关掉飞控上的 MAVLink shell）
+MAVROS_PID0=""        # 核心启动时常驻 mavros_node 的 PID；运行中变了说明 MAVROS 重启过
+MAVROS_SEEN=""        # 已经告警过的 mavros_node PID（含空串＝不在运行），同一状态只报一次
 
 # /proc/<pid>/stat 的第 22 个字段 = 进程启动时刻（自开机起的 tick 数）。comm 字段可能
 # 含空格和括号，所以先贪婪砍到最后一个 ')' 再数第 20 个字段。exec 不改变 PID 与启动时刻，
@@ -218,7 +218,7 @@ SPAWN_WRAPPER='
 # 由收尾统一发一次 SIGINT，避免重复信号打断 roslaunch 的收尾流程。OUT=tee 时输出进终端和主日志
 # （tee 忽略 SIGINT：否则 Ctrl+C 会先杀掉 tee，roslaunch 再写日志就吃 SIGPIPE），否则追加进该文件。
 # SPAWN_PID 是 setsid --wait 包装进程（wait 它拿得到命令的退出码）；等 pidfile 落地最多 12 s。
-# 冻结时钟的锁（fd 201）随之被继承；另按 pidfile 名（core / mavros …）打上 clock_env 环境变量标记，
+# 冻结时钟的锁（fd 201）随之被继承；另按 pidfile 名（core / aux …）打上 clock_env 环境变量标记，
 # 一路继承到 roslaunch 用 setsid 起的节点：roslaunch 被强杀留下的孤儿节点收尾时据此找回来。
 spawn() {
   local _pf="$1" _out="$2" _i=0
@@ -296,15 +296,29 @@ stop_leader() {
   return 1
 }
 
-# 收尾顺序：相机 → 附属（录包节点先把 bag 收尾写索引）→ 核心 → MAVROS → roscore
-# （master 最后停，先停它会让其余节点注销时卡住）
+# 收尾顺序：相机 → 附属（录包节点先把 bag 收尾写索引）→ 核心 → 监控。
+# roscore 和 MAVROS 是常驻服务，不停。
 stop_all() {
   stop_proc "相机 roslaunch" "$CAM_PIDFILE" 15
   stop_proc "附属 roslaunch（录包节点会先把 bag 收尾）" "$AUX_PIDFILE" "$STOP_TIMEOUT"
   stop_proc "核心 roslaunch" "$CORE_PIDFILE" "$STOP_TIMEOUT"
-  stop_proc "MAVROS roslaunch" "$MAVROS_PIDFILE" "$STOP_TIMEOUT"
   stop_proc "数据连续性监控（退出时打印最终汇总）" "$WATCH_PIDFILE" 10
-  stop_proc "roscore" "$ROSCORE_PIDFILE" 15
+}
+
+# 常驻 MAVROS 的状态，运行中每轮调用：mavros_node 不在或 PID 跟核心启动时不同就告警，同一状态只报一次。
+# MAVROS 重启后与飞控的时间同步要重新收敛，期间送给飞控的外部定位时间戳可能不准。
+check_mavros() {
+  local _p
+  _p="$(mavros_pid)"
+  [ "$_p" = "$MAVROS_SEEN" ] && return 0
+  MAVROS_SEEN="$_p"
+  if [ -z "$_p" ]; then
+    warn "常驻 MAVROS 不在运行（systemd 会重启它）：飞控暂时收不到外部定位"
+  elif [ -z "$MAVROS_PID0" ]; then
+    warn "常驻 MAVROS 起来了（pid $_p）：时间同步刚开始收敛，起飞前确认 EKF 已接受外部定位"
+  elif [ "$_p" != "$MAVROS_PID0" ]; then
+    warn "常驻 MAVROS 重启过（pid ${MAVROS_PID0:-无} → $_p）：时间同步要重新收敛，外部定位时间戳可能不准，在飞应降落"
+  fi
 }
 
 # 相机预览：单独的 roslaunch，不带 required。输出只进单独日志，避免 15 Hz 相机日志刷屏主终端。
@@ -338,8 +352,6 @@ start_camera() {
 verify_clean() {
   hr; log "收尾检查"
   local _left=""
-  alive "rosmaste[r]"            && _left="$_left rosmaster"
-  alive "mavros_nod[e]"          && _left="$_left mavros_node"
   alive "livox_ros_driver2_nod[e]" && _left="$_left livox_ros_driver2_node"
   alive "fastlio_mappin[g]"      && _left="$_left fastlio_mapping"
   alive "gravity_bridge_nod[e]"  && _left="$_left gravity_bridge_node"
@@ -354,7 +366,7 @@ verify_clean() {
   fi
   if [ -n "$_left" ]; then
     warn "仍有节点进程残留：$_left"
-    warn "核对：ps -eo pid,args | grep -E 'rosmaster|mavros_node|livox_ros_driver2_node|fastlio_mapping|gravity_bridge_node|bag_recorder_node|tether_winch_node|ov13855_'"
+    warn "核对：ps -eo pid,args | grep -E 'livox_ros_driver2_node|fastlio_mapping|gravity_bridge_node|bag_recorder_node|tether_winch_node|ov13855_'"
   else
     ok "链路节点已全部退出"
   fi
@@ -389,17 +401,11 @@ verify_clean() {
     fi
   fi
 
-  if ss -ltn 2>/dev/null | grep -q 11311; then
-    warn "11311 仍在监听（可能是别的 ROS Master）"
+  # roscore / MAVROS 本来就该常驻，只报一下它们还在
+  if unit_active "$RESIDENT_ROSCORE_UNIT" && [ -n "$(mavros_pid)" ]; then
+    ok "常驻 roscore / MAVROS 照常运行"
   else
-    ok "11311 未监听"
-  fi
-  if command -v fuser >/dev/null 2>&1; then
-    if fuser "$TTY" >/dev/null 2>&1; then
-      warn "$TTY 仍被占用"
-    else
-      ok "$TTY 空闲"
-    fi
+    warn "常驻服务有不在的：systemctl status $RESIDENT_ROSCORE_UNIT $RESIDENT_MAVROS_UNIT"
   fi
 }
 
@@ -410,10 +416,10 @@ on_signal() {
     return
   fi
   SHUTTING_DOWN=1
-  hr; warn "收到 SIG$_sig：只收拢本次启动的 roscore / roslaunch"
+  hr; warn "收到 SIG$_sig：只收拢本次启动的 roslaunch（常驻 roscore / MAVROS 不停）"
   if [ -n "$FC_TIME_PID" ]; then
     # timeout 把 SIGTERM 转给校时脚本，脚本先关掉飞控上的 MAVLink shell 再退出（< 1 s）；
-    # 等它放开串口，下面的收尾检查才不会误报串口被占用
+    # 等它退干净，免得 shell 一直开在飞控上
     log "停止飞控校时脚本（pid=$FC_TIME_PID）"
     kill -TERM "$FC_TIME_PID" 2>/dev/null
     while kill -0 "$FC_TIME_PID" 2>/dev/null && [ "$_i" -lt 15 ]; do
@@ -436,11 +442,11 @@ esac
 
 # ============================================================== 前置检查 =====
 hr; log "融合快速启动（日志：$LOGFILE）"
-hr; log "步骤 1/3：前置检查（环境 / 串口 / 防重复启动 / 板端时钟）"
+hr; log "步骤 1/3：前置检查（环境 / 常驻 roscore 与 MAVROS / 防重复启动 / 板端时钟）"
 
 [ -f "$ROS_SETUP" ] || { err "缺少 $ROS_SETUP"; exit 1; }
 [ -f "$WS_SETUP" ]  || { err "缺少 $WS_SETUP，请先在板端 catkin build"; exit 1; }
-for f in "$CORE_LAUNCH" "$MAVROS_LAUNCH" "$AUX_LAUNCH"; do
+for f in "$CORE_LAUNCH" "$AUX_LAUNCH"; do
   [ -f "$f" ] || { err "缺少 $f"; exit 1; }
 done
 if [ "$DO_CAMERA" -eq 1 ]; then
@@ -475,15 +481,28 @@ if [ "$DO_CAMERA" -eq 1 ]; then
 fi
 ok "ROS Noetic 与所选功能包齐备"
 
-[ -c "$TTY" ] || { err "飞控串口 $TTY 不存在"; exit 1; }
-if [ -w "$TTY" ]; then
-  ok "飞控串口 $TTY 存在且可写（$FCU_URL）"
+# roscore / MAVROS 是开机常驻服务（scripts/resident/install.sh 装的），这里只确认它们在。
+# master 起不来就不启动；MAVROS 不在或没连上飞控只告警（和以前 MAVROS 起不来一样，核心照常运行）。
+if ! unit_active "$RESIDENT_ROSCORE_UNIT" || ! timeout 5 rosnode list >/dev/null 2>&1; then
+  err "常驻 roscore 不可达：systemctl status $RESIDENT_ROSCORE_UNIT（没装过就跑 $DIR/resident/install.sh）"
+  exit 1
+fi
+ok "常驻 roscore 可达（master 走 127.0.0.1:11311）"
+# 常驻 master 的参数会一直留着：离线回放之类留下 /use_sim_time=true，核心节点就会干等 /clock
+if [ "$(timeout 5 rosparam get /use_sim_time 2>/dev/null)" = "true" ]; then
+  err "常驻 master 上 /use_sim_time=true（多半是回放留下的）：rosparam set /use_sim_time false 后再启动"
+  exit 1
+fi
+if [ -z "$(mavros_pid)" ]; then
+  warn "常驻 MAVROS 不在运行（systemctl status $RESIDENT_MAVROS_UNIT）：核心照常起，飞控收不到外部定位"
+elif timeout 5 rostopic echo -n1 /mavros/state 2>/dev/null | grep -q "connected: True"; then
+  ok "常驻 MAVROS 已连上飞控（mavros_node pid $(mavros_pid)）"
 else
-  err "$TTY 不可写（检查 dialout 组权限）"; exit 1
+  warn "常驻 MAVROS 在跑但没连上飞控（飞控没上电？）：核心照常起，飞控收不到外部定位"
 fi
 
 stale=""
-for pat in "rosmaste[r]" "roslaunc[h]" "mavros_nod[e]" "livox_ros_driver2_nod[e]" \
+for pat in "roslaunc[h]" "livox_ros_driver2_nod[e]" \
            "fastlio_mappin[g]" "gravity_bridge_nod[e]" "bag_recorder_node.p[y]" "core_watch.p[y]"; do
   alive "$pat" && stale="$stale ${pat//[\[\]]/}"
 done
@@ -499,25 +518,21 @@ if [ -n "$stale" ]; then
   err "上一次实例可能没退干净，先收尾（Ctrl+C 或 kill -INT <roslaunch pid>）再启动"
   exit 1
 fi
-ok "无残留 ROS 进程"
+ok "无残留 ROS 进程（常驻服务除外）"
 
-if timeout 5 rosnode list >/dev/null 2>&1; then
-  _nodes="$(timeout 5 rosnode list 2>/dev/null)"
-  _busy=""
-  _check="$EXPECT_NODES /rc_bag_recorder"
-  [ "$DO_CAMERA" -eq 1 ] && _check="$_check /ov13855_cam /ov13855_full_cam /ov13855_apriltag_vision_node"
-  for n in $_check; do
-    printf '%s\n' "$_nodes" | grep -qx "$n" && _busy="$_busy $n"
-  done
-  if [ -n "$_busy" ]; then
-    err "ROS Master 上已挂着本链路节点：$_busy"
-    err "先停掉旧实例再启动"
-    exit 1
-  fi
-  ok "ROS Master 可达且无本链路节点"
-else
-  log "当前没有 ROS Master，将由本次 roslaunch 创建"
+_nodes="$(timeout 5 rosnode list 2>/dev/null)"
+_busy=""
+_check="${EXPECT_NODES#/mavros } /rc_bag_recorder"   # /mavros 是常驻的，本来就该在
+[ "$DO_CAMERA" -eq 1 ] && _check="$_check /ov13855_cam /ov13855_full_cam /ov13855_apriltag_vision_node"
+for n in $_check; do
+  printf '%s\n' "$_nodes" | grep -qx "$n" && _busy="$_busy $n"
+done
+if [ -n "$_busy" ]; then
+  err "ROS Master 上已挂着本链路节点：$_busy"
+  err "先停掉旧实例再启动"
+  exit 1
 fi
+ok "ROS Master 上没有本链路节点"
 
 # 板端 RTC 掉电不保持：开机先用 fake-hwclock 存的旧时间，chrony 连上外网时间源后
 # 再一次性跳到正确时间（makestep 1 3；实测开机约 30 s 时跳了 +1045 s）。MID-360S 没接
@@ -579,13 +594,13 @@ RUN_START_TS="$(date +%s)"
 
 # ============================================================== 飞控校时 =====
 # Pixhawk 6C 的 RTC 断电停走、开机接着走（每断一次电慢一个断电时长），PX4 又只在自身
-# 时钟早于 2009 年时才接受 MAVROS 的 SYSTEM_TIME，所以趁 MAVROS 还没占用串口，由
-# fc_set_time.py 走 MAVLink shell 执行 date -s 写进飞控 RTC。只影响 ulog 文件名/日期，
-# 不影响融合，所以任何情况都只告警、不拦启动。板端没对上（--allow-unsynced-clock 放行）
+# 时钟早于 2009 年时才接受 MAVROS 的 SYSTEM_TIME，所以由 fc_set_time.py 经常驻 MAVROS 的本地口
+# （FC_LOCAL_URL，串口一直被 MAVROS 占着）走 MAVLink shell 执行 date -s 写进飞控 RTC。只影响 ulog
+# 文件名/日期，不影响融合，所以任何情况都只告警、不拦启动。板端没对上（--allow-unsynced-clock 放行）
 # 时不写，免得把错误时间带给飞控。
 sync_fc_time() {
   local _pid _rc _line
-  hr; log "飞控校时：把板端时间写进飞控 RTC"
+  hr; log "飞控校时：经 MAVROS 本地口把板端时间写进飞控 RTC"
   if [ "$CLOCK_SYNCED" -ne 1 ]; then
     warn "板端时间没对上，跳过飞控校时（本次 ulog 文件名时间可能不准）"
     return 0
@@ -594,13 +609,13 @@ sync_fc_time() {
     warn "缺 $FC_TIME_PY，跳过飞控校时"
     return 0
   fi
-  if command -v fuser >/dev/null 2>&1 && fuser "$TTY" >/dev/null 2>&1; then
-    warn "$TTY 正被别的进程占用，跳过飞控校时"
+  if [ -z "$(mavros_pid)" ]; then
+    warn "常驻 MAVROS 不在运行，跳过飞控校时"
     return 0
   fi
   # 放后台再 wait：等待期间收到 Ctrl+C/SIGTERM 能立即进 on_signal（此时 roslaunch 还没起，
-  # 脚本自带总时限，到时自己退出并释放串口）
-  timeout "$FC_TIME_TIMEOUT" python3 "$FC_TIME_PY" --dev "$TTY" --baud "${FCU_URL##*:}" \
+  # 脚本自带总时限，到时自己退出并关掉飞控上的 shell）
+  timeout "$FC_TIME_TIMEOUT" python3 "$FC_TIME_PY" --dev "$FC_LOCAL_URL" \
     >"$RUN_DIR/fc_time.out" 2>&1 &
   _pid=$!
   FC_TIME_PID="$_pid"
@@ -621,7 +636,7 @@ sync_fc_time() {
 sync_fc_time
 
 # ============================================================== 启动 =========
-hr; log "步骤 2/3：启动 roscore 与核心 / MAVROS / 附属（scripts/launch/）"
+hr; log "步骤 2/3：在常驻 roscore / MAVROS 上启动核心 / 附属（scripts/launch/）"
 if [ "$DO_RECORD" -eq 1 ]; then
   log "录包：RC 通道 6 触发，前缀 $BAG_PREFIX，目录 $BAG_DIR"
   REC_ARG=true
@@ -656,8 +671,8 @@ elif [ "$_rc" -ne 0 ]; then
 fi
 ok "已停 chronyd：运行中系统时钟不跳、不调速，收尾后恢复对时"
 
-# 启动顺序：roscore → 核心 → MAVROS → 附属，各自一个独立会话（spawn），身份按 pidfile 核对。
-# roscore / 核心起不来就收掉已起的进程、以失败退出；MAVROS / 附属起不来只告警，核心照常运行。
+# 启动顺序：监控 → 核心 → 附属，各自一个独立会话（spawn），身份按 pidfile 核对。
+# 核心起不来就收掉已起的进程、以失败退出；附属起不来只告警，核心照常运行。
 start_fail() {
   SHUTTING_DOWN=1
   err "$1"; err "看日志：$LOGFILE"
@@ -665,16 +680,6 @@ start_fail() {
   exit 1
 }
 
-log "启动 roscore（master 走 127.0.0.1:11311，不随任何 roslaunch 进退）"
-spawn "$ROSCORE_PIDFILE" "$LOGFILE" roscore || start_fail "roscore 没能在 12 s 内起来"
-_i=0
-until timeout 3 rosnode list >/dev/null 2>&1; do
-  proc_alive "$ROSCORE_PIDFILE" || start_fail "roscore 起来后又退出了"
-  _i=$((_i + 1))
-  [ "$_i" -lt 15 ] || start_fail "15 s 内 master 没有响应"
-  sleep 1
-done
-ok "master 已就绪（roscore pid=$(proc_pid_now "$ROSCORE_PIDFILE")，ROS_IP=$ROS_IP）"
 # 记下本次 UTC 是否对上：回放 / 分析 bag 时据此判断绝对时间可不可信
 if [ "$CLOCK_SYNCED" -eq 1 ]; then
   rosparam set /fusion/utc_synced true
@@ -694,12 +699,10 @@ spawn "$CORE_PIDFILE" tee roslaunch --screen --required "$CORE_LAUNCH" send_to_m
   || start_fail "核心 roslaunch 没能在 12 s 内起来"
 CORE_SETSID_PID="$SPAWN_PID"
 log "核心 roslaunch pid=$(proc_pid_now "$CORE_PIDFILE")（雷达驱动 / FAST-LIO / 重力桥，任一退出整组停）"
-if spawn "$MAVROS_PIDFILE" tee roslaunch --screen "$MAVROS_LAUNCH" \
-     fcu_url:="$FCU_URL" fcu_protocol:=v1.0 tgt_system:=1 tgt_component:=1 respawn_mavros:=true; then
-  log "MAVROS roslaunch pid=$(proc_pid_now "$MAVROS_PIDFILE")（节点退出自动重启，不连带核心）"
-else
-  warn "MAVROS roslaunch 没能在 12 s 内起来：飞控收不到外部定位（核心照常运行）"
-fi
+# 从这里起盯常驻 MAVROS：mavros_node 的 PID 变了就是重启过（check_mavros）
+MAVROS_PID0="$(mavros_pid)"
+MAVROS_SEEN="$MAVROS_PID0"
+log "常驻 MAVROS：mavros_node pid=${MAVROS_PID0:-不在运行}（运行中重启会告警）"
 if [ "$DO_RECORD" -eq 1 ] || [ "$DO_WINCH" -eq 1 ]; then
   if spawn "$AUX_PIDFILE" tee roslaunch --screen "$AUX_LAUNCH" \
        "record:=$REC_ARG" "winch:=$WINCH_ARG" bag_prefix:="$BAG_PREFIX" bag_dir:="$BAG_DIR"; then
@@ -751,6 +754,7 @@ elif [ "$NODES_RC" -eq 0 ]; then
       _ready=1; break
     fi
     core_alive || break
+    check_mavros
     _t=$((_t + READY_POLL))
   done
   if [ "$_ready" -eq 1 ]; then
@@ -777,7 +781,7 @@ if core_alive; then
   echo "=================================================================="
   echo "  包：$BAG_DIR/${BAG_PREFIX}_000001.bag（每拨一次新增一个序号）"
   echo "  日志：$LOGFILE"
-  echo "  roscore / 核心 / MAVROS / 附属 都在独立会话里，收尾只能靠本脚本"
+  echo "  核心 / 附属都在独立会话里，收尾只能靠本脚本；roscore / MAVROS 常驻，收尾不停"
   echo "  本机 RViz：板内地址 $ROS_IP，经板端 Wi-Fi ${ROS_NET_WIFI_IP:-（未连接）} 转发"
   echo
   if [ "$DO_RECORD" -eq 1 ]; then
@@ -797,6 +801,7 @@ TIP
   while core_alive; do
     sleep 2
     HB=$((HB + 2))
+    check_mavros
     # 绕线器不 respawn（见 fusion_aux.launch）：退出后立即告警一次
     if [ "$DO_WINCH" -eq 1 ] && [ "$WINCH_GONE" -eq 0 ] && ! alive "tether_winch_nod[e]"; then
       WINCH_GONE=1
@@ -806,7 +811,9 @@ TIP
       HB=0
       _armed="$(timeout 5 rostopic echo -n1 /mavros/state 2>/dev/null | sed -n 's/^armed: //p' | head -1)"
       _rec="$(timeout 5 rostopic echo -n1 /rc_record/status 2>/dev/null | sed -n 's/^data: "\(state=[^ ]*\).*/\1/p')"
-      _mav="mavros=up"; proc_alive "$MAVROS_PIDFILE" || _mav="mavros=down"
+      if [ -z "$MAVROS_SEEN" ]; then _mav="mavros=down"
+      elif [ "$MAVROS_SEEN" != "$MAVROS_PID0" ]; then _mav="mavros=重启过"
+      else _mav="mavros=up"; fi
       _aux=""
       if [ -e "$AUX_PIDFILE.tried" ]; then
         if proc_alive "$AUX_PIDFILE"; then _aux=" · aux=up"; else _aux=" · aux=down"; fi

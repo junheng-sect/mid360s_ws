@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # 台架 / 手持 / 无桨测试 一键启动
-#   MAVROS(飞控串口) + MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接(位姿送飞控)
+#   MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接(位姿送飞控)，用开机常驻的 roscore / MAVROS（scripts/resident/）
 #   + RC 开关触发录包节点（遥控器通道 6 拨到触发位即开始录 bag）
 #
 # 路径: /home/orangepi/mid360s_ws/scripts/start_handheld_test.sh
 # 用法: ./start_handheld_test.sh [选项]
 #   --check             只做前置检查，不启动任何节点
-#   --no-lidar          调试：只起 MAVROS + 录包节点，用于单独验证「开关 -> 录包」
+#   --no-lidar          调试：只起录包节点（MAVROS 常驻），用于单独验证「开关 -> 录包」
 #   --no-record         不启动 RC 触发录包节点
 #   --bag-prefix NAME   包名前缀（默认 noprop，产出 NAME_000001.bag）
 #   --bag-dir PATH      包输出目录（默认 /home/orangepi/test_data/bags）
@@ -21,6 +21,7 @@
 # 锁，互相排斥。
 #
 # 前台运行：Ctrl+C / SIGTERM 停止本次启动的节点；录包节点先收 SIGINT，bag 正常写索引。
+# 常驻 roscore / MAVROS 不归本脚本起停，收尾也不动它们。
 # 本脚本不修改 mid360s_ws 源码，不写飞控参数（除显式 --fix-params）。
 # ==============================================================================
 set -o pipefail
@@ -39,12 +40,12 @@ LOCK_FILE="/tmp/mid360s_fusion.lock"
 # ROS 核心用板内固定地址（ros0 10.250.32.1，master 走 127.0.0.1），不依赖 Wi-Fi；
 # WIFI_IP 只用于提示本机 RViz 怎么连，没连 Wi-Fi 为空
 source "$DIR/ros_net.sh" || exit 1
+# 常驻 roscore / MAVROS 的服务名和 mavros_pid / resident_proc
+source "$DIR/resident/resident.sh"
 
 WIFI_IP="$ROS_NET_WIFI_IP"
 LIDAR_IFACE_IP="192.168.1.5"
 LIDAR_IP="192.168.1.194"
-TTY="/dev/ttyS3"
-FCU_URL="${TTY}:921600"
 
 CHECK_ONLY=0; FIX_PARAMS=0; NET_CHECK=1
 DO_RECORD=1; DO_LIDAR=1; REQUIRE_DISARMED=0
@@ -74,7 +75,6 @@ LOGFILE="$LOG_DIR/handheld_${STAMP}.log"
 # 本次运行专属的 PID 目录：mktemp -d 保证唯一，上一次异常退出留下的 pid 文件绝不会被
 # 这一次读到，也就不可能拿历史 PID 去误停无关进程；收尾时整个目录一起删掉。
 RUN_DIR="$(mktemp -d /tmp/mid360s_handheld.XXXXXX)"
-PIDFILE_MAVROS="$RUN_DIR/mavros.pid"
 PIDFILE_FASTLIO="$RUN_DIR/fastlio.pid"
 PIDFILE_REC="$RUN_DIR/rec.pid"
 trap 'rm -rf "$RUN_DIR"' EXIT
@@ -85,7 +85,7 @@ warn() { printf '[%s] [WARN] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE";
 err()  { printf '[%s] [FAIL] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE" >&2; }
 hr()   { printf '%s\n' "----------------------------------------------------------------" | tee -a "$LOGFILE"; }
 
-NODE_PAT="mavros_nod[e]|livox_ros_driver2_nod[e]|fastlio_mappin[g]|gravity_bridge_nod[e]|bag_recorder_node.p[y]"
+NODE_PAT="livox_ros_driver2_nod[e]|fastlio_mappin[g]|gravity_bridge_nod[e]|bag_recorder_node.p[y]"
 
 # 本次启动的子进程：收尾只认在 STARTED_PIDFILES 里登记过的组件，不按进程名扫描，
 # 也不认任何没登记过的 pid 文件。
@@ -194,12 +194,11 @@ stop_everything() {
   stop_child "$PIDFILE_REC" "录包节点"
   wait_gone 20 "$PIDFILE_REC"
   stop_child "$PIDFILE_FASTLIO" "雷达/FAST-LIO/桥接"
-  stop_child "$PIDFILE_MAVROS" "MAVROS"
-  wait_gone 50 "$PIDFILE_FASTLIO" "$PIDFILE_MAVROS"
+  wait_gone 50 "$PIDFILE_FASTLIO"
   if alive "$NODE_PAT"; then
     warn "仍有节点进程残留，请用 ps 检查后手动清理"
   else
-    ok "所有节点已停止，11311 与 $TTY 已释放"
+    ok "本次启动的节点已全部停止（常驻 roscore / MAVROS 照常运行）"
   fi
   # 录包节点直接用 rosbag API 写最终 .bag，不产生 .bag.active，
   # 所以「没有 .active」证明不了收尾成功 —— 得验证本次生成的包索引读不读得出来。
@@ -251,9 +250,11 @@ while [ "$_pp" -gt 1 ]; do
   _pp="$_parent"
 done
 
+# 常驻服务里的进程（roscore、MAVROS 的 roslaunch / mavros_node）不算残留，按 cgroup 排除
 alive() {
   for _pid in $(pgrep -f "$1" 2>/dev/null); do
     case "$SELF_PIDS" in *" $_pid "*) continue ;; esac
+    resident_proc "$_pid" && continue
     return 0
   done
   return 1
@@ -262,6 +263,7 @@ count_alive() {
   _n=0
   for _pid in $(pgrep -f "$1" 2>/dev/null); do
     case "$SELF_PIDS" in *" $_pid "*) continue ;; esac
+    resident_proc "$_pid" && continue
     _n=$((_n+1))
   done
   echo "$_n"
@@ -313,7 +315,7 @@ done
 ok "ROS Noetic + 4 个必需包齐备"
 
 stale=""
-for pat in "rosmaste[r]" "roslaunc[h]" "mavros_nod[e]" "livox_ros_driver2_nod[e]" "fastlio_mappin[g]" "gravity_bridge_nod[e]" "bag_recorder_node.p[y]" "rosbag recor[d]"; do
+for pat in "roslaunc[h]" "livox_ros_driver2_nod[e]" "fastlio_mappin[g]" "gravity_bridge_nod[e]" "bag_recorder_node.p[y]" "rosbag recor[d]"; do
   alive "$pat" && stale="$stale $pat"
 done
 if [ -n "$stale" ]; then
@@ -321,7 +323,7 @@ if [ -n "$stale" ]; then
   err "请先收尾上一个实例（Ctrl+C 或 kill -INT <roslaunch pid>）后再启动"
   exit 1
 fi
-ok "无残留 ROS 进程"
+ok "无残留 ROS 进程（常驻服务除外）"
 
 # 抢到就一直持有（fd 200 随进程退出才释放），否则新旧入口会同时跑起来
 exec 200>>"$LOCK_FILE"
@@ -358,25 +360,30 @@ else
   warn "已按要求跳过雷达网络检查"
 fi
 
-[ -c "$TTY" ] || { err "飞控串口 $TTY 不存在"; exit 1; }
-if [ -w "$TTY" ]; then ok "飞控串口 $TTY 存在且可写"; else err "$TTY 不可写（检查 dialout 组权限）"; exit 1; fi
-[ "$DO_LIDAR" -eq 1 ] || warn "已指定 --no-lidar：只起 MAVROS + 录包节点，不启动雷达/FAST-LIO"
+# roscore / MAVROS 是开机常驻服务（scripts/resident/install.sh 装的），这里只确认它们在
+if ! unit_active "$RESIDENT_ROSCORE_UNIT" || ! timeout 5 rosnode list >/dev/null 2>&1; then
+  err "常驻 roscore 不可达：systemctl status $RESIDENT_ROSCORE_UNIT（没装过就跑 $DIR/resident/install.sh）"
+  exit 1
+fi
+ok "常驻 roscore 可达（master 走 127.0.0.1:11311）"
+if [ -z "$(mavros_pid)" ]; then
+  err "常驻 MAVROS 不在运行：systemctl status $RESIDENT_MAVROS_UNIT；journalctl -u $RESIDENT_MAVROS_UNIT -n 50"
+  exit 1
+fi
+ok "常驻 MAVROS 在运行（mavros_node pid $(mavros_pid)）"
+[ "$DO_LIDAR" -eq 1 ] || warn "已指定 --no-lidar：只起录包节点，不启动雷达/FAST-LIO"
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
-  hr; log "飞控参数检查需要启动 MAVROS，--check 模式不做"
+  hr; log "飞控参数检查要等 MAVROS 连上飞控、拉参数，--check 模式不做"
   log "前置检查全部通过，可直接运行：$0"
   exit 0
 fi
 
-# ============================================================== 启动 MAVROS ==
-hr; log "步骤 2/5：启动 MAVROS（$FCU_URL）"
-start_child "$PIDFILE_MAVROS" "$LOG_DIR/mavros_${STAMP}.log" \
-  roslaunch "$DIR/launch/mavros.launch" \
-  fcu_url:="$FCU_URL" fcu_protocol:=v1.0 tgt_system:=1 tgt_component:=1 gcs_url:=""
-log "MAVROS pid=$CHILD_PID（日志：$LOG_DIR/mavros_${STAMP}.log）"
+# ======================================================== 等常驻 MAVROS 连上 ==
+hr; log "步骤 2/5：等常驻 MAVROS 连上飞控"
 wait_for "MAVROS 已连接飞控" 60 state_connected || {
-  err "60 s 内未连上飞控，看日志：$LOG_DIR/mavros_${STAMP}.log"
-  err "常见原因：飞控未上电 / 串口被占用 / 波特率不符"
+  err "60 s 内未连上飞控，看日志：journalctl -u $RESIDENT_MAVROS_UNIT -n 50"
+  err "常见原因：飞控未上电 / 串口线 / 波特率不符"
   stop_everything; exit 1
 }
 

@@ -3,8 +3,8 @@
     定位核心：MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接（位姿送 /mavros/vision_pose/pose_cov）。
     fusion.sh 单独起它，并给 roslaunch 传 required 选项：三者任一退出就整组停下、fusion.sh 以失败退出，不自动重启。
     FAST-LIO 重启会重置 drone_odom 原点，宁可让飞控明确丢外部定位，也不在飞行中输出看似正常、原点却变了的定位。
-    MAVROS（mavros.launch，自动重启）和录包 / 绕线器（fusion_aux.launch，自动重启）是单独的 roslaunch，
-    它们退出不连带本组；master 由 fusion.sh 单独起的 roscore 提供，也不随本组进退。
+    录包 / 绕线器（fusion_aux.launch）是单独的 roslaunch，退出不连带本组；MAVROS 和 master 是开机常驻的
+    systemd 服务（scripts/resident/），也不随本组进退。
 
     启动后机体保持静止，FAST-LIO 重力初始化通过后桥接才输出 /fastlio/odom_world。
     桥接默认用固定安装补偿（mounting_source:=fixed，实测安装角 roll 0.5 / pitch 18.8 /

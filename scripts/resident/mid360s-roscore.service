@@ -1,0 +1,20 @@
+# 常驻 ROS master（板内固定地址 10.250.32.1，master 走 127.0.0.1:11311）。
+# 源文件在 mid360s_ws/scripts/resident/，改完重跑 install.sh 才会生效。
+[Unit]
+Description=mid360s resident ROS master (10.250.32.1)
+After=NetworkManager.service
+
+[Service]
+Type=simple
+User=orangepi
+Group=orangepi
+Environment=HOME=/home/orangepi
+ExecStart=/home/orangepi/mid360s_ws/scripts/resident/run_roscore.sh
+# roscore 按 SIGINT 收尾最干净
+KillSignal=SIGINT
+TimeoutStopSec=20
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

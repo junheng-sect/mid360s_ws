@@ -1,0 +1,25 @@
+# 常驻 MAVROS（飞控 /dev/ttyS3:921600，本地口 udp 127.0.0.1:14555）。
+# PartOf：roscore 重启（手动或崩溃后 systemd 自动重启）时 MAVROS 跟着重启，重新注册到新 master；手动停 roscore
+# 时 MAVROS 也停。不用 BindsTo：roscore 崩溃那一刻它会先把 MAVROS 停掉，roscore 自动重启时只重启还在跑的
+# 依赖，MAVROS 就再也起不来了（10-30 实测）。
+# 源文件在 mid360s_ws/scripts/resident/，改完重跑 install.sh 才会生效。
+[Unit]
+Description=mid360s resident MAVROS (/dev/ttyS3)
+Requires=mid360s-roscore.service
+PartOf=mid360s-roscore.service
+After=mid360s-roscore.service
+
+[Service]
+Type=simple
+User=orangepi
+Group=orangepi
+SupplementaryGroups=dialout
+Environment=HOME=/home/orangepi
+ExecStart=/home/orangepi/mid360s_ws/scripts/resident/run_mavros.sh
+KillSignal=SIGINT
+TimeoutStopSec=20
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
