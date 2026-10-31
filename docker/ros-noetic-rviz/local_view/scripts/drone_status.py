@@ -8,8 +8,9 @@
   /mavros/sys_status        5 Hz   各部件健康位（enabled 且不 healthy 的就是不健康部件，含遥控）
   /mavros/extended_state    5 Hz   在地 / 在空
   /mavros/estimator_status  1 Hz   EKF 水平位置是否有效（没有 GPS 时只能来自视觉）
-  /mavros/statustext/recv   变化时 飞控消息（Preflight Fail 的原因只在检查结果变化时发一次，这里缓存最近几条）
   /mavros/vision_pose/pose_cov     送给飞控的视觉位姿（FAST-LIO 频率），只记收到的时刻算频率
+不订阅 /mavros/statustext/recv：PX4 只给收到过 GCS 心跳的链路发 STATUSTEXT（STATUSTEXT.hpp 的 is_gcs_connected），
+MAVROS 的心跳是 ONBOARD_CONTROLLER，板端这一路收不到；不能起飞的原因看各部件健康位和下面几项检查。
 另外每 2 s 用 XML-RPC 问一次板端 master：/run_id、节点列表（fusion 的核心节点在不在）、/mavros 和 /laserMapping 的
 身份和 PID。fusion 运行期间 mavros_node 的 PID 变了，就标“MAVROS 重启过”（时间同步要重新收敛，在飞应降落），直到下次 fusion。
 本节点晚于那次重启才起来也认得出：mavros_node 的 PID 比 /laserMapping 的大，就是 fusion 开始后才（重新）起来的
@@ -46,7 +47,6 @@ CORE_NODES = ('/livox_lidar_publisher2', '/laserMapping', '/gravity_bridge')  # 
 # 各话题多久没更新算过期（秒）：发布频率的 3~5 倍
 STALE = {'state': 3.5, 'battery': 6.0, 'sys_status': 2.0, 'extended_state': 2.0, 'estimator_status': 3.5}
 VISION_STALE_S = 0.5    # 视觉位姿是 FAST-LIO 频率，半秒没来就算断
-MESSAGES_KEEP = 8
 # MAV_STATE：PX4 心跳里的 system_status
 SYSTEM_STATUS = {0: '自检未通过', 1: '启动中', 2: '校准中', 3: '自检通过', 4: '已解锁',
                  5: '失效保护', 6: '紧急', 7: '关机中', 8: '终止飞行'}
@@ -61,7 +61,7 @@ SENSOR_BITS = ((0x1, '陀螺'), (0x2, '加计'), (0x4, '磁罗盘'), (0x8, '气�
 RC_BIT = 0x10000
 TOPICS = {'/mavros/state': 'state', '/mavros/battery': 'battery', '/mavros/sys_status': 'sys_status',
           '/mavros/extended_state': 'extended_state', '/mavros/estimator_status': 'estimator_status',
-          '/mavros/statustext/recv': 'statustext', '/mavros/vision_pose/pose_cov': 'vision'}
+          '/mavros/vision_pose/pose_cov': 'vision'}
 
 
 class _Transport(xmlrpc.client.Transport):
@@ -99,7 +99,6 @@ class Bridge:
         self.lock = threading.Lock()
         self.msgs = {}              # 键 → (收到时刻, 解析后的消息)
         self.vision_t = collections.deque(maxlen=200)
-        self.messages = collections.deque(maxlen=MESSAGES_KEEP)
         self.classes = {}           # 消息类型 → 现场生成的类
         self.master_ok = False
         self.master_err = '还没连过'
@@ -131,10 +130,7 @@ class Bridge:
             rospy.logwarn_throttle(10, '%s 解析失败：%s' % (key, e))
             return
         with self.lock:
-            if key == 'statustext':
-                self.messages.append({'t': now, 'severity': int(msg.severity), 'text': msg.text.strip()})
-            else:
-                self.msgs[key] = (now, msg)
+            self.msgs[key] = (now, msg)
 
     def subscribe(self):
         for topic, key in TOPICS.items():
@@ -224,8 +220,7 @@ class Bridge:
             ext, ext_age = self.fresh('extended_state', now)
             est, est_age = self.fresh('estimator_status', now)
             vision = [t for t in self.vision_t if now - t <= 2.0]
-            out = {'t': now, 'master': {'ok': self.master_ok, 'uri': self.master_uri, 'error': self.master_err},
-                   'messages': list(self.messages)}
+            out = {'t': now, 'master': {'ok': self.master_ok, 'uri': self.master_uri, 'error': self.master_err}}
             nodes, mavros_pid, restarted = set(self.nodes), self.mavros_pid, self.mavros_restarted
             master_ok = self.master_ok
 

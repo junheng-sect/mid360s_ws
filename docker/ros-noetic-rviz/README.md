@@ -35,7 +35,7 @@ curl -s http://127.0.0.1:8091/status      # 汇总好的 JSON
 先手动跑一次 `run_rviz.sh` 或 `sudo ip route replace 10.250.32.1/32 via <板端地址>`。
 
 `local_view/drone_status.py` 在容器里只读订阅板端常驻 MAVROS 的低频话题（state、battery、sys_status、extended_state、
-estimator_status、statustext、送给飞控的视觉位姿），加上每 2 s 问一次板端 master（fusion 核心节点在不在、MAVROS 有没有重启），
+estimator_status、送给飞控的视觉位姿），加上每 2 s 问一次板端 master（fusion 核心节点在不在、MAVROS 有没有重启），
 汇总成一份 JSON，带“可以起飞 / 不可起飞”的判断。定位只在要位置的模式（POSCTL、OFFBOARD、AUTO.*）下算进总灯；
 MANUAL、STABILIZED、ALTCTL、ACRO 不跑 fusion 也能起飞，定位一行只作参考（页面灰色“–”）。板端不加进程，只多一个订阅者；本节点不发布、不调服务、不写参数。
 页面是 orange 仓库的 `tools/car_web`（顶栏“无人机”“机电量”，点“无人机”展开），默认取 `http://<打开页面的主机>:8091/status`，
