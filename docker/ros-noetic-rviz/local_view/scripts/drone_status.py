@@ -17,6 +17,9 @@
 
 镜像里没有 mavros_msgs：按 AnyMsg 订阅，用发布者连接头里带的消息定义现场生成消息类再解析。
 板端重启后 master 是新的（/run_id 变），ROS1 节点不会重新注册，所以发现 /run_id 变了就 exec 自己整个重来。
+本机换网后 ROS_IP 就失效了：master 回调不到旧地址，之后才出现的发布者（比如后起的 fusion 的视觉位姿）订阅不上。
+ROS_IP 是自动识别的（DRONE_STATUS_AUTO_IP=1）时，每 2 s 看一次本机到 master 的源地址，连续 3 次和 ROS_IP 不一样就退出，
+由用户服务 drone-status 重起、重选地址。
 入口：docker/ros-noetic-rviz/scripts/run_drone_status.sh。
 """
 import argparse
@@ -24,9 +27,11 @@ import collections
 import http.server
 import json
 import os
+import socket
 import sys
 import threading
 import time
+import urllib.parse
 import xmlrpc.client
 sys.dont_write_bytecode = True
 
@@ -36,6 +41,7 @@ import rospy  # noqa: E402
 NAME = '/drone_status_check'
 POLL_S = 2.0            # 问 master 的周期
 RPC_TIMEOUT_S = 2.0
+NET_CHANGE_POLLS = 3    # 源地址连续这么多次和 ROS_IP 不一样才算换网（换网途中会短暂没路由）
 CORE_NODES = ('/livox_lidar_publisher2', '/laserMapping', '/gravity_bridge')  # fusion_core.launch 的三个节点
 # 各话题多久没更新算过期（秒）：发布频率的 3~5 倍
 STALE = {'state': 3.5, 'battery': 6.0, 'sys_status': 2.0, 'extended_state': 2.0, 'estimator_status': 3.5}
@@ -45,6 +51,9 @@ MESSAGES_KEEP = 8
 SYSTEM_STATUS = {0: '自检未通过', 1: '启动中', 2: '校准中', 3: '自检通过', 4: '已解锁',
                  5: '失效保护', 6: '紧急', 7: '关机中', 8: '终止飞行'}
 LANDED = {0: '未知', 1: '在地面', 2: '在空中', 3: '起飞中', 4: '降落中'}
+# 不用位置估计就能飞的 PX4 模式（MAVROS 的模式名）：手动、自稳、气压定高。其余（POSCTL、OFFBOARD、AUTO.*）要 fusion 给位置，
+# 没见过的模式也按要位置算
+NO_POS_MODES = {'MANUAL', 'ACRO', 'STABILIZED', 'RATTITUDE', 'ALTCTL'}
 # MAV_SYS_STATUS_SENSOR 里 PX4 1.16 会填的部件（SYS_STATUS.hpp 的 fillOutComponent）；同名的合并显示
 SENSOR_BITS = ((0x1, '陀螺'), (0x2, '加计'), (0x4, '磁罗盘'), (0x8, '气压计'), (0x10, '空速计'), (0x20, 'GPS'),
                (0x800, '姿态估计'), (0x4000, '位置估计'), (0x8000, '电机/电调'), (0x10000, '遥控'),
@@ -68,9 +77,25 @@ def rpc(uri):
     return xmlrpc.client.ServerProxy(uri, transport=_Transport(), allow_none=True)
 
 
+def route_src(host):
+    """本机发往 host 时用的源地址；没路由给 None。UDP connect 只让内核选路由，不发包"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((host, 9))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
 class Bridge:
     def __init__(self, master_uri):
         self.master_uri = master_uri
+        self.master_host = urllib.parse.urlparse(master_uri).hostname
+        # 只盯自动识别的地址：手动指定的查了也换不了，退出只会反复重起
+        self.ros_ip = os.environ.get('ROS_IP') if os.environ.get('DRONE_STATUS_AUTO_IP') == '1' else None
+        self.net_miss = 0
         self.lock = threading.Lock()
         self.msgs = {}              # 键 → (收到时刻, 解析后的消息)
         self.vision_t = collections.deque(maxlen=200)
@@ -116,6 +141,17 @@ class Bridge:
             rospy.Subscriber(topic, rospy.AnyMsg, self.on_msg, callback_args=key, queue_size=5)
 
     # ---------------------------------------------------------- 问 master ----
+    def check_route(self):
+        """换网了（本机到 master 的源地址连续几次不是 ROS_IP）就整个退出，交给用户服务重起"""
+        if not self.ros_ip:
+            return
+        src = route_src(self.master_host)
+        self.net_miss = 0 if src == self.ros_ip else self.net_miss + 1
+        if self.net_miss >= NET_CHANGE_POLLS:
+            print('[drone_status] 本机到板端的源地址变了（ROS_IP %s → %s），退出等重起' % (self.ros_ip, src or '没有路由'),
+                  flush=True)
+            os._exit(3)     # 在轮询线程里，sys.exit 只会结束本线程
+
     def poll_master(self):
         m = rpc(self.master_uri)
         code, _, run_id = m.getParam(NAME, '/run_id')
@@ -144,6 +180,7 @@ class Bridge:
 
     def poll_loop(self):
         while True:
+            self.check_route()
             try:
                 run_id, nodes, mavros_pid, fusion_run, core_pid = self.poll_master()
             except Exception as e:  # noqa: BLE001 - 板端掉线、Wi-Fi 断了
@@ -195,7 +232,9 @@ class Bridge:
         fc = bool(state and state.connected)
         armed = bool(state and state.armed)
         sysst = int(state.system_status) if state else None
-        out['flight'] = {'connected': fc, 'armed': armed if state else None, 'mode': state.mode if state else None,
+        mode = state.mode if state else None
+        need_pos = mode not in NO_POS_MODES
+        out['flight'] = {'connected': fc, 'armed': armed if state else None, 'mode': mode,
                          'landed': LANDED.get(int(ext.landed_state), '未知') if ext else None,
                          'failsafe': sysst == 5, 'age': state_age}
 
@@ -217,7 +256,7 @@ class Bridge:
         checks = []
 
         def check(key, name, ok, text):
-            checks.append({'key': key, 'name': name, 'ok': ok, 'text': text})
+            checks.append({'key': key, 'name': name, 'ok': ok, 'text': text, 'required': True})
 
         # 1. PX4 自检（当前模式能不能解锁）
         if not fc:
@@ -242,6 +281,11 @@ class Bridge:
             check('pos', '定位', None, '视觉 %.0f Hz，EKF 状态未知' % vision_hz)
         else:
             check('pos', '定位', ekf, '视觉 %.0f Hz，EKF %s' % (vision_hz, '已接受' if ekf else '没接受'))
+        # 定位只在要位置的模式下算数；ALTCTL、STABILIZED 等不跑 fusion 也能起飞，这一行只作参考
+        if not need_pos:
+            checks[-1]['required'] = False
+            if checks[-1]['ok'] is not True:
+                checks[-1]['text'] += '（%s 不用定位）' % mode
         out['positioning'] = {'fusion': not missing, 'missing': missing, 'vision_hz': vision_hz,
                               'vision_age': vision_age, 'ekf_pos': ekf, 'ekf_age': est_age}
         # 3. 遥控
@@ -279,9 +323,10 @@ class Bridge:
         elif not fc:
             lamp = ('unknown', '飞控未连接')
         elif armed:
-            lamp = ('bad', '失效保护') if sysst == 5 else (('ok', '已解锁 · 正常') if by['pos'] and by['mavros']
+            pos_ok = by['pos'] or not need_pos
+            lamp = ('bad', '失效保护') if sysst == 5 else (('ok', '已解锁 · 正常') if pos_ok and by['mavros']
                                                            else ('bad', '已解锁 · 定位或 MAVROS 异常'))
-        elif all(by[k] for k in ('px4', 'pos', 'rc', 'mavros', 'fresh')):
+        elif all(c['ok'] for c in checks if c['required']):
             lamp = ('ok', '可以起飞')
         else:
             lamp = ('bad', '不可起飞')
@@ -323,6 +368,7 @@ def main():
     print('[drone_status] http://%s:%d/status  master %s' % (a.bind, a.port, bridge.master_uri), flush=True)
     # master 连上之前不 init_node：页面照样能取到“连不上板端”
     while True:
+        bridge.check_route()
         try:
             run_id = bridge.poll_master()[0]
             break

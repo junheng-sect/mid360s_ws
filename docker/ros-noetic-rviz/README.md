@@ -24,16 +24,25 @@ Fixed Frame `map`，彩色先验地图 + 白色实时点云，三维里有 map�
 ## 无人机状态桥（网页无人机面板）
 
 ```bash
-./scripts/run_drone_status.sh          # 后台起容器 drone_status；--fg 前台看日志，--stop 停
-curl -s http://127.0.0.1:8091/status   # 汇总好的 JSON
+./scripts/run_drone_status.sh --install   # 装成本机用户服务 drone-status，开机自启（每台电脑装一次，--uninstall 卸）
+systemctl --user status drone-status      # 看状态；日志 journalctl --user -u drone-status -f
+curl -s http://127.0.0.1:8091/status      # 汇总好的 JSON
 ```
+
+不装服务时 `./scripts/run_drone_status.sh` 后台起容器 drone_status（`--fg` 前台看日志，`--stop` 停）；服务在跑时手动起停会被拒绝。
+服务跑的是 `--fg`，退出 10 s 后重起，每次起都重选 ROS_IP、补路由；开机时本机还没连上网就一直重试。用户服务不登录也能开机起，
+要求当前用户开了 linger（`loginctl show-user $USER -p Linger`，本机已开）。服务没有终端输 sudo 密码：要 sudo 补路由的网（手机热点等）
+先手动跑一次 `run_rviz.sh` 或 `sudo ip route replace 10.250.32.1/32 via <板端地址>`。
 
 `local_view/drone_status.py` 在容器里只读订阅板端常驻 MAVROS 的低频话题（state、battery、sys_status、extended_state、
 estimator_status、statustext、送给飞控的视觉位姿），加上每 2 s 问一次板端 master（fusion 核心节点在不在、MAVROS 有没有重启），
-汇总成一份 JSON，带“可以起飞 / 不可起飞”的判断。板端不加进程，只多一个订阅者；本节点不发布、不调服务、不写参数。
+汇总成一份 JSON，带“可以起飞 / 不可起飞”的判断。定位只在要位置的模式（POSCTL、OFFBOARD、AUTO.*）下算进总灯；
+MANUAL、STABILIZED、ALTCTL、ACRO 不跑 fusion 也能起飞，定位一行只作参考（页面灰色“–”）。板端不加进程，只多一个订阅者；本节点不发布、不调服务、不写参数。
 页面是 orange 仓库的 `tools/car_web`（顶栏“无人机”“机电量”，点“无人机”展开），默认取 `http://<打开页面的主机>:8091/status`，
 手机经台式机 IP 打开也能用。镜像里没有 mavros_msgs，节点按发布者连接头里的消息定义现场解析，不用重建镜像。
-板端没开时照样起，页面显示“连不上板端”；板端重启（master 换了）节点自己重来。本机换网后 ROS_IP 变了，要重跑一次。
+板端没开时照样起，页面显示“连不上板端”；板端重启（master 换了）节点自己重来。本机换网后 ROS_IP 就失效了
+（之后才起的 fusion 订阅不上）：ROS_IP 是自动识别的时，节点发现本机到板端的源地址连续 3 次（每 2 s 查一次）不是 ROS_IP 就退出，由服务重起
+（换网途中这几秒页面显示“本机状态桥连不上”）；手动起的要重跑；`--ros-ip` 或 local.env 写死地址时不查。
 
 ## 两台电脑共用一份仓库
 
