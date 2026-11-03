@@ -14,8 +14,12 @@
 
     板端一律关闭 RViz；飞控参数不在本文件里改（px4_config.yaml 的 vision_pose/tf/listen 已经是 false，
     桥接用消息订阅而不是 TF）。
+
+    ev_mode 选外部定位送飞控的方式：pose（默认）只发位姿到 /mavros/vision_pose/pose_cov；
+    odom 发位姿 + 速度到 /mavros/odometry/out（要 MAVROS 用 MAVLink2）。说明见 gravity_bridge.launch。
   -->
   <arg name="send_to_mavros" default="true"/>
+  <arg name="ev_mode"        default="pose"/>
 
   <!-- MID-360S 驱动：关 RViz，也关驱动自带的 rosbag（录包统一交给通道 6 触发） -->
   <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360s.launch">
@@ -28,8 +32,9 @@
     <arg name="rviz" value="false"/>
   </include>
 
-  <!-- 重力对齐桥接：带协方差位姿送 /mavros/vision_pose/pose_cov -->
+  <!-- 重力对齐桥接：pose 方式送 /mavros/vision_pose/pose_cov，odom 方式送 /mavros/odometry/out -->
   <include file="$(find fastlio_gravity_bridge)/launch/gravity_bridge.launch">
     <arg name="send_to_mavros" value="$(arg send_to_mavros)"/>
+    <arg name="ev_mode"        value="$(arg ev_mode)"/>
   </include>
 </launch>

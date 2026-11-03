@@ -15,6 +15,7 @@
 #   --bag-prefix NAME   包名前缀（默认 noprop，产出 NAME_000001.bag）
 #   --bag-dir PATH      包输出目录（默认 /home/orangepi/test_data/bags）
 #   --allow-unsynced-clock  不等对时，直接按板端本地时间启动（没外网时用）
+#   --ev-mode MODE      外部定位送飞控的方式：pose（默认，只发位姿）/ odom（位姿 + 速度，要 MAVROS 用 MAVLink2）
 #   -h|--help           帮助
 #
 # 目标：Wi-Fi 没连、断开、换网、重连都不让 FAST-LIO 停止、重启或重新初始化，飞控外部定位不因此中断。
@@ -93,6 +94,9 @@ DO_WINCH=1
 DO_CAMERA=1
 BAG_PREFIX="noprop"
 BAG_DIR="/home/orangepi/test_data/bags"
+# 外部定位送飞控的方式（重力桥 ev_mode）：pose = /mavros/vision_pose/pose_cov 只发位姿；
+# odom = /mavros/odometry/out 位姿 + 速度。启动时选定，运行中不切换（见 gravity_bridge.launch）。
+EV_MODE="pose"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -102,13 +106,15 @@ while [ $# -gt 0 ]; do
     --bag-prefix) BAG_PREFIX="${2:-}"; shift ;;
     --bag-dir) BAG_DIR="${2:-}"; shift ;;
     --allow-unsynced-clock) ALLOW_UNSYNCED_CLOCK=1 ;;
-    -h|--help) sed -n '3,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --ev-mode) EV_MODE="${2:-}"; shift ;;
+    -h|--help) sed -n '3,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1（-h 看用法）" >&2; exit 2 ;;
   esac
   shift
 done
 [ -n "$BAG_PREFIX" ] || { echo "包名前缀不能为空" >&2; exit 2; }
 [ -n "$BAG_DIR" ] || { echo "包目录不能为空" >&2; exit 2; }
+case "$EV_MODE" in pose|odom) ;; *) echo "--ev-mode 只能是 pose 或 odom（收到：$EV_MODE）" >&2; exit 2 ;; esac
 
 mkdir -p "$LOG_DIR" "$BAG_DIR"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -500,6 +506,16 @@ elif timeout 5 rostopic echo -n1 /mavros/state 2>/dev/null | grep -q "connected:
 else
   warn "常驻 MAVROS 在跑但没连上飞控（飞控没上电？）：核心照常起，飞控收不到外部定位"
 fi
+# odom 方式发 ODOMETRY（MAVLink2 才有的消息）：MAVROS 还是 v1.0 时会把它丢掉，飞控什么都收不到
+if [ "$EV_MODE" = "odom" ] && [ -n "$(mavros_pid)" ]; then
+  _proto="$(timeout 5 rosparam get /mavros/fcu_protocol 2>/dev/null)"
+  if [ "$_proto" != "v2.0" ]; then
+    err "--ev-mode odom 要 MAVROS 用 MAVLink2，常驻 MAVROS 是 fcu_protocol=${_proto:-读不到}"
+    err "改 scripts/launch/mavros.launch 的 fcu_protocol 后 sudo systemctl restart $RESIDENT_MAVROS_UNIT，或改用 --ev-mode pose"
+    exit 1
+  fi
+  ok "常驻 MAVROS 用 MAVLink2（odom 方式可用）"
+fi
 
 stale=""
 for pat in "roslaunc[h]" "livox_ros_driver2_nod[e]" \
@@ -658,6 +674,11 @@ if [ "$DO_CAMERA" -eq 1 ]; then
 else
   log "已指定 --no-camera：不启动相机预览"
 fi
+if [ "$EV_MODE" = "odom" ]; then
+  log "外部定位：odom 方式，位姿 + 速度送 /mavros/odometry/out（飞控 EKF2_EV_CTRL 带 bit2 才融合速度）"
+else
+  log "外部定位：pose 方式，只送位姿到 /mavros/vision_pose/pose_cov"
+fi
 
 # 核心起来前冻结时钟：停掉 chronyd，运行中不论何时联网、chrony 被谁重启都不会跳时间；
 # 冻结锁（fd 201）会被下面的 roslaunch 继承，收尾时 on_exit 再恢复。冻结不了就不启动。
@@ -689,14 +710,14 @@ else
 fi
 # 数据连续性监控先于核心起：从第一帧开始记。只读消息头，断流 / 时间戳倒退 / 时间跳变 / 飞控本地位置与
 # 视觉位姿偏差即时打到终端，逐秒明细进 CSV。起不来只告警。
-if spawn "$WATCH_PIDFILE" tee python3 -u "$DIR/core_watch.py" --csv "$WATCH_CSV"; then
+if spawn "$WATCH_PIDFILE" tee python3 -u "$DIR/core_watch.py" --csv "$WATCH_CSV" --ev-mode "$EV_MODE"; then
   log "数据连续性监控 pid=$(proc_pid_now "$WATCH_PIDFILE")（逐秒明细：$WATCH_CSV）"
 else
   warn "数据连续性监控没起来（核心照常运行）"
 fi
 
 spawn "$CORE_PIDFILE" tee roslaunch --screen --required "$CORE_LAUNCH" send_to_mavros:=true \
-  || start_fail "核心 roslaunch 没能在 12 s 内起来"
+  ev_mode:="$EV_MODE" || start_fail "核心 roslaunch 没能在 12 s 内起来"
 CORE_SETSID_PID="$SPAWN_PID"
 log "核心 roslaunch pid=$(proc_pid_now "$CORE_PIDFILE")（雷达驱动 / FAST-LIO / 重力桥，任一退出整组停）"
 # 从这里起盯常驻 MAVROS：mavros_node 的 PID 变了就是重启过（check_mavros）
@@ -759,6 +780,14 @@ elif [ "$NODES_RC" -eq 0 ]; then
   done
   if [ "$_ready" -eq 1 ]; then
     ok "桥接已输出里程计（从启动到首帧共 $((SECONDS - T0)) s）"
+    # odom 方式要位姿和速度配上才送飞控：FAST-LIO 没发 /fastlio/velocity 时这里收不到
+    if [ "$EV_MODE" = "odom" ]; then
+      if timeout 5 rostopic echo -n1 /fastlio/vision_odom >/dev/null 2>&1; then
+        ok "odom 方式：位姿 + 速度已在送 /mavros/odometry/out"
+      else
+        warn "odom 方式 5 s 内没有 /fastlio/vision_odom：FAST-LIO 没发 /fastlio/velocity？飞控收不到外部定位，看桥接日志"
+      fi
+    fi
     log "注意：这只说明 FAST-LIO→桥接这一段通了。MAVROS 有没有连上飞控、PX4 有没有"
     log "      接受外部定位，本入口不检查（要验收请用 start_handheld_test.sh）"
   elif ! core_alive; then

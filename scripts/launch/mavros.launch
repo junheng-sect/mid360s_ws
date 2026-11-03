@@ -6,7 +6,10 @@
     帧名不能在 roslaunch 之前用 rosparam set 预先设好：node.launch 给 mavros 节点开了 clear_params，
     启动时会清掉 /mavros 下的旧参数。写在同一个 roslaunch 里就没问题——roslaunch 先清、再统一设参数，
     同名的项以后加载的这份为准。
-    参数和 px4.launch 一样，默认值也照它（板端 px4.launch 已改成 /dev/ttyS3:921600、v1.0）。
+    参数和 px4.launch 一样，默认值也照它（板端 px4.launch 已改成 /dev/ttyS3:921600、v1.0），只有协议例外：
+    这里用 v2.0（MAVLink2）。fusion 的 odom 方式（ev_mode=odom）发的 ODOMETRY（#331）是 v2 才有的消息，v1.0 下 MAVROS
+    直接丢掉；pose 方式的 VISION_POSITION_ESTIMATE 协方差也是 v2 扩展字段，v1.0 下飞控收到的全是 0
+    （PX4 取 max(EKF2_EVP_NOISE², 报告值)，报告值比参数小时行为不变）。飞控 MAV_PROTO_VER=0，收到 v2 自动跟着切。
 
     本地口 gcs_url：串口一直被 MAVROS 占着，fc_set_time.py 校时改走这个口（MAVROS 原样转发 MAVLink）。
     只绑 127.0.0.1，局域网连不上。gcs_quiet_mode：只在最近 conn/timeout（px4_config.yaml 是 10 s）内
@@ -19,7 +22,7 @@
   <arg name="tgt_system"     default="1"/>
   <arg name="tgt_component"  default="1"/>
   <arg name="log_output"     default="screen"/>
-  <arg name="fcu_protocol"   default="v1.0"/>
+  <arg name="fcu_protocol"   default="v2.0"/>
   <arg name="respawn_mavros" default="false"/>
 
   <include file="$(find mavros)/launch/px4.launch">

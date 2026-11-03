@@ -3,13 +3,14 @@
 
 fusion.sh 在 roscore 起来后自动拉起，事件和汇总进 fusion 日志，逐秒明细写 CSV；也可以单独跑：
   source ~/mid360s_ws/scripts/ros_net.sh && source /opt/ros/noetic/setup.bash
-  python3 ~/mid360s_ws/scripts/core_watch.py [--csv 文件] [--summary-sec 60]
+  python3 ~/mid360s_ws/scripts/core_watch.py [--csv 文件] [--summary-sec 60] [--ev-mode pose|odom]
 
 - 每个话题：频率、相邻两帧接收最大间隔、消息时间戳是否倒退、时间戳落后接收时刻多少（lag）。
   话题流起来以后断流超过阈值报 STALE，恢复报 RESUMED；从没来过的只在汇总里列出（雷达没上电、
   初始化没过时本来就没有）。
 - 系统时间相对单调时钟的跳变：核心运行中 fusion.sh 已冻结时钟，出现跳变就是问题。
 - 飞控侧：/mavros/local_position/pose 还在不在更新，以及它和送给飞控的视觉位姿之间的距离 ev_resid。
+  送给飞控的视觉位姿按 --ev-mode 取：pose 方式是 /mavros/vision_pose/pose_cov，odom 方式是 /mavros/odometry/out。
   外部定位在融合时两者应在厘米级一致，持续变大说明飞控没在用（或用不上）视觉位姿。
   两者原点都是起飞前初始化处、都是 ENU，未融合前（刚上电）可能有固定偏差，看变化趋势。
 """
@@ -22,6 +23,7 @@ import time
 
 import rospy
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from nav_msgs.msg import Odometry
 
 # (话题, 断流阈值 s)；消息第一个字段都是 std_msgs/Header，AnyMsg 直接从原始字节读 seq / stamp
 TOPICS = [
@@ -33,7 +35,10 @@ TOPICS = [
     ('/mavros/local_position/pose', 0.3),
     ('/mavros/state', 3.0),
 ]
-VISION, LOCAL = '/mavros/vision_pose/pose_cov', '/mavros/local_position/pose'
+LOCAL = '/mavros/local_position/pose'
+# 送给飞控的视觉位姿：TOPICS 里写的是 pose 方式的话题，odom 方式换成 /mavros/odometry/out
+VISION_TOPICS = {'pose': ('/mavros/vision_pose/pose_cov', PoseWithCovarianceStamped),
+                 'odom': ('/mavros/odometry/out', Odometry)}
 HEADER = struct.Struct('<III')   # seq, stamp.secs, stamp.nsecs
 CLOCK_JUMP_S = 0.05              # 系统时间相对单调时钟一次变化超过它算跳变
 LAG_WARN_S = 1.0                 # 时间戳落后接收时刻超过它告警（时间不一致或严重积压）
@@ -93,16 +98,20 @@ class Watch:
     def __init__(self, args):
         self.args = args
         self.lock = threading.Lock()
-        self.topics = {name: Topic(name, s) for name, s in TOPICS}
+        self.vision, vision_type = VISION_TOPICS[args.ev_mode]
+        pose_topic = VISION_TOPICS['pose'][0]
+        self.topic_list = [(self.vision if name == pose_topic else name, s) for name, s in TOPICS]
+        self.topics = {name: Topic(name, s) for name, s in self.topic_list}
         self.pos = {}                            # 话题 -> (单调时刻, x, y, z)
         self.win_resid = self.max_resid = None
         self.resid_warned = False
         self.clock_jumps = 0
         self.max_clock_step = 0.0
         self.t0 = time.monotonic()
-        for name, _ in TOPICS:
-            if name == VISION:
-                rospy.Subscriber(name, PoseWithCovarianceStamped, self.on_pose, (name, True), queue_size=50)
+        for name, _ in self.topic_list:
+            if name == self.vision:
+                # PoseWithCovarianceStamped 和 Odometry 的位置都在 msg.pose.pose.position
+                rospy.Subscriber(name, vision_type, self.on_pose, (name, True), queue_size=50)
             elif name == LOCAL:
                 rospy.Subscriber(name, PoseStamped, self.on_pose, (name, False), queue_size=50)
             else:
@@ -112,7 +121,7 @@ class Watch:
             self.csv_file = open(args.csv, 'w', newline='', buffering=1)
             self.csv = csv.writer(self.csv_file)
             head = ['wall', 'mono_s']    # mono_s：开机以来的单调时间，和 /proc/uptime、journal 对得上
-            for name, _ in TOPICS:
+            for name, _ in self.topic_list:
                 k = name.strip('/').replace('/', '.')
                 head += [k + '.n', k + '.max_gap', k + '.age', k + '.max_lag']
             self.csv.writerow(head + ['ev_resid_max', 'clock_step'])
@@ -136,7 +145,7 @@ class Watch:
             self.update_resid(mono)
 
     def update_resid(self, mono):
-        a, b = self.pos.get(VISION), self.pos.get(LOCAL)
+        a, b = self.pos.get(self.vision), self.pos.get(LOCAL)
         if a is None or b is None or abs(a[0] - b[0]) > 0.5 or mono - min(a[0], b[0]) > 0.5:
             return
         d = math.sqrt(sum((a[i] - b[i]) ** 2 for i in (1, 2, 3)))
@@ -155,7 +164,7 @@ class Watch:
         say('%s（运行 %.0f s，系统时间跳变 %d 次，最大单次 %.3f s，ev_resid 最大 %s）' % (
             '最终汇总' if final else '汇总', up, self.clock_jumps, self.max_clock_step,
             '%.3f m' % self.max_resid if self.max_resid is not None else '无'))
-        for name, _ in TOPICS:
+        for name, _ in self.topic_list:
             t = self.topics[name]
             if t.first_rx is None:
                 say('  %-30s 从没收到' % name)
@@ -187,7 +196,7 @@ class Watch:
                     next_row += 1.0
                     if self.csv:
                         row = [time.strftime('%H:%M:%S'), '%.1f' % mono]
-                        for name, _ in TOPICS:
+                        for name, _ in self.topic_list:
                             row += ['%.3f' % v if isinstance(v, float) else v
                                     for v in self.topics[name].take_window(mono)]
                         row += ['%.3f' % self.win_resid if self.win_resid is not None else '', '%.3f' % clock_step]
@@ -211,10 +220,12 @@ def main():
     ap.add_argument('--summary-sec', type=float, default=60.0, help='汇总间隔（秒），默认 60')
     ap.add_argument('--resid-warn', type=float, default=0.5,
                     help='飞控本地位置与视觉位姿相差超过它告警（米），默认 0.5')
+    ap.add_argument('--ev-mode', choices=sorted(VISION_TOPICS), default='pose',
+                    help='外部定位送飞控的方式（与 fusion.sh --ev-mode 一致），决定盯哪个视觉位姿话题')
     args = ap.parse_args(rospy.myargv()[1:])
     rospy.init_node('core_watch')
     w = Watch(args)
-    say('开始监控：%s；CSV %s' % (' '.join(n for n, _ in TOPICS), args.csv or '不写'))
+    say('开始监控：%s；CSV %s' % (' '.join(n for n, _ in w.topic_list), args.csv or '不写'))
     w.run()
 
 

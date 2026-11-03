@@ -302,6 +302,28 @@ inline bool transformPoseWithCovariance(const AlignmentTransform &transform,
   return true;
 }
 
+/// FAST-LIO2 的速度（/fastlio/velocity：camera_init 下、雷达 IMU 点的速度）转到输出机体系：
+///   v_B = R_wbᵀ · R_a · v_C
+/// R_a 是本轮对齐旋转，R_wb 是已经变换好的输出姿态（drone_odom 下的 drone_base，
+/// 即 transformPoseWithCovariance 输出的 orientation），所以安装旋转自动包含在内。
+/// 只做旋转：速度基点和位置一样仍是雷达 IMU，杆臂由飞控按 EKF2_EV_POS_* 扣除 ω×r。
+///
+/// 输入非有限、姿态无效或对齐旋转未锁定时返回 false。
+inline bool transformVelocityToBody(const AlignmentTransform &transform,
+                                    const geometry_msgs::Quaternion &q_wb_msg,
+                                    const Eigen::Vector3d &v_c, Eigen::Vector3d &v_b)
+{
+  if (!transform.valid) return false;
+  if (!isFiniteVector3(v_c.x(), v_c.y(), v_c.z())) return false;
+
+  Eigen::Quaterniond q_wb(q_wb_msg.w, q_wb_msg.x, q_wb_msg.y, q_wb_msg.z);
+  if (!quaternionIsValid(q_wb)) return false;
+  q_wb.normalize();
+
+  v_b = q_wb.conjugate() * (transform.R * v_c);
+  return isFiniteVector3(v_b.x(), v_b.y(), v_b.z());
+}
+
 }  // namespace fastlio_gravity_bridge
 
 #endif  // FASTLIO_GRAVITY_BRIDGE_GRAVITY_ALIGNMENT_H

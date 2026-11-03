@@ -9,6 +9,7 @@
     ROS_PACKAGE_PATH）。相机预览不在本文件：见 camera.launch。
   -->
   <arg name="send_to_mavros" default="true"/>
+  <arg name="ev_mode"        default="pose"/>
   <arg name="record"         default="true"/>
   <arg name="winch"          default="true"/>
   <arg name="bag_prefix"     default="noprop"/>
@@ -16,6 +17,7 @@
 
   <include file="$(dirname)/fusion_core.launch">
     <arg name="send_to_mavros" value="$(arg send_to_mavros)"/>
+    <arg name="ev_mode"        value="$(arg ev_mode)"/>
   </include>
   <include file="$(dirname)/fusion_aux.launch">
     <arg name="record"     value="$(arg record)"/>

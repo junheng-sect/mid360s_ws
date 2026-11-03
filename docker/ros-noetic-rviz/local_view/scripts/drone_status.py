@@ -9,6 +9,7 @@
   /mavros/extended_state    5 Hz   在地 / 在空
   /mavros/estimator_status  1 Hz   EKF 水平位置是否有效（没有 GPS 时只能来自视觉）
   /mavros/vision_pose/pose_cov     送给飞控的视觉位姿（FAST-LIO 频率），只记收到的时刻算频率
+  /mavros/odometry/out             同上，fusion --ev-mode odom 时视觉位姿 + 速度走这一路；两路同时只会有一路有数据
 不订阅 /mavros/statustext/recv：PX4 只给收到过 GCS 心跳的链路发 STATUSTEXT（STATUSTEXT.hpp 的 is_gcs_connected），
 MAVROS 的心跳是 ONBOARD_CONTROLLER，板端这一路收不到；不能起飞的原因看各部件健康位和下面几项检查。
 另外每 2 s 用 XML-RPC 问一次板端 master：/run_id、节点列表（fusion 的核心节点在不在）、/mavros 和 /laserMapping 的
@@ -61,7 +62,8 @@ SENSOR_BITS = ((0x1, '陀螺'), (0x2, '加计'), (0x4, '磁罗盘'), (0x8, '气�
 RC_BIT = 0x10000
 TOPICS = {'/mavros/state': 'state', '/mavros/battery': 'battery', '/mavros/sys_status': 'sys_status',
           '/mavros/extended_state': 'extended_state', '/mavros/estimator_status': 'estimator_status',
-          '/mavros/vision_pose/pose_cov': 'vision'}
+          '/mavros/vision_pose/pose_cov': 'vision',
+          '/mavros/odometry/out': 'vision'}
 
 
 class _Transport(xmlrpc.client.Transport):

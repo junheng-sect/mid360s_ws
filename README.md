@@ -240,6 +240,24 @@ roslaunch fastlio_gravity_bridge gravity_bridge.launch \
 `send_to_mavros:=true` 时输出改为 `/mavros/vision_pose/pose_cov`，并在 `/fastlio/vision_pose_cov`
 保留一路本地回显；MAVROS 侧需使用消息订阅模式（`vision_pose/tf/listen=false`），不要用 TF 监听。
 
+送飞控有两种方式，由 `ev_mode` 在启动时选定（`fusion.sh` / `start_handheld_test.sh` 用 `--ev-mode`）：
+
+| `ev_mode` | 送到 | MAVLink 消息 | 内容 |
+|---|---|---|---|
+| `pose`（默认） | `/mavros/vision_pose/pose_cov` | VISION_POSITION_ESTIMATE | 位姿 + 协方差 |
+| `odom` | `/mavros/odometry/out` | ODOMETRY | 位姿 + 协方差 + 机体系速度 |
+
+- `odom` 的速度取 FAST-LIO 的 `/fastlio/velocity`（camera_init 下、雷达 IMU 点，和 `/Odometry` 同一时间戳），
+  桥接按时间戳和位姿配对后转到机体系 `drone_base`；配不上的位姿不送飞控（限频报错，不退回 `pose`）。
+  本地回显 `/fastlio/vision_odom`。杆臂由飞控按 `EKF2_EV_POS_*` 扣 ω×r。
+- 消息父帧填 `px4_odom`：MAVROS odometry 插件按 `px4_odom_ned` 查静态 TF、只取旋转；数值仍是 drone_odom 下的。
+- 要 MAVROS 用 MAVLink2（`scripts/launch/mavros.launch` 的 `fcu_protocol`，2026-11-03 起默认 v2.0）；
+  飞控 `EKF2_EV_CTRL` 带 bit2（11 → 15）才融合速度，不带时只记录（ulog 的 `vehicle_visual_odometry`）。
+- PX4 把 ODOMETRY 当 EV 自有的 FRD 坐标系（EV 航向融合时 `yaw_align` 为 false，`heading_good_for_control`
+  跟着为 false：定点 / 定高 / offboard 不受影响，自稳模式不锁航向、自动模式不控航向），
+  VISION_POSITION_ESTIMATE 当 NED；两种方式中途切换会让 EKF 重新对准航向，所以只随节点重启切换。
+- 速度方差默认报 0，PX4 取 `max(EKF2_EVV_NOISE², 报告值)`，即由 `EKF2_EVV_NOISE` 决定；`odom_velocity_std` 可另设。
+
 行为约定（与实现一致，详见包内 `launch/gravity_bridge.launch` 注释）：
 
 - 没收到有效初始化重力时只等待，不输出未对齐消息；latched 主题允许桥接节点晚于算法启动。
@@ -251,7 +269,8 @@ roslaunch fastlio_gravity_bridge gravity_bridge.launch \
 - 对齐旋转与协方差只做本次运行的固定变换，不额外建模初始化重力的不确定度。
 - 默认 `fixed` 模式的安装旋转在启动时按参数确定，不依赖初始化重力；初始化只需保持静止
   （FAST-LIO 静态初始化），机体是否水平只表现为输出姿态里如实体现的倾角。
-- 位置基点仍是雷达 IMU 原点，尚无有效速度与杆臂补偿；飞控航向策略属于后续机体接入步骤。
+- 位置基点仍是雷达 IMU 原点，桥接不做杆臂补偿（由飞控 `EKF2_EV_POS_*` 处理）；`/fastlio/odom_world`
+  的 twist 仍原样透传（FAST-LIO 的 `/Odometry` 不带速度），速度只在 `ev_mode=odom` 时随 ODOMETRY 送飞控。
 
 ### 测试
 

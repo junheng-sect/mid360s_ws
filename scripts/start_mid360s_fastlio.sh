@@ -4,8 +4,10 @@ set -euo pipefail
 # ==============================================================================
 # 一键前台启动 Livox MID-360S 驱动、FAST-LIO2 与重力对齐桥接
 # 路径: /home/orangepi/mid360s_ws/scripts/start_mid360s_fastlio.sh
-# 用法: ./start_mid360s_fastlio.sh [--check] [--send-to-mavros]
-#   --send-to-mavros   把带协方差位姿输出改为 /mavros/vision_pose/pose_cov
+# 用法: ./start_mid360s_fastlio.sh [--check] [--send-to-mavros] [--ev-mode pose|odom]
+#   --send-to-mavros   把外部定位送给飞控：pose 方式送 /mavros/vision_pose/pose_cov，
+#                      odom 方式送 /mavros/odometry/out（位姿 + 速度，要 MAVROS 用 MAVLink2）
+#   --ev-mode MODE     重力桥 ev_mode，默认 pose；说明见 gravity_bridge.launch
 #
 # 提示：桥接默认用固定安装补偿（mounting_source:=fixed，实测安装角 roll 0.5 /
 # pitch 18.8 / yaw 1.6 度，取 gravity_bridge.launch 的默认值），
@@ -30,22 +32,33 @@ ROS_MASTER_PORT=11311
 
 CHECK_ONLY=0
 SEND_TO_MAVROS=0
-for arg in "$@"; do
-    case "$arg" in
+EV_MODE="pose"
+usage() {
+    echo "用法: $0 [--check] [--send-to-mavros] [--ev-mode pose|odom]" >&2
+    echo "  --check            仅执行前置网络、依赖、状态及 launch 解析检查，不启动节点" >&2
+    echo "  --send-to-mavros   把外部定位送给飞控（pose 方式 /mavros/vision_pose/pose_cov，odom 方式 /mavros/odometry/out）" >&2
+    echo "  --ev-mode MODE     pose（默认，只发位姿）/ odom（位姿 + 速度）" >&2
+    exit 2
+}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --check)
             CHECK_ONLY=1
             ;;
         --send-to-mavros)
             SEND_TO_MAVROS=1
             ;;
+        --ev-mode)
+            EV_MODE="${2:-}"
+            shift
+            ;;
         *)
-            echo "用法: $0 [--check] [--send-to-mavros]" >&2
-            echo "  --check            仅执行前置网络、依赖、状态及 launch 解析检查，不启动节点" >&2
-            echo "  --send-to-mavros   把带协方差位姿输出改为 /mavros/vision_pose/pose_cov" >&2
-            exit 2
+            usage
             ;;
     esac
+    shift
 done
+case "$EV_MODE" in pose|odom) ;; *) echo "--ev-mode 只能是 pose 或 odom（收到：$EV_MODE）" >&2; usage ;; esac
 
 CHECK_FAILED=0
 
@@ -241,6 +254,7 @@ cat <<'EOF' > "$COMBINED_LAUNCH"
 <launch>
   <!-- 联合启动 MID-360S 驱动、FAST-LIO2 与重力对齐桥接 -->
   <arg name="send_to_mavros" default="false"/>
+  <arg name="ev_mode" default="pose"/>
 
   <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360s.launch">
     <arg name="rviz_enable" value="false"/>
@@ -253,6 +267,7 @@ cat <<'EOF' > "$COMBINED_LAUNCH"
 
   <include file="$(find fastlio_gravity_bridge)/launch/gravity_bridge.launch">
     <arg name="send_to_mavros" value="$(arg send_to_mavros)"/>
+    <arg name="ev_mode" value="$(arg ev_mode)"/>
   </include>
 </launch>
 EOF
@@ -292,10 +307,14 @@ if [[ $CHECK_ONLY -eq 1 ]]; then
 fi
 
 if [[ $SEND_TO_MAVROS -eq 1 ]]; then
-    ROSLAUNCH_ARGS=(send_to_mavros:=true)
-    echo "[INFO] 带协方差位姿输出目的地: /mavros/vision_pose/pose_cov"
+    ROSLAUNCH_ARGS=(send_to_mavros:=true "ev_mode:=$EV_MODE")
+    if [[ $EV_MODE == odom ]]; then
+        echo "[INFO] 外部定位（odom 方式，位姿 + 速度）送: /mavros/odometry/out"
+    else
+        echo "[INFO] 带协方差位姿输出目的地: /mavros/vision_pose/pose_cov"
+    fi
 else
-    ROSLAUNCH_ARGS=(send_to_mavros:=false)
+    ROSLAUNCH_ARGS=(send_to_mavros:=false "ev_mode:=$EV_MODE")
 fi
 
 echo "============================================================"

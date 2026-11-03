@@ -90,16 +90,49 @@ class BridgeMessagesTest : public ::testing::Test
     config_.gravity_in = "/test_bridge/gravity" + suffix;
     config_.odom_out = "/test_bridge/odom_world" + suffix;
     config_.pose_cov_out = "/test_bridge/pose_cov" + suffix;
+    config_.velocity_in = "/test_bridge/velocity" + suffix;
+    config_.vision_odom_out = "/test_bridge/vision_odom" + suffix;
     config_.publish_static_tf = false;  // 静态 TF 由单独的用例检查
 
     pub_gravity_ = nh_->advertise<geometry_msgs::Vector3Stamped>(config_.gravity_in, 1, true);
     pub_odom_ = nh_->advertise<nav_msgs::Odometry>(config_.odom_in, 10);
+    pub_velocity_ = nh_->advertise<geometry_msgs::Vector3Stamped>(config_.velocity_in, 10);
     sub_odom_ = nh_->subscribe(config_.odom_out, 50, &BridgeMessagesTest::onOdom, this);
     sub_pose_cov_ =
         nh_->subscribe(config_.pose_cov_out, 50, &BridgeMessagesTest::onPoseCov, this);
+    sub_vision_odom_ =
+        nh_->subscribe(config_.vision_odom_out, 50, &BridgeMessagesTest::onVisionOdom, this);
 
     odom_count_ = 0;
     pose_cov_count_ = 0;
+    vision_odom_count_ = 0;
+  }
+
+  void onVisionOdom(const nav_msgs::Odometry::ConstPtr &msg)
+  {
+    ++vision_odom_count_;
+    last_vision_odom_ = *msg;
+  }
+
+  /// odom 方式：额外等速度订阅和 vision_odom 发布连上。
+  void startOdomModeBridge()
+  {
+    config_.ev_mode = "odom";
+    startBridge();
+    ASSERT_TRUE(spinUntil([this] { return pub_velocity_.getNumSubscribers() > 0; }, 10.0));
+    ASSERT_TRUE(spinUntil([this] { return sub_vision_odom_.getNumPublishers() > 0; }, 10.0));
+  }
+
+  void publishVelocity(double stamp_sec, const Eigen::Vector3d &v_c,
+                       const std::string &frame_id = "camera_init")
+  {
+    geometry_msgs::Vector3Stamped msg;
+    msg.header.stamp = ros::Time().fromSec(stamp_sec);
+    msg.header.frame_id = frame_id;
+    msg.vector.x = v_c.x();
+    msg.vector.y = v_c.y();
+    msg.vector.z = v_c.z();
+    pub_velocity_.publish(msg);
   }
 
   void onOdom(const nav_msgs::Odometry::ConstPtr &msg)
@@ -171,13 +204,17 @@ class BridgeMessagesTest : public ::testing::Test
 
   ros::Publisher pub_gravity_;
   ros::Publisher pub_odom_;
+  ros::Publisher pub_velocity_;
   ros::Subscriber sub_odom_;
   ros::Subscriber sub_pose_cov_;
+  ros::Subscriber sub_vision_odom_;
 
   int odom_count_ = 0;
   int pose_cov_count_ = 0;
+  int vision_odom_count_ = 0;
   nav_msgs::Odometry last_odom_;
   geometry_msgs::PoseWithCovarianceStamped last_pose_cov_;
+  nav_msgs::Odometry last_vision_odom_;
 };
 
 /// 未收到有效初始化重力前只等待，不输出未对齐消息。
@@ -879,6 +916,154 @@ TEST_F(BridgeMessagesTest, FixedMountingUsesFullRpy)
   EXPECT_LT((q_mount.toRotationMatrix() - bridge_->mounting().toRotationMatrix())
                 .cwiseAbs().maxCoeff(),
             1e-12);
+}
+
+// ---------------------------------------------------------------------------
+// 送飞控方式 ev_mode：pose 只发位姿；odom 把位姿和同一时间戳的速度配成一条 Odometry。
+// ---------------------------------------------------------------------------
+
+TEST(BridgeConfigValidation, EvModeDefaultsToPose)
+{
+  const fgb::GravityBridge::Config config = loadConfigFrom("/test_bridge_config_ev_default");
+  EXPECT_TRUE(config.valid) << config.error;
+  EXPECT_EQ(config.ev_mode, "pose");
+  EXPECT_EQ(config.velocity_in, "/fastlio/velocity");
+  EXPECT_EQ(config.mavros_odom_topic, "/mavros/odometry/out");
+  EXPECT_EQ(config.mavros_odom_frame, "px4_odom");
+  EXPECT_DOUBLE_EQ(config.odom_velocity_std, 0.0);
+}
+
+TEST(BridgeConfigValidation, ReadsOdomModeParameters)
+{
+  const std::string ns = "/test_bridge_config_ev_odom";
+  ros::param::set(ns + "/ev_mode", std::string("odom"));
+  ros::param::set(ns + "/odom_velocity_std", 0.15);
+  const fgb::GravityBridge::Config config = loadConfigFrom(ns);
+  EXPECT_TRUE(config.valid) << config.error;
+  EXPECT_EQ(config.ev_mode, "odom");
+  EXPECT_DOUBLE_EQ(config.odom_velocity_std, 0.15);
+}
+
+TEST(BridgeConfigValidation, RejectsUnknownEvModeOrBadVelocityStd)
+{
+  ros::param::set("/test_bridge_config_ev_bad/ev_mode", std::string("vision_speed"));
+  fgb::GravityBridge::Config config = loadConfigFrom("/test_bridge_config_ev_bad");
+  EXPECT_FALSE(config.valid);
+  EXPECT_NE(config.error.find("vision_speed"), std::string::npos) << config.error;
+
+  for (const double bad : {-0.1, std::numeric_limits<double>::quiet_NaN()})
+  {
+    const std::string ns = "/test_bridge_config_ev_std_" + std::to_string(bad < 0.0 ? 0 : 1);
+    ros::param::set(ns + "/ev_mode", std::string("odom"));
+    ros::param::set(ns + "/odom_velocity_std", bad);
+    config = loadConfigFrom(ns);
+    EXPECT_FALSE(config.valid) << bad;
+    EXPECT_NE(config.error.find("odom_velocity_std"), std::string::npos) << config.error;
+  }
+}
+
+/// 构造时 ev_mode 非法：直接停住，不建立任何订阅/发布。
+TEST_F(BridgeMessagesTest, InvalidEvModeStopsTheBridge)
+{
+  config_.ev_mode = "both";
+  bridge_.reset(new fgb::GravityBridge(*nh_, config_));
+  EXPECT_EQ(bridge_->state(), fgb::GravityBridge::State::kFatal);
+  EXPECT_NE(bridge_->fatalReason().find("ev_mode"), std::string::npos) << bridge_->fatalReason();
+  EXPECT_EQ(pub_odom_.getNumSubscribers(), 0u);
+}
+
+/// pose 方式不订阅速度、不发 vision_odom，行为与加这个参数之前一致。
+TEST_F(BridgeMessagesTest, PoseModeSendsNoVelocity)
+{
+  startBridge();
+  EXPECT_EQ(pub_velocity_.getNumSubscribers(), 0u);
+  publishGravity(tiltedGravity(), 900.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+  publishOdom(900.5);
+  publishVelocity(900.5, Eigen::Vector3d(0.2, 0.0, 0.0));
+  ASSERT_TRUE(spinUntil([this] { return pose_cov_count_ > 0; }, 5.0));
+  spinUntil([this] { return vision_odom_count_ > 0; }, 0.3);
+  EXPECT_EQ(vision_odom_count_, 0);
+  EXPECT_EQ(bridge_->visionOdomCount(), 0u);
+}
+
+/// odom 方式：位姿与 drone_odom 输出一致，速度按真实物理关系还原成机体系速度；
+/// 帧名按 MAVROS odometry 插件的要求（父 px4_odom、子 drone_base），角速度未知填 NaN。
+TEST_F(BridgeMessagesTest, OdomModePairsPoseWithBodyVelocity)
+{
+  config_.odom_velocity_std = 0.2;
+  startOdomModeBridge();
+  // 机体水平启动、雷达按默认 20 度前倾安装
+  const Eigen::Matrix3d R_base_lidar = pitchRotation(kMountPitchDeg);
+  publishGravity(tiltedGravity(), 1000.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  // 之后机体偏航 90 度、抬头 5 度，沿机体系 (前 0.4, 左 0.1, 上 0.05) m/s 运动
+  const Eigen::Matrix3d R_now = (Eigen::AngleAxisd(M_PI / 2.0, Eigen::Vector3d::UnitZ()) *
+                                 Eigen::AngleAxisd(-5.0 * M_PI / 180.0, Eigen::Vector3d::UnitY()))
+                                    .toRotationMatrix();
+  const Eigen::Vector3d v_body_true(0.4, 0.1, 0.05);
+  odom_orientation_ = Eigen::Quaterniond(R_base_lidar.transpose() * R_now * R_base_lidar);
+  const Eigen::Vector3d v_c = R_base_lidar.transpose() * (R_now * v_body_true);
+
+  publishOdom(1000.5);
+  publishVelocity(1000.5, v_c);
+  ASSERT_TRUE(spinUntil([this] { return vision_odom_count_ > 0; }, 5.0));
+  ASSERT_TRUE(spinUntil([this] { return pose_cov_count_ > 0; }, 5.0));
+
+  EXPECT_EQ(last_vision_odom_.header.stamp, ros::Time().fromSec(1000.5));
+  EXPECT_EQ(last_vision_odom_.header.frame_id, "px4_odom");
+  EXPECT_EQ(last_vision_odom_.child_frame_id, "drone_base");
+  // 位姿（含协方差）与本地 pose_cov 输出完全一致
+  EXPECT_EQ(last_vision_odom_.pose.pose.position.x, last_pose_cov_.pose.pose.position.x);
+  EXPECT_EQ(last_vision_odom_.pose.pose.orientation.w, last_pose_cov_.pose.pose.orientation.w);
+  for (std::size_t i = 0; i < 36; ++i)
+  {
+    EXPECT_EQ(last_vision_odom_.pose.covariance[i], last_pose_cov_.pose.covariance[i]) << i;
+  }
+  const Eigen::Vector3d v_b(last_vision_odom_.twist.twist.linear.x,
+                            last_vision_odom_.twist.twist.linear.y,
+                            last_vision_odom_.twist.twist.linear.z);
+  EXPECT_LT((v_b - v_body_true).norm(), 1e-9) << v_b.transpose();
+  EXPECT_TRUE(std::isnan(last_vision_odom_.twist.twist.angular.x));
+  EXPECT_DOUBLE_EQ(last_vision_odom_.twist.covariance[0], 0.04);
+  EXPECT_DOUBLE_EQ(last_vision_odom_.twist.covariance[7], 0.04);
+  EXPECT_DOUBLE_EQ(last_vision_odom_.twist.covariance[14], 0.04);
+  EXPECT_EQ(bridge_->visionOdomCount(), 1u);
+}
+
+/// odom 方式：速度先到也能配上；配不上速度的位姿不送（计数），时间戳不同的速度不会被套用。
+TEST_F(BridgeMessagesTest, OdomModeSendsOnlyMatchedPairs)
+{
+  startOdomModeBridge();
+  publishGravity(tiltedGravity(), 1100.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+
+  // 速度先于位姿到达
+  publishVelocity(1100.5, Eigen::Vector3d(0.1, 0.0, 0.0));
+  spinUntil([] { return false; }, 0.2);
+  publishOdom(1100.5);
+  ASSERT_TRUE(spinUntil([this] { return vision_odom_count_ == 1; }, 5.0));
+
+  // 1101.0 的位姿没有速度；下一条位姿到来时记一次缺失，且 1101.0 不会被补发
+  publishOdom(1101.0);
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ == 2; }, 5.0));
+  publishVelocity(1100.9, Eigen::Vector3d(0.1, 0.0, 0.0));  // 时间戳对不上
+  spinUntil([] { return false; }, 0.2);
+  EXPECT_EQ(vision_odom_count_, 1);
+  publishOdom(1101.5);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->missingVelocityCount() == 1u; }, 5.0));
+  publishVelocity(1101.5, Eigen::Vector3d(0.1, 0.0, 0.0));
+  ASSERT_TRUE(spinUntil([this] { return vision_odom_count_ == 2; }, 5.0));
+  EXPECT_EQ(last_vision_odom_.header.stamp, ros::Time().fromSec(1101.5));
+
+  // 坐标系不对或非有限的速度被拒绝
+  publishOdom(1102.0);
+  publishVelocity(1102.0, Eigen::Vector3d(0.1, 0.0, 0.0), "drone_odom");
+  publishVelocity(1102.0,
+                  Eigen::Vector3d(std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0));
+  spinUntil([] { return false; }, 0.3);
+  EXPECT_EQ(vision_odom_count_, 2);
 }
 
 int main(int argc, char **argv)

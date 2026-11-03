@@ -748,6 +748,68 @@ TEST(GravityAlignmentMath, FixedMountingRpyRejectsNonFiniteAngles)
   expectQuaternionNear(out, keep, 0.0);
 }
 
+/// 速度转机体系：按真实物理关系造出 FAST-LIO 在 camera_init 下的速度，经桥接必须还原出
+/// 机体系的真实速度，与启动姿态、安装角、当前姿态都无关。前进 / 右移 / 上升 / 组合都要对。
+TEST(GravityAlignmentMath, VelocityToBodyRecoversTrueBodyVelocity)
+{
+  const double kRoll = 0.5;
+  const double kPitch = 18.8;
+  const double kYaw = 1.6;
+  const Eigen::Matrix3d R_base_lidar = baseFromLidarRpy(kRoll, kPitch, kYaw);
+  Eigen::Quaterniond q_ib;
+  ASSERT_TRUE(fgb::computeFixedMounting(kRoll, kPitch, kYaw, q_ib));
+
+  const Eigen::Matrix3d R_start = pitchBodyToWorld(4.0);  // 初始化时机体略前倾
+  fgb::AlignmentTransform transform;
+  ASSERT_TRUE(fgb::computeAlignmentTransform(gravityFromBodyAttitude(R_start, R_base_lidar),
+                                             transform));
+  const Eigen::Matrix3d R_now = (Eigen::AngleAxisd(70.0 * kDeg, Eigen::Vector3d::UnitZ()) *
+                                 Eigen::AngleAxisd(-8.0 * kDeg, Eigen::Vector3d::UnitY()) *
+                                 Eigen::AngleAxisd(5.0 * kDeg, Eigen::Vector3d::UnitX()))
+                                    .toRotationMatrix();
+  const Eigen::Quaterniond q_out =
+      transformOrientation(transform, q_ib, cameraInitFromLidar(R_start, R_now, R_base_lidar));
+  geometry_msgs::Quaternion q_msg;
+  q_msg.w = q_out.w();
+  q_msg.x = q_out.x();
+  q_msg.y = q_out.y();
+  q_msg.z = q_out.z();
+
+  const std::vector<Eigen::Vector3d> body_velocities = {
+      {0.5, 0.0, 0.0}, {0.0, -0.3, 0.0}, {0.0, 0.0, 0.2}, {0.12, -0.34, 0.05}};
+  for (const Eigen::Vector3d &v_body_true : body_velocities)
+  {
+    // FAST-LIO 的速度是雷达 IMU 在 camera_init（初始化时刻的雷达系）下的表达。
+    const Eigen::Vector3d v_world = R_now * v_body_true;
+    const Eigen::Vector3d v_c = (R_start * R_base_lidar).transpose() * v_world;
+    Eigen::Vector3d v_b;
+    ASSERT_TRUE(fgb::transformVelocityToBody(transform, q_msg, v_c, v_b));
+    EXPECT_LT((v_b - v_body_true).norm(), 1e-12) << v_b.transpose();
+  }
+}
+
+/// 非有限速度、无效姿态、未锁定对齐都必须拒绝。
+TEST(GravityAlignmentMath, VelocityToBodyRejectsInvalidInput)
+{
+  fgb::AlignmentTransform transform;
+  ASSERT_TRUE(fgb::computeAlignmentTransform(Eigen::Vector3d(0.0, 0.0, -kGravity), transform));
+  geometry_msgs::Quaternion q_msg;
+  q_msg.w = 1.0;
+  Eigen::Vector3d v_b;
+  ASSERT_TRUE(fgb::transformVelocityToBody(transform, q_msg, Eigen::Vector3d(1.0, 2.0, 3.0), v_b));
+  EXPECT_LT((v_b - Eigen::Vector3d(1.0, 2.0, 3.0)).norm(), kTol);
+
+  const double kNaN = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(fgb::transformVelocityToBody(transform, q_msg, Eigen::Vector3d(kNaN, 0.0, 0.0), v_b));
+
+  geometry_msgs::Quaternion zero;
+  zero.w = 0.0;
+  EXPECT_FALSE(fgb::transformVelocityToBody(transform, zero, Eigen::Vector3d(1.0, 0.0, 0.0), v_b));
+
+  fgb::AlignmentTransform unlocked;
+  EXPECT_FALSE(fgb::transformVelocityToBody(unlocked, q_msg, Eigen::Vector3d(1.0, 0.0, 0.0), v_b));
+}
+
 int main(int argc, char **argv)
 {
   testing::InitGoogleTest(&argc, argv);

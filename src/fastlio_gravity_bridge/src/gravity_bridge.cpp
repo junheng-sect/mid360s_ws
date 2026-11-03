@@ -1,5 +1,8 @@
 #include "fastlio_gravity_bridge/gravity_bridge.h"
 
+#include <cmath>
+#include <limits>
+
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
@@ -20,6 +23,21 @@ std::string fixedMountingError(const GravityBridge::Config &config)
          " contains a non-finite angle (fixed mounting)";
 }
 
+/// 送飞控方式的配置错误（构造与参数加载两处共用）；合法时返回空串。
+std::string evModeError(const GravityBridge::Config &config)
+{
+  if (!evModeIsKnown(config.ev_mode))
+  {
+    return "ev_mode='" + config.ev_mode + "' is invalid (expected pose / odom)";
+  }
+  if (!std::isfinite(config.odom_velocity_std) || config.odom_velocity_std < 0.0)
+  {
+    return "odom_velocity_std=" + std::to_string(config.odom_velocity_std) +
+           " must be finite and >= 0";
+  }
+  return "";
+}
+
 }  // namespace
 
 GravityBridge::GravityBridge(ros::NodeHandle &nh, const Config &config) : config_(config)
@@ -27,25 +45,58 @@ GravityBridge::GravityBridge(ros::NodeHandle &nh, const Config &config) : config
   // 先把安装旋转定下来：fixed 只取决于参数，与初始化重力无关。配置非法时直接进入
   // kFatal 并返回，连订阅/发布都不建立，避免静默发布错误姿态。
   if (!resolveMounting()) return;
+  const std::string ev_error = evModeError(config_);
+  if (!ev_error.empty())
+  {
+    enterFatalState(ev_error);
+    return;
+  }
 
   sub_gravity_ = nh.subscribe(config_.gravity_in, 10, &GravityBridge::gravityCallback, this);
   sub_odom_ = nh.subscribe(config_.odom_in, 200, &GravityBridge::odomCallback, this);
 
+  // 位姿只在 pose 方式送 MAVROS；odom 方式位姿随速度一起走 ODOMETRY，绝不两路同时喂飞控。
+  const bool odom_mode = config_.ev_mode == "odom";
+  const bool pose_to_mavros = config_.send_to_mavros && !odom_mode;
   pub_odom_ = nh.advertise<nav_msgs::Odometry>(config_.odom_out, 100);
   pub_pose_cov_ = nh.advertise<geometry_msgs::PoseWithCovarianceStamped>(
-      config_.send_to_mavros ? config_.mavros_pose_cov_topic : config_.pose_cov_out, 100);
-  if (config_.send_to_mavros)
+      pose_to_mavros ? config_.mavros_pose_cov_topic : config_.pose_cov_out, 100);
+  if (pose_to_mavros)
   {
     // 目的地改为 MAVROS 时保留一路本地回显，便于板端 / RViz 侧监视（launch 注释有说明）。
     pub_pose_cov_echo_ = nh.advertise<geometry_msgs::PoseWithCovarianceStamped>(
         config_.pose_cov_out, 100);
   }
+  if (odom_mode)
+  {
+    sub_velocity_ =
+        nh.subscribe(config_.velocity_in, 200, &GravityBridge::velocityCallback, this);
+    pub_vision_odom_ = nh.advertise<nav_msgs::Odometry>(
+        config_.send_to_mavros ? config_.mavros_odom_topic : config_.vision_odom_out, 100);
+    if (config_.send_to_mavros)
+    {
+      pub_vision_odom_echo_ = nh.advertise<nav_msgs::Odometry>(config_.vision_odom_out, 100);
+    }
+  }
 
   ROS_INFO("[gravity_bridge] in: %s + %s -> out: %s, pose_cov: %s%s",
            config_.odom_in.c_str(), config_.gravity_in.c_str(), config_.odom_out.c_str(),
-           config_.send_to_mavros ? config_.mavros_pose_cov_topic.c_str()
-                                  : config_.pose_cov_out.c_str(),
-           config_.send_to_mavros ? " (+local echo)" : "");
+           pose_to_mavros ? config_.mavros_pose_cov_topic.c_str() : config_.pose_cov_out.c_str(),
+           pose_to_mavros ? " (+local echo)" : "");
+  if (odom_mode)
+  {
+    ROS_INFO("[gravity_bridge] ev_mode=odom: pose + %s -> %s%s (frame %s -> %s, velocity std "
+             "%.3f m/s, 0 = EKF2_EVV_NOISE decides)",
+             config_.velocity_in.c_str(),
+             config_.send_to_mavros ? config_.mavros_odom_topic.c_str()
+                                    : config_.vision_odom_out.c_str(),
+             config_.send_to_mavros ? " (+local echo)" : "", config_.mavros_odom_frame.c_str(),
+             config_.output_child_frame.c_str(), config_.odom_velocity_std);
+  }
+  else
+  {
+    ROS_INFO("[gravity_bridge] ev_mode=pose: pose only, no velocity to the flight controller");
+  }
   ROS_INFO("[gravity_bridge] frames: %s -> %s -> %s -> %s, static_tf: %s",
            config_.world_frame.c_str(), config_.input_frame.c_str(),
            config_.input_child_frame.c_str(), config_.output_child_frame.c_str(),
@@ -117,6 +168,23 @@ GravityBridge::Config GravityBridge::loadConfig(ros::NodeHandle &pnh)
                          config.mavros_pose_cov_topic);
   pnh.param<bool>("publish_static_tf", config.publish_static_tf, config.publish_static_tf);
   pnh.param<bool>("send_to_mavros", config.send_to_mavros, config.send_to_mavros);
+  pnh.param<std::string>("ev_mode", config.ev_mode, config.ev_mode);
+  pnh.param<std::string>("velocity_in", config.velocity_in, config.velocity_in);
+  pnh.param<std::string>("vision_odom_out", config.vision_odom_out, config.vision_odom_out);
+  pnh.param<std::string>("mavros_odom_topic", config.mavros_odom_topic,
+                         config.mavros_odom_topic);
+  pnh.param<std::string>("mavros_odom_frame", config.mavros_odom_frame,
+                         config.mavros_odom_frame);
+  pnh.param<double>("odom_velocity_std", config.odom_velocity_std, config.odom_velocity_std);
+
+  const std::string ev_error = evModeError(config);
+  if (!ev_error.empty())
+  {
+    config.valid = false;
+    config.error = ev_error;
+    ROS_ERROR("[gravity_bridge] %s; refusing to start.", config.error.c_str());
+    return config;
+  }
 
   // 安装旋转的非法配置不再静默回退（旧实现会退回 none 并发出一条告警），
   // 而是标记配置非法；节点入口据此拒绝启动，避免对外发布错误姿态。
@@ -391,6 +459,90 @@ void GravityBridge::odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
   last_published_stamp_ = msg->header.stamp;
   has_last_published_stamp_ = true;
   ++published_count_;
+
+  if (config_.ev_mode == "odom")
+  {
+    // FAST-LIO 在同一次回调里紧接着 /Odometry 发同一时间戳的速度，上一条位姿到现在还没配上，
+    // 说明速度没来（FAST-LIO 没带 /fastlio/velocity，或时间戳对不上）：这条位姿不送飞控。
+    if (has_pending_pose_)
+    {
+      ++missing_velocity_count_;
+      ROS_ERROR_THROTTLE(5.0,
+                         "[gravity_bridge] ev_mode=odom: no %s with stamp %.9f, that pose was NOT "
+                         "sent to the flight controller (%zu missing so far).",
+                         config_.velocity_in.c_str(), pending_pose_.header.stamp.toSec(),
+                         missing_velocity_count_);
+    }
+    pending_pose_ = pose_msg;
+    has_pending_pose_ = true;
+    tryPublishVisionOdom();
+  }
+}
+
+void GravityBridge::velocityCallback(const geometry_msgs::Vector3Stamped::ConstPtr &msg)
+{
+  if (state_ == State::kFatal) return;
+
+  if (msg->header.frame_id != config_.input_frame)
+  {
+    ++rejected_count_;
+    ROS_ERROR_THROTTLE(5.0,
+                       "[gravity_bridge] rejecting velocity: frame_id is '%s', expected '%s'.",
+                       msg->header.frame_id.c_str(), config_.input_frame.c_str());
+    return;
+  }
+  if (!isFiniteVector3(msg->vector.x, msg->vector.y, msg->vector.z))
+  {
+    ++rejected_count_;
+    ROS_ERROR_THROTTLE(5.0, "[gravity_bridge] rejecting velocity: non-finite values.");
+    return;
+  }
+
+  last_velocity_ = *msg;
+  has_velocity_ = true;
+  tryPublishVisionOdom();
+}
+
+void GravityBridge::tryPublishVisionOdom()
+{
+  if (!has_pending_pose_ || !has_velocity_) return;
+  if (last_velocity_.header.stamp != pending_pose_.header.stamp) return;
+  has_pending_pose_ = false;
+
+  Eigen::Vector3d v_b;
+  const Eigen::Vector3d v_c(last_velocity_.vector.x, last_velocity_.vector.y,
+                            last_velocity_.vector.z);
+  if (!transformVelocityToBody(alignment_, pending_pose_.pose.pose.orientation, v_c, v_b))
+  {
+    ++rejected_count_;
+    ROS_ERROR_THROTTLE(5.0, "[gravity_bridge] rejecting velocity: transform failed.");
+    return;
+  }
+
+  // nav_msgs/Odometry 约定：pose 在 header.frame_id 下，twist 在 child_frame_id（机体）下。
+  // 角速度 FAST-LIO 没给，填 NaN 表示未知（PX4 的 EKF 不用外部角速度）。
+  nav_msgs::Odometry out;
+  out.header.stamp = pending_pose_.header.stamp;
+  out.header.frame_id = config_.mavros_odom_frame;
+  out.child_frame_id = config_.output_child_frame;
+  out.pose = pending_pose_.pose;
+  out.twist.twist.linear.x = v_b.x();
+  out.twist.twist.linear.y = v_b.y();
+  out.twist.twist.linear.z = v_b.z();
+  out.twist.twist.angular.x = std::numeric_limits<double>::quiet_NaN();
+  out.twist.twist.angular.y = std::numeric_limits<double>::quiet_NaN();
+  out.twist.twist.angular.z = std::numeric_limits<double>::quiet_NaN();
+  const double velocity_var = config_.odom_velocity_std * config_.odom_velocity_std;
+  out.twist.covariance[0] = velocity_var;
+  out.twist.covariance[7] = velocity_var;
+  out.twist.covariance[14] = velocity_var;
+
+  pub_vision_odom_.publish(out);
+  if (pub_vision_odom_echo_)
+  {
+    pub_vision_odom_echo_.publish(out);
+  }
+  ++vision_odom_count_;
 }
 
 }  // namespace fastlio_gravity_bridge

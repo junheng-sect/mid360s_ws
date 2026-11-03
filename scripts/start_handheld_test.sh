@@ -14,6 +14,7 @@
 #   --fix-params        飞控参数不符时自动写入（含 RC 录包所需的 SDLOG_MODE=3）
 #   --require-disarmed  飞控已解锁则中止（默认只告警，适配无桨台架测试）
 #   --no-net-check      跳过雷达网口/ping 检查（调试用）
+#   --ev-mode MODE      外部定位送飞控的方式：pose（默认，只发位姿）/ odom（位姿 + 速度，要 MAVROS 用 MAVLink2）
 #   -h|--help           帮助
 #
 # 本脚本是「逐项体检」入口；只想快速把链路拉起来请用同目录 fusion.sh（一条统一
@@ -50,6 +51,7 @@ LIDAR_IP="192.168.1.194"
 CHECK_ONLY=0; FIX_PARAMS=0; NET_CHECK=1
 DO_RECORD=1; DO_LIDAR=1; REQUIRE_DISARMED=0
 BAG_PREFIX="noprop"; BAG_DIR="/home/orangepi/test_data/bags"
+EV_MODE="pose"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -61,12 +63,14 @@ while [ $# -gt 0 ]; do
     --fix-params) FIX_PARAMS=1 ;;
     --require-disarmed) REQUIRE_DISARMED=1 ;;
     --no-net-check) NET_CHECK=0 ;;
-    -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --ev-mode) EV_MODE="${2:-}"; shift ;;
+    -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1（-h 看用法）" >&2; exit 2 ;;
   esac
   shift
 done
 [ -n "$BAG_PREFIX" ] || { echo "包名前缀不能为空" >&2; exit 2; }
+case "$EV_MODE" in pose|odom) ;; *) echo "--ev-mode 只能是 pose 或 odom（收到：$EV_MODE）" >&2; exit 2 ;; esac
 
 mkdir -p "$LOG_DIR" "$BAG_DIR"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -409,7 +413,19 @@ else
 fi
 if [ $((EV_CTRL & 2)) -ne 0 ]; then ok "EV 垂直位置融合已开启（bit1）"; else warn "EV 垂直位置融合未开（bit1）：高度不跟随视觉"; fi
 if [ $((EV_CTRL & 8)) -ne 0 ]; then ok "EV 偏航融合已开启（bit3）"; else warn "EV 偏航融合未开（bit3）：航向将依赖磁罗盘"; fi
-[ $((EV_CTRL & 4)) -ne 0 ] && warn "EV 3D 速度位(bit2)已开，但本链路只发位姿不发速度，该位无数据源"
+if [ "$EV_MODE" = "odom" ]; then
+  if [ $((EV_CTRL & 4)) -ne 0 ]; then ok "EV 速度融合已开启（bit2），odom 方式送的速度会被融合"
+  else warn "EV 速度融合未开（bit2）：odom 方式送的速度飞控只记录不融合（要融合改 EKF2_EV_CTRL=$((EV_CTRL | 4))）"; fi
+  _proto="$(timeout 5 rosparam get /mavros/fcu_protocol 2>/dev/null)"
+  if [ "$_proto" = "v2.0" ]; then
+    ok "常驻 MAVROS 用 MAVLink2（ODOMETRY 发得出去）"
+  else
+    err "--ev-mode odom 要 MAVROS 用 MAVLink2，常驻 MAVROS 是 fcu_protocol=${_proto:-读不到}（ODOMETRY 会被丢掉）"
+    stop_everything; exit 1
+  fi
+else
+  [ $((EV_CTRL & 4)) -ne 0 ] && warn "EV 3D 速度位(bit2)已开，但 pose 方式只发位姿不发速度，该位无数据源（要发速度用 --ev-mode odom）"
+fi
 if [ "${GPS_CTRL:-x}" = "0" ]; then ok "GPS 融合已关闭"; else warn "EKF2_GPS_CTRL=$GPS_CTRL 非 0，无 GPS 时建议置 0"; need_fix=1; fi
 if [ "${HGT_REF:-x}" = "3" ]; then ok "高度主参考为 Vision(3)"; else warn "EKF2_HGT_REF=$HGT_REF 非 Vision(3)"; need_fix=1; fi
 
@@ -455,9 +471,14 @@ fi
 
 # ================================================ 启动雷达 + FAST-LIO + 桥接 =
 if [ "$DO_LIDAR" -eq 1 ]; then
-  hr; log "步骤 4/5：启动 MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接（位姿送 /mavros/vision_pose/pose_cov）"
+  if [ "$EV_MODE" = "odom" ]; then
+    EV_MAVROS_TOPIC="/mavros/odometry/out"; EV_LOCAL_TOPIC="/fastlio/vision_odom"
+  else
+    EV_MAVROS_TOPIC="/mavros/vision_pose/pose_cov"; EV_LOCAL_TOPIC="/fastlio/vision_pose_cov"
+  fi
+  hr; log "步骤 4/5：启动 MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接（$EV_MODE 方式，送 $EV_MAVROS_TOPIC）"
   cd "$WS"
-  start_child "$PIDFILE_FASTLIO" "$LOG_DIR/fastlio_${STAMP}.log" "$FASTLIO_LAUNCHER" --send-to-mavros
+  start_child "$PIDFILE_FASTLIO" "$LOG_DIR/fastlio_${STAMP}.log" "$FASTLIO_LAUNCHER" --send-to-mavros --ev-mode "$EV_MODE"
   log "雷达/FAST-LIO/桥接 pid=$CHILD_PID（日志：$LOG_DIR/fastlio_${STAMP}.log）"
 
   wait_for "重力桥接节点已注册" 60 bash -c 'rosnode list 2>/dev/null | grep -qx /gravity_bridge' || {
@@ -474,15 +495,22 @@ if [ "$DO_LIDAR" -eq 1 ]; then
     err "只有显式改用旧的 mounting_source:=gravity 时才要求初始化时机体水平"
     err "看日志：$LOG_DIR/fastlio_${STAMP}.log"; stop_everything; exit 1
   }
-  info="$(timeout 5 rostopic info /mavros/vision_pose/pose_cov 2>&1)"
+  if [ "$EV_MODE" = "odom" ]; then
+    # odom 方式位姿要和同一时间戳的速度配上才送：FAST-LIO 没发 /fastlio/velocity 时这里不会有
+    wait_for "odom 方式：位姿 + 速度已配对（$EV_LOCAL_TOPIC）" 20 topic_hz_ok "$EV_LOCAL_TOPIC" || {
+      err "桥接没有输出 $EV_LOCAL_TOPIC：多半是 FAST-LIO 没发 /fastlio/velocity（重编 fast_lio？），飞控收不到外部定位"
+      err "看日志：$LOG_DIR/fastlio_${STAMP}.log"; stop_everything; exit 1
+    }
+  fi
+  info="$(timeout 5 rostopic info "$EV_MAVROS_TOPIC" 2>&1)"
   echo "$info" | grep -q "/gravity_bridge" && ok "发布者 /gravity_bridge" || { err "发布者异常：$info"; stop_everything; exit 1; }
-  echo "$info" | grep -q "/mavros" && ok "订阅者 /mavros（飞控已在收位姿）" || { err "MAVROS 未订阅 /mavros/vision_pose/pose_cov"; stop_everything; exit 1; }
+  echo "$info" | grep -q "/mavros" && ok "订阅者 /mavros（飞控已在收外部定位）" || { err "MAVROS 未订阅 $EV_MAVROS_TOPIC"; stop_everything; exit 1; }
 
   wait_for "EKF 已获得本地水平位置（pos_horiz_rel=True）" 40 \
     bash -c '[ "$(timeout 8 rostopic echo -n1 /mavros/estimator_status 2>/dev/null | awk "/^pos_horiz_rel_status_flag:/{print \$2}")" = "True" ]' \
     || warn "EKF 仍未报告有效水平位置，检查 EKF2_EV_CTRL/GPS_CTRL 与飞控日志"
 
-  for x in /fastlio/vision_pose_cov /mavros/local_position/pose; do
+  for x in "$EV_LOCAL_TOPIC" /mavros/local_position/pose; do
     log "频率 $x: $(timeout 7 rostopic hz "$x" 2>&1 | awk '/average rate/{print $3 " Hz"}' | head -1)"
   done
 else

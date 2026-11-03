@@ -40,9 +40,25 @@
     send_to_mavros:=true 时，带协方差位姿的输出目的地改为 /mavros/vision_pose/pose_cov，
     同时在 pose_cov_out 上保留一路本地回显（便于板端与 RViz 侧监视）。
     启用 MAVROS 时需在 MAVROS 侧设置 vision_pose/tf/listen=false（用消息订阅代替 TF 监听）。
+
+    ev_mode 选送飞控的方式，启动时定、运行中不切换：
+      pose（默认）：只发位姿，走上面的 /mavros/vision_pose/pose_cov（VISION_POSITION_ESTIMATE）；
+      odom：位姿 + 速度，走 /mavros/odometry/out（ODOMETRY）。速度取 FAST-LIO 的 /fastlio/velocity
+            （与 /Odometry 同时间戳的 camera_init 速度），转成机体系 drone_base 下的速度；同一时间戳的
+            位姿和速度配上才发，配不上的位姿不送飞控（限频报错）。本地回显 /fastlio/vision_odom。
+            要求 MAVROS 用 MAVLink2（ODOMETRY 是 v2 消息），飞控 EKF2_EV_CTRL 带速度位（bit2，11 -> 15）
+            才会真的融合速度，不带时飞控只记录。PX4 把 ODOMETRY 当 EV 自有坐标系（FRD）、
+            VISION_POSITION_ESTIMATE 当 NED，两种方式中途切换会让 EKF 重新对准航向。
+    odom_velocity_std：报给飞控的速度标准差，PX4 取 max(EKF2_EVV_NOISE², 它的平方)，0 = 由 EVV_NOISE 决定。
   -->
 
   <arg name="send_to_mavros"     default="false" />
+  <arg name="ev_mode"            default="pose" />
+  <arg name="velocity_in"        default="/fastlio/velocity" />
+  <arg name="vision_odom_out"    default="/fastlio/vision_odom" />
+  <arg name="mavros_odom_topic"  default="/mavros/odometry/out" />
+  <arg name="mavros_odom_frame"  default="px4_odom" />
+  <arg name="odom_velocity_std"  default="0.0" />
   <arg name="odom_in"            default="/Odometry" />
   <arg name="gravity_in"         default="/fastlio/gravity_init" />
   <arg name="odom_out"           default="/fastlio/odom_world" />
@@ -75,5 +91,11 @@
     <param name="mavros_pose_cov_topic" type="string" value="$(arg mavros_pose_cov_topic)" />
     <param name="publish_static_tf"  type="bool"   value="$(arg publish_static_tf)" />
     <param name="send_to_mavros"     type="bool"   value="$(arg send_to_mavros)" />
+    <param name="ev_mode"            type="string" value="$(arg ev_mode)" />
+    <param name="velocity_in"        type="string" value="$(arg velocity_in)" />
+    <param name="vision_odom_out"    type="string" value="$(arg vision_odom_out)" />
+    <param name="mavros_odom_topic"  type="string" value="$(arg mavros_odom_topic)" />
+    <param name="mavros_odom_frame"  type="string" value="$(arg mavros_odom_frame)" />
+    <param name="odom_velocity_std"  type="double" value="$(arg odom_velocity_std)" />
   </node>
 </launch>
