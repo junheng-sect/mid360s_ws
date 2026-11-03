@@ -341,20 +341,21 @@ roscore 和 MAVROS 是开机就起的两个 systemd 服务，fusion 没跑时也
 
 ## fusion 系留控制开关
 
-板端默认启动定位、RC录包以及绕线器控制（MAVROS 开机常驻，见上一节）：
+板端默认启动定位和RC录包，绕线器控制默认关闭（MAVROS 开机常驻，见上一节）：
 
 ```bash
 cd /home/orangepi/mid360s_ws/scripts
 ./fusion.sh
 ```
 
-非系留测试关闭绕线器；仍保留定位和RC录包：
+系留时显式开启绕线器：
 
 ```bash
-./fusion.sh --no-winch
+./fusion.sh --winch
 ```
 
-也可以独立关闭录包：`./fusion.sh --no-winch --no-record`。
+`--no-winch` 仍可显式关闭，兼容原有命令。
+也可以独立关闭录包：`./fusion.sh --no-record`。
 直接调用launch时，对应开关为 `winch:=false`（默认true）。
 
 绕线器开启时，入口追加加载 `/home/orangepi/orange/devel/setup.bash --extend`，

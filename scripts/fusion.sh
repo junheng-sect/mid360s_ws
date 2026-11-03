@@ -3,14 +3,15 @@
 # 融合快速启动（fusion）：在常驻 roscore / MAVROS 上，用几个单独的 roslaunch 拉起整条链路
 #   定位核心（required，整组进退）：MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接(位姿送飞控)
 #   + 附属（RC 通道 6 触发录包自动重启、系留绕线器不重启）；MAVROS 开机常驻，不归本脚本起停
-#   + 系留绕线器默认开启（非系留使用 --no-winch）
+#   + 系留绕线器默认关闭（系留时使用 --winch 开启）
 #   + OV13855 相机预览（独立 roslaunch，见 launch/camera.launch）
 #
 # 路径: /home/orangepi/mid360s_ws/scripts/fusion.sh
 # launch: scripts/launch/ 下 fusion_core / fusion_aux / camera（fusion.launch 是手动合集）
 # 用法: ./fusion.sh [选项]
 #   --no-record         不启动 RC 触发录包节点（本次不会有 bag）
-#   --no-winch          不启动绕线器控制（非系留测试）
+#   --winch             启动绕线器控制（系留时显式开启）
+#   --no-winch          不启动绕线器控制（默认，保留兼容）
 #   --no-camera         不启动相机预览（OV13855 驱动 + AprilTag 视觉节点）
 #   --bag-prefix NAME   包名前缀（默认 noprop，产出 NAME_000001.bag）
 #   --bag-dir PATH      包输出目录（默认 /home/orangepi/test_data/bags）
@@ -90,7 +91,7 @@ FC_TIME_TIMEOUT=20    # 飞控校时脚本的总时限（秒），正常 5~10 s
 
 DO_RECORD=1
 ALLOW_UNSYNCED_CLOCK=0
-DO_WINCH=1
+DO_WINCH=0
 DO_CAMERA=1
 BAG_PREFIX="noprop"
 BAG_DIR="/home/orangepi/test_data/bags"
@@ -101,13 +102,14 @@ EV_MODE="pose"
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-record) DO_RECORD=0 ;;
+    --winch) DO_WINCH=1 ;;
     --no-winch) DO_WINCH=0 ;;
     --no-camera) DO_CAMERA=0 ;;
     --bag-prefix) BAG_PREFIX="${2:-}"; shift ;;
     --bag-dir) BAG_DIR="${2:-}"; shift ;;
     --allow-unsynced-clock) ALLOW_UNSYNCED_CLOCK=1 ;;
     --ev-mode) EV_MODE="${2:-}"; shift ;;
-    -h|--help) sed -n '3,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1（-h 看用法）" >&2; exit 2 ;;
   esac
   shift
@@ -667,7 +669,7 @@ if [ "$DO_WINCH" -eq 1 ]; then
   warn "绕线器启动即发送备用 DUTY；定位通信就绪后按 YAML 自动启用；退出会尝试发送备用 DUTY"
 else
   WINCH_ARG=false
-  log "已指定 --no-winch：不启动绕线器控制，不由 fusion 发送 DUTY"
+  log "绕线器：关闭（默认，--winch 可开启），不由 fusion 发送 DUTY"
 fi
 if [ "$DO_CAMERA" -eq 1 ]; then
   log "相机预览：核心节点注册后单独拉起（非 required，掉线不影响定位）"
