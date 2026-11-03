@@ -100,6 +100,29 @@ def topic_type_registry():
         registry['/livox/lidar'] = CustomMsg
     except Exception:
         pass
+    try:
+        from sensor_msgs.msg import PointCloud2
+        from traj_utils.msg import Bspline
+        from drone_navigation.msg import NavigationCommand
+        registry.update({
+            '/fastlio/velocity': Vector3Stamped,
+            '/cloud_registered': PointCloud2,
+            '/drone_nav/odom': Odometry,
+            '/drone_nav/sensor_odom': Odometry,
+            '/drone_nav/cloud': PointCloud2,
+            '/drone_nav/planner_goal': PoseStamped,
+            '/drone_nav/bspline': Bspline,
+            '/drone_nav/command': NavigationCommand,
+            '/drone_nav/setpoint_preview': PositionTarget,
+            '/drone_nav/input_status': String,
+            '/drone_nav/planner_status': String,
+            '/drone_nav/executor_status': String,
+            '/drone_nav/gateway_status': String,
+            '/drone_reloc/status': String,
+            '/drone_reloc/result': String,
+        })
+    except ImportError:
+        rospy.logwarn('navigation recording types not built; existing recorder topics remain available')
     return registry
 
 

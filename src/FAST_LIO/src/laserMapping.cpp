@@ -621,6 +621,13 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
     }
 
     pubOdomAftMapped.publish(odomAftMapped);
+    // Navigation side channel: no change to the existing pose or /Odometry twist.
+    static ros::NodeHandle nav_nh;
+    static ros::Publisher velocity_pub=nav_nh.advertise<geometry_msgs::Vector3Stamped>("/fastlio/velocity",10);
+    geometry_msgs::Vector3Stamped velocity;
+    velocity.header=odomAftMapped.header;
+    velocity.vector.x=state_point.vel.x();velocity.vector.y=state_point.vel.y();velocity.vector.z=state_point.vel.z();
+    velocity_pub.publish(velocity);
 
     static tf::TransformBroadcaster br;
     tf::Transform                   transform;

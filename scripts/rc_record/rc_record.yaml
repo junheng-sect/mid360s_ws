@@ -34,6 +34,25 @@ rc_bag_recorder:
     - /front_marker_control/status            # 状态文本（门控原因、目标、采样统计）
     - /front_marker_control/position_error    # 视觉位置误差（机体系）
     - /mavros/setpoint_raw/local              # 实际发给飞控的 setpoint（20 Hz）
+    - /fastlio/velocity
+    - /cloud_registered
+    - /drone_nav/odom
+    - /drone_nav/sensor_odom
+    - /drone_nav/cloud
+    - /drone_nav/planner_goal
+    - /drone_nav/bspline
+    - /drone_nav/command
+    - /drone_nav/setpoint_preview
+    - /drone_nav/input_status
+    - /drone_nav/planner_status
+    - /drone_nav/executor_status
+    - /drone_nav/gateway_status
+    - /drone_reloc/status
+    - /drone_reloc/result
+    - /tf
+    - /tf_static
   # 只在变化时发布的 latch 话题：平时缓存最新一条，开包时先补写当前值（须同时在 topics 里）
   latched_topics:
+    - /tf_static
+    - /drone_reloc/result
     - /front_marker_control/control_mode
