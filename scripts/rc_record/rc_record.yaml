@@ -15,6 +15,7 @@ rc_bag_recorder:
   bag_directory: /home/orangepi/test_data/bags
   bag_prefix: handheld       # 包名 handheld_000001.bag，序号文件 .handheld_sequence
   record_raw_cloud: false    # true 则额外录 /livox/lidar（约 +5 MB/s）
+  record_registered_cloud: false  # true 则额外录 /cloud_registered（约 +3 MB/s）
   status_rate: 2.0           # /rc_record/status 发布频率
 
   # ---- 录制话题（必须都在 bag_recorder_node.py 的类型登记表里）----
@@ -37,7 +38,6 @@ rc_bag_recorder:
     - /front_marker_control/position_error    # 视觉位置误差（机体系）
     - /mavros/setpoint_raw/local              # 实际发给飞控的 setpoint（20 Hz）
     - /fastlio/velocity
-    - /cloud_registered
     - /drone_nav/odom
     - /drone_nav/sensor_odom
     - /drone_nav/cloud

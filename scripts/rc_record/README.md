@@ -103,12 +103,15 @@ rostopic echo /rc_record/bag_path    # latched："OPEN <path>" / "CLOSED <path>"
 | `stop_on_rc_loss` | `false` | false: 丢遥控也不截断正在录的包 |
 | `bag_directory` / `bag_prefix` | `/home/orangepi/test_data/bags` / `handheld` | 输出位置与包名前缀 |
 | `record_raw_cloud` | `false` | true 额外录 `/livox/lidar`（约 +5 MB/s，需先 source mid360s_ws/devel） |
+| `record_registered_cloud` | `false` | true 额外录 `/cloud_registered`（约 +3 MB/s）；可用 `RC_RECORD_REGISTERED_CLOUD=true` 覆盖 |
 | `status_rate` | `2.0` | `/rc_record/status` 频率 |
-| `topics` | 14 个（见 yaml） | 录制话题；类型必须在节点的登记表里，否则启动时跳过并报错 |
-| `latched_topics` | `/front_marker_control/control_mode` | 只在变化时发布的 latch 话题：平时缓存最新一条，开包时先补写当前值（时间记为开包时刻）；须同时在 `topics` 里 |
+| `topics` | 见 yaml | 录制话题；类型必须在节点的登记表里，否则启动时跳过并报错 |
+| `latched_topics` | 见 yaml | 只在变化时发布的 latch 话题：平时缓存最新一条，开包时先补写当前值（时间记为开包时刻）；须同时在 `topics` 里 |
 
-已从默认清单移除 4 个重复话题（类型仍在登记表里，需要时在 yaml 加回即可）：
-`/fastlio/vision_pose_cov` 与 `/mavros/vision_pose/pose_cov` 逐条相同（桥接本地回显）；`/tf` 只有 camera_init→body，与 `/Odometry` 相同；`/tf_static` 是 latched 消息，节点启动时就收到、开包后不会再来，实际录不到；`/mavros/estimator_status` 在飞控 ulog 的 estimator_status 里更全。
+`/fastlio/velocity`、`/cloud_registered` 的标准消息类型不依赖导航包构建。
+`/cloud_registered` 默认不订阅、不录制；需要时启用 `record_registered_cloud`，
+或在自定义 `topics` 中显式指定。导航状态、轨迹和 TF 的默认清单见 yaml；
+`/tf_static` 与重定位结果在开包时补写缓存值。
 
 ## 控制话题记录
 

@@ -172,8 +172,12 @@ for name in ('/front_marker_control/control_mode', '/front_marker_control/status
 assert topic in DEFAULT_LATCHED_TOPICS
 with open(os.path.join(os.environ['RC_RECORD_TEST_DIR'], 'rc_record.yaml')) as stream:
     config = yaml.safe_load(stream)['rc_bag_recorder']
-assert set(DEFAULT_TOPICS) == set(config['topics']), set(DEFAULT_TOPICS) ^ set(config['topics'])
-assert config['latched_topics'] == DEFAULT_LATCHED_TOPICS
+assert set(DEFAULT_TOPICS) <= set(config['topics'])
+assert set(config['topics']) <= set(registry)
+assert '/cloud_registered' not in config['topics']
+assert config['record_registered_cloud'] is False
+assert set(DEFAULT_LATCHED_TOPICS) <= set(config['latched_topics'])
+assert set(config['latched_topics']) <= set(config['topics'])
 # 两次变化都发生在开包前：每个包里只有开包时补写的那一条，内容是开包时刻的当前值。
 expected = ['ALIGN', 'POS_HOLD']
 paths = sorted(glob.glob(os.path.join(sys.argv[1], 'e2e_*.bag')))

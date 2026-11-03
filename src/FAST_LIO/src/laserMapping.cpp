@@ -587,7 +587,7 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const ros::Publisher & pubOdomAftMapped)
+void publish_odometry(const ros::Publisher & pubOdomAftMapped, const ros::Publisher & pubVelocity)
 {
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
@@ -622,12 +622,10 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
 
     pubOdomAftMapped.publish(odomAftMapped);
     // Navigation side channel: no change to the existing pose or /Odometry twist.
-    static ros::NodeHandle nav_nh;
-    static ros::Publisher velocity_pub=nav_nh.advertise<geometry_msgs::Vector3Stamped>("/fastlio/velocity",10);
     geometry_msgs::Vector3Stamped velocity;
     velocity.header=odomAftMapped.header;
     velocity.vector.x=state_point.vel.x();velocity.vector.y=state_point.vel.y();velocity.vector.z=state_point.vel.z();
-    velocity_pub.publish(velocity);
+    pubVelocity.publish(velocity);
 
     static tf::TransformBroadcaster br;
     tf::Transform                   transform;
@@ -880,6 +878,8 @@ int main(int argc, char** argv)
             ("/Laser_map", 100000);
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry> 
             ("/Odometry", 100000);
+    ros::Publisher pubVelocity = nh.advertise<geometry_msgs::Vector3Stamped>
+            ("/fastlio/velocity", 10);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
     /* Latched gravity of this run, expressed in camera_init. Published once when the
@@ -1015,7 +1015,7 @@ int main(int argc, char** argv)
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped);
+            publish_odometry(pubOdomAftMapped, pubVelocity);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();

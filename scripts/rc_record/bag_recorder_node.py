@@ -25,7 +25,7 @@ offboard_bag_recorder 一致），不 fork rosbag record 进程；bag 名用六�
 参数（rospy 私有参数，命令行可直接 _name:=value 覆盖）：
   rc_topic, rc_channel(1-based), rc_threshold, active_high, confirm_samples,
   release_tail_s, rc_warn_timeout_s, stop_on_rc_loss, bag_directory, bag_prefix,
-  topics, latched_topics, record_raw_cloud, status_topic, bag_path_topic, status_rate
+  topics, latched_topics, record_raw_cloud, record_registered_cloud, status_topic, bag_path_topic, status_rate
 """
 
 import os
@@ -39,7 +39,7 @@ from std_msgs.msg import String
 from geometry_msgs.msg import (PoseStamped, PoseWithCovarianceStamped, TwistStamped,
                                Vector3Stamped)
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, PointCloud2
 from tf2_msgs.msg import TFMessage
 from mavros_msgs.msg import EstimatorStatus, PositionTarget, RCIn, State, TimesyncStatus
 
@@ -84,6 +84,8 @@ def topic_type_registry():
         '/mavros/odometry/out': Odometry,
         '/fastlio/vision_odom': Odometry,
         '/fastlio/odom_world': Odometry,
+        '/fastlio/velocity': Vector3Stamped,
+        '/cloud_registered': PointCloud2,
         '/Odometry': Odometry,
         '/livox/imu': Imu,
         '/tf': TFMessage,
@@ -106,12 +108,9 @@ def topic_type_registry():
     except Exception:
         pass
     try:
-        from sensor_msgs.msg import PointCloud2
         from traj_utils.msg import Bspline
         from drone_navigation.msg import NavigationCommand
         registry.update({
-            '/fastlio/velocity': Vector3Stamped,
-            '/cloud_registered': PointCloud2,
             '/drone_nav/odom': Odometry,
             '/drone_nav/sensor_odom': Odometry,
             '/drone_nav/cloud': PointCloud2,
@@ -176,6 +175,9 @@ class RcBagRecorder(object):
             else:
                 rospy.logerr('record_raw_cloud=true 但导入不到 livox_ros_driver2/CustomMsg'
                              '（需要 source mid360s_ws/devel/setup.bash），已忽略')
+        if bool(rospy.get_param('~record_registered_cloud', False)):
+            if '/cloud_registered' not in wanted:
+                wanted.append('/cloud_registered')
         self._topics = []
         for topic in wanted:
             if topic not in registry:
