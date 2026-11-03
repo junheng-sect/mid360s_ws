@@ -55,6 +55,8 @@ DEFAULT_TOPICS = [
     '/mavros/local_position/odom',
     '/mavros/local_position/velocity_local',
     '/mavros/vision_pose/pose_cov',
+    '/mavros/odometry/out',
+    '/fastlio/vision_odom',
     '/fastlio/odom_world',
     '/tether_winch_control/status',
     '/Odometry',
@@ -78,6 +80,9 @@ def topic_type_registry():
         '/mavros/local_position/velocity_local': TwistStamped,
         '/mavros/vision_pose/pose_cov': PoseWithCovarianceStamped,
         '/fastlio/vision_pose_cov': PoseWithCovarianceStamped,
+        # ev_mode=odom 时实际送飞控的位姿 + 机体系速度（及本地回显）
+        '/mavros/odometry/out': Odometry,
+        '/fastlio/vision_odom': Odometry,
         '/fastlio/odom_world': Odometry,
         '/Odometry': Odometry,
         '/livox/imu': Imu,

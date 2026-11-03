@@ -25,6 +25,8 @@ rc_bag_recorder:
     - /mavros/local_position/odom
     - /mavros/local_position/velocity_local
     - /mavros/vision_pose/pose_cov
+    - /mavros/odometry/out                    # ev_mode=odom 时实际送飞控的位姿 + 速度
+    - /fastlio/vision_odom                    # 同上的本地回显（不送飞控时只有它）
     - /fastlio/odom_world
     - /tether_winch_control/status
     - /Odometry

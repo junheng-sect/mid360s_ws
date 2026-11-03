@@ -2,6 +2,7 @@
 #define FASTLIO_GRAVITY_BRIDGE_GRAVITY_BRIDGE_H
 
 #include <cstddef>
+#include <deque>
 #include <string>
 
 #include <ros/ros.h>
@@ -54,6 +55,8 @@ inline bool evModeIsKnown(const std::string &mode)
 ///  - odom：位姿 + 速度 -> /mavros/odometry/out（ODOMETRY，MAVROS 须用 MAVLink2）。速度取
 ///    /fastlio/velocity（与 /Odometry 同一时间戳的 camera_init 速度），按时间戳和位姿配对，
 ///    转到机体系 drone_base；配不上速度的位姿不送飞控（限频报错），不退回 pose 方式。
+///    两个话题各自按序到达，但彼此不保证交替（可能连到几条位姿再连到几条速度），所以两边
+///    各留一个有界队列按时间戳归并，见 tryPublishVisionOdom。
 ///    PX4 把 ODOMETRY 当作 EV 自己的 FRD 坐标系、VISION_POSITION_ESTIMATE 当作 NED，
 ///    两种方式中途切换会让 EKF 重新对准航向，所以只能随节点重启切换。
 ///  两种方式下 /fastlio/vision_pose_cov 本地话题都照常发布。
@@ -104,6 +107,10 @@ class GravityBridge
     std::string error;
   };
 
+  /// odom 方式两个配对队列各自最多留的条数（FAST-LIO 10 Hz 时约 1 s）。一直配不上时丢最旧的，
+  /// 丢掉的位姿记为缺速度。
+  static constexpr std::size_t kMaxPendingPairs = 10;
+
   enum class State
   {
     kWaitingGravity,  ///< 还没收到有效的初始化重力，等待中
@@ -132,8 +139,13 @@ class GravityBridge
   void velocityCallback(const geometry_msgs::Vector3Stamped::ConstPtr &msg);
 
  private:
-  /// 位姿和速度时间戳相同时组装 odom 方式的消息并发布（两者先到后到都可以）。
+  /// 按时间戳归并两个配对队列：相同的配成一条发出，确定配不上的丢掉（两者先到后到都可以）。
   void tryPublishVisionOdom();
+  /// 组装并发布一条 odom 方式的消息（位姿与速度时间戳相同）。
+  void publishVisionOdom(const geometry_msgs::PoseWithCovarianceStamped &pose,
+                         const geometry_msgs::Vector3Stamped &velocity);
+  /// 丢掉最早的待配对位姿，记一次缺速度。
+  void dropPoseWithoutVelocity();
   void publishStaticTransform();
   void enterFatalState(const std::string &reason);
   /// 按 mounting_source 解析本轮的安装旋转：fixed 在构造时确定，gravity 等初始化重力，
@@ -161,11 +173,9 @@ class GravityBridge
   std::size_t published_count_ = 0;
   std::size_t rejected_count_ = 0;
 
-  /// odom 方式：等速度配对的位姿（已变换到 drone_odom / drone_base）和最近一条速度。
-  geometry_msgs::PoseWithCovarianceStamped pending_pose_;
-  bool has_pending_pose_ = false;
-  geometry_msgs::Vector3Stamped last_velocity_;
-  bool has_velocity_ = false;
+  /// odom 方式：等配对的位姿（已变换到 drone_odom / drone_base）和速度，各按时间戳升序。
+  std::deque<geometry_msgs::PoseWithCovarianceStamped> pending_poses_;
+  std::deque<geometry_msgs::Vector3Stamped> pending_velocities_;
   std::size_t vision_odom_count_ = 0;
   std::size_t missing_velocity_count_ = 0;
 

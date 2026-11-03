@@ -3,7 +3,9 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include <boost/make_shared.hpp>
 #include <gtest/gtest.h>
 
 #include <ros/ros.h>
@@ -106,12 +108,14 @@ class BridgeMessagesTest : public ::testing::Test
     odom_count_ = 0;
     pose_cov_count_ = 0;
     vision_odom_count_ = 0;
+    vision_odom_stamps_.clear();
   }
 
   void onVisionOdom(const nav_msgs::Odometry::ConstPtr &msg)
   {
     ++vision_odom_count_;
     last_vision_odom_ = *msg;
+    vision_odom_stamps_.push_back(msg->header.stamp);
   }
 
   /// odom 方式：额外等速度订阅和 vision_odom 发布连上。
@@ -123,8 +127,8 @@ class BridgeMessagesTest : public ::testing::Test
     ASSERT_TRUE(spinUntil([this] { return sub_vision_odom_.getNumPublishers() > 0; }, 10.0));
   }
 
-  void publishVelocity(double stamp_sec, const Eigen::Vector3d &v_c,
-                       const std::string &frame_id = "camera_init")
+  geometry_msgs::Vector3Stamped makeVelocity(double stamp_sec, const Eigen::Vector3d &v_c,
+                                             const std::string &frame_id = "camera_init")
   {
     geometry_msgs::Vector3Stamped msg;
     msg.header.stamp = ros::Time().fromSec(stamp_sec);
@@ -132,7 +136,25 @@ class BridgeMessagesTest : public ::testing::Test
     msg.vector.x = v_c.x();
     msg.vector.y = v_c.y();
     msg.vector.z = v_c.z();
-    pub_velocity_.publish(msg);
+    return msg;
+  }
+
+  void publishVelocity(double stamp_sec, const Eigen::Vector3d &v_c,
+                       const std::string &frame_id = "camera_init")
+  {
+    pub_velocity_.publish(makeVelocity(stamp_sec, v_c, frame_id));
+  }
+
+  /// 不经话题、直接调用回调：两个话题谁先到由用例精确决定。
+  void feedOdom(double stamp_sec)
+  {
+    bridge_->odomCallback(boost::make_shared<nav_msgs::Odometry>(makeOdom(stamp_sec)));
+  }
+
+  void feedVelocity(double stamp_sec, const Eigen::Vector3d &v_c)
+  {
+    bridge_->velocityCallback(
+        boost::make_shared<geometry_msgs::Vector3Stamped>(makeVelocity(stamp_sec, v_c)));
   }
 
   void onOdom(const nav_msgs::Odometry::ConstPtr &msg)
@@ -172,6 +194,12 @@ class BridgeMessagesTest : public ::testing::Test
   void publishOdom(double stamp_sec, const std::string &frame_id = "camera_init",
                    const std::string &child_frame_id = "body")
   {
+    pub_odom_.publish(makeOdom(stamp_sec, frame_id, child_frame_id));
+  }
+
+  nav_msgs::Odometry makeOdom(double stamp_sec, const std::string &frame_id = "camera_init",
+                              const std::string &child_frame_id = "body")
+  {
     nav_msgs::Odometry msg;
     msg.header.stamp = ros::Time().fromSec(stamp_sec);
     msg.header.frame_id = frame_id;
@@ -192,7 +220,7 @@ class BridgeMessagesTest : public ::testing::Test
     msg.pose.covariance[35] = 9.0e-5;  // yaw 方差
     msg.pose.covariance[1] = msg.pose.covariance[6] = 3.0e-3;  // 交叉项
     msg.pose.covariance[3] = msg.pose.covariance[18] = 2.0e-4;
-    pub_odom_.publish(msg);
+    return msg;
   }
 
   ros::NodeHandlePtr nh_;
@@ -215,6 +243,7 @@ class BridgeMessagesTest : public ::testing::Test
   nav_msgs::Odometry last_odom_;
   geometry_msgs::PoseWithCovarianceStamped last_pose_cov_;
   nav_msgs::Odometry last_vision_odom_;
+  std::vector<ros::Time> vision_odom_stamps_;
 };
 
 /// 未收到有效初始化重力前只等待，不输出未对齐消息。
@@ -1045,17 +1074,19 @@ TEST_F(BridgeMessagesTest, OdomModeSendsOnlyMatchedPairs)
   publishOdom(1100.5);
   ASSERT_TRUE(spinUntil([this] { return vision_odom_count_ == 1; }, 5.0));
 
-  // 1101.0 的位姿没有速度；下一条位姿到来时记一次缺失，且 1101.0 不会被补发
+  // 1101.0 的位姿没有速度：更晚的速度到了才确定它配不上，记一次缺失，且 1101.0 不会被补发
   publishOdom(1101.0);
   ASSERT_TRUE(spinUntil([this] { return odom_count_ == 2; }, 5.0));
-  publishVelocity(1100.9, Eigen::Vector3d(0.1, 0.0, 0.0));  // 时间戳对不上
+  publishVelocity(1100.9, Eigen::Vector3d(0.1, 0.0, 0.0));  // 没有对应位姿，直接丢掉
   spinUntil([] { return false; }, 0.2);
   EXPECT_EQ(vision_odom_count_, 1);
+  EXPECT_EQ(bridge_->missingVelocityCount(), 0u);
   publishOdom(1101.5);
-  ASSERT_TRUE(spinUntil([this] { return bridge_->missingVelocityCount() == 1u; }, 5.0));
+  ASSERT_TRUE(spinUntil([this] { return odom_count_ == 3; }, 5.0));
   publishVelocity(1101.5, Eigen::Vector3d(0.1, 0.0, 0.0));
   ASSERT_TRUE(spinUntil([this] { return vision_odom_count_ == 2; }, 5.0));
   EXPECT_EQ(last_vision_odom_.header.stamp, ros::Time().fromSec(1101.5));
+  EXPECT_EQ(bridge_->missingVelocityCount(), 1u);
 
   // 坐标系不对或非有限的速度被拒绝
   publishOdom(1102.0);
@@ -1064,6 +1095,80 @@ TEST_F(BridgeMessagesTest, OdomModeSendsOnlyMatchedPairs)
                   Eigen::Vector3d(std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0));
   spinUntil([] { return false; }, 0.3);
   EXPECT_EQ(vision_odom_count_, 2);
+}
+
+/// odom 方式：两个话题不交替到达（成批、速度一直落后一帧、速度先成批）也全部配上，
+/// 发出的时间戳严格递增。
+TEST_F(BridgeMessagesTest, OdomModePairsBurstsInAnyOrder)
+{
+  startOdomModeBridge();
+  publishGravity(tiltedGravity(), 1200.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+  const Eigen::Vector3d v(0.1, 0.0, 0.0);
+
+  // 先连到三条位姿，再连到三条速度
+  for (const double s : {1200.1, 1200.2, 1200.3}) feedOdom(s);
+  EXPECT_EQ(bridge_->visionOdomCount(), 0u);
+  for (const double s : {1200.1, 1200.2, 1200.3}) feedVelocity(s, v);
+  EXPECT_EQ(bridge_->visionOdomCount(), 3u);
+
+  // 速度一直落后一帧
+  feedOdom(1200.4);
+  feedOdom(1200.5);
+  feedVelocity(1200.4, v);
+  feedOdom(1200.6);
+  feedVelocity(1200.5, v);
+  feedVelocity(1200.6, v);
+  EXPECT_EQ(bridge_->visionOdomCount(), 6u);
+
+  // 速度先连到三条
+  for (const double s : {1200.7, 1200.8, 1200.9}) feedVelocity(s, v);
+  for (const double s : {1200.7, 1200.8, 1200.9}) feedOdom(s);
+  EXPECT_EQ(bridge_->visionOdomCount(), 9u);
+  EXPECT_EQ(bridge_->missingVelocityCount(), 0u);
+
+  ASSERT_TRUE(spinUntil([this] { return vision_odom_count_ == 9; }, 5.0));
+  for (std::size_t i = 1; i < vision_odom_stamps_.size(); ++i)
+  {
+    EXPECT_LT(vision_odom_stamps_[i - 1], vision_odom_stamps_[i]) << i;
+  }
+}
+
+/// odom 方式：丢了一条速度只少发那一帧；时间戳不递增的速度被拒绝；一直没有速度时
+/// 队列有界，多出的位姿记缺失，速度恢复后从新的帧接着配。
+TEST_F(BridgeMessagesTest, OdomModeDropsOnlyUnpairableData)
+{
+  startOdomModeBridge();
+  publishGravity(tiltedGravity(), 1300.0);
+  ASSERT_TRUE(spinUntil([this] { return bridge_->hasAlignment(); }, 5.0));
+  const Eigen::Vector3d v(0.1, 0.0, 0.0);
+
+  // 1300.2 的速度丢了
+  for (const double s : {1300.1, 1300.2, 1300.3}) feedOdom(s);
+  feedVelocity(1300.1, v);
+  feedVelocity(1300.3, v);
+  EXPECT_EQ(bridge_->visionOdomCount(), 2u);
+  EXPECT_EQ(bridge_->missingVelocityCount(), 1u);
+
+  // 1300.4 的速度晚于 1300.5 到达，按乱序拒绝；1300.4 的位姿因此配不上
+  feedVelocity(1300.5, v);
+  feedVelocity(1300.4, v);
+  feedOdom(1300.4);
+  EXPECT_EQ(bridge_->missingVelocityCount(), 2u);
+  feedOdom(1300.5);
+  EXPECT_EQ(bridge_->visionOdomCount(), 3u);
+
+  // 一直没有速度：只留最新的 kMaxPendingPairs 条位姿
+  const std::size_t max_pending = fgb::GravityBridge::kMaxPendingPairs;
+  const std::size_t n = max_pending + 5;
+  for (std::size_t i = 0; i < n; ++i) feedOdom(1301.0 + 0.1 * i);
+  EXPECT_EQ(bridge_->visionOdomCount(), 3u);
+  EXPECT_EQ(bridge_->missingVelocityCount(), 2u + 5u);
+
+  // 速度恢复：更早的待配对位姿全部记缺失，最新一帧照常发出
+  feedVelocity(1301.0 + 0.1 * (n - 1), v);
+  EXPECT_EQ(bridge_->visionOdomCount(), 4u);
+  EXPECT_EQ(bridge_->missingVelocityCount(), 2u + 5u + (max_pending - 1));
 }
 
 int main(int argc, char **argv)

@@ -11,6 +11,8 @@
 namespace fastlio_gravity_bridge
 {
 
+constexpr std::size_t GravityBridge::kMaxPendingPairs;
+
 namespace
 {
 
@@ -462,19 +464,8 @@ void GravityBridge::odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
 
   if (config_.ev_mode == "odom")
   {
-    // FAST-LIO 在同一次回调里紧接着 /Odometry 发同一时间戳的速度，上一条位姿到现在还没配上，
-    // 说明速度没来（FAST-LIO 没带 /fastlio/velocity，或时间戳对不上）：这条位姿不送飞控。
-    if (has_pending_pose_)
-    {
-      ++missing_velocity_count_;
-      ROS_ERROR_THROTTLE(5.0,
-                         "[gravity_bridge] ev_mode=odom: no %s with stamp %.9f, that pose was NOT "
-                         "sent to the flight controller (%zu missing so far).",
-                         config_.velocity_in.c_str(), pending_pose_.header.stamp.toSec(),
-                         missing_velocity_count_);
-    }
-    pending_pose_ = pose_msg;
-    has_pending_pose_ = true;
+    // 进到这里的位姿时间戳严格递增（重复已丢、回退已进 kFatal），队列天然有序。
+    pending_poses_.push_back(pose_msg);
     tryPublishVisionOdom();
   }
 }
@@ -498,21 +489,71 @@ void GravityBridge::velocityCallback(const geometry_msgs::Vector3Stamped::ConstP
     return;
   }
 
-  last_velocity_ = *msg;
-  has_velocity_ = true;
+  // 归并配对依赖速度按时间戳升序；不递增的（FAST-LIO 重启、重复投递）拒绝。
+  if (!pending_velocities_.empty() &&
+      msg->header.stamp <= pending_velocities_.back().header.stamp)
+  {
+    ++rejected_count_;
+    ROS_ERROR_THROTTLE(5.0,
+                       "[gravity_bridge] rejecting velocity: stamp %.9f is not after the previous "
+                       "one %.9f.",
+                       msg->header.stamp.toSec(),
+                       pending_velocities_.back().header.stamp.toSec());
+    return;
+  }
+
+  pending_velocities_.push_back(*msg);
   tryPublishVisionOdom();
 }
 
 void GravityBridge::tryPublishVisionOdom()
 {
-  if (!has_pending_pose_ || !has_velocity_) return;
-  if (last_velocity_.header.stamp != pending_pose_.header.stamp) return;
-  has_pending_pose_ = false;
+  // 两个队列各自按时间戳升序（同一话题内按序到达），按时间戳归并：
+  //  - 相同：配成一条发出；
+  //  - 位姿更早：它的速度本该排在队首速度之前，已不会再来，这条位姿不送飞控；
+  //  - 速度更早：它的位姿没有输出（被拒绝或丢了），丢掉这条速度。
+  // 发出的消息因此时间戳严格递增，不会在新的之后补发旧的。
+  while (!pending_poses_.empty() && !pending_velocities_.empty())
+  {
+    const ros::Time pose_stamp = pending_poses_.front().header.stamp;
+    const ros::Time velocity_stamp = pending_velocities_.front().header.stamp;
+    if (pose_stamp == velocity_stamp)
+    {
+      publishVisionOdom(pending_poses_.front(), pending_velocities_.front());
+      pending_poses_.pop_front();
+      pending_velocities_.pop_front();
+    }
+    else if (pose_stamp < velocity_stamp)
+    {
+      dropPoseWithoutVelocity();
+    }
+    else
+    {
+      pending_velocities_.pop_front();
+    }
+  }
+  // 一边一直不来（例如 FAST-LIO 没带 /fastlio/velocity）时队列不能无限长：丢最旧的。
+  while (pending_poses_.size() > kMaxPendingPairs) dropPoseWithoutVelocity();
+  while (pending_velocities_.size() > kMaxPendingPairs) pending_velocities_.pop_front();
+}
 
+void GravityBridge::dropPoseWithoutVelocity()
+{
+  ++missing_velocity_count_;
+  ROS_ERROR_THROTTLE(5.0,
+                     "[gravity_bridge] ev_mode=odom: no %s with stamp %.9f, that pose was NOT "
+                     "sent to the flight controller (%zu missing so far).",
+                     config_.velocity_in.c_str(), pending_poses_.front().header.stamp.toSec(),
+                     missing_velocity_count_);
+  pending_poses_.pop_front();
+}
+
+void GravityBridge::publishVisionOdom(const geometry_msgs::PoseWithCovarianceStamped &pose,
+                                      const geometry_msgs::Vector3Stamped &velocity)
+{
   Eigen::Vector3d v_b;
-  const Eigen::Vector3d v_c(last_velocity_.vector.x, last_velocity_.vector.y,
-                            last_velocity_.vector.z);
-  if (!transformVelocityToBody(alignment_, pending_pose_.pose.pose.orientation, v_c, v_b))
+  const Eigen::Vector3d v_c(velocity.vector.x, velocity.vector.y, velocity.vector.z);
+  if (!transformVelocityToBody(alignment_, pose.pose.pose.orientation, v_c, v_b))
   {
     ++rejected_count_;
     ROS_ERROR_THROTTLE(5.0, "[gravity_bridge] rejecting velocity: transform failed.");
@@ -522,10 +563,10 @@ void GravityBridge::tryPublishVisionOdom()
   // nav_msgs/Odometry 约定：pose 在 header.frame_id 下，twist 在 child_frame_id（机体）下。
   // 角速度 FAST-LIO 没给，填 NaN 表示未知（PX4 的 EKF 不用外部角速度）。
   nav_msgs::Odometry out;
-  out.header.stamp = pending_pose_.header.stamp;
+  out.header.stamp = pose.header.stamp;
   out.header.frame_id = config_.mavros_odom_frame;
   out.child_frame_id = config_.output_child_frame;
-  out.pose = pending_pose_.pose;
+  out.pose = pose.pose;
   out.twist.twist.linear.x = v_b.x();
   out.twist.twist.linear.y = v_b.y();
   out.twist.twist.linear.z = v_b.z();
