@@ -1,0 +1,39 @@
+# 室外大图（11-05 加）：每次都在建图原点附近的起飞圆柱里（水平 3 m、上下 0.5 m）启动重定位。
+# 只用原点 20 m 内、地面 −0.5～+4 m 的地图（地面点 0.2 m、其余 0.1 m 体素），实时点云截到水平 16 m；
+# 全局搜索只在起飞圆柱内找候选，解落在圆柱外就拒绝。质量门限与室内相同，没有为室外放宽。
+res: 0.05
+sigma: 0.05
+max_cands: 6000
+yaw_step_deg: 2.0
+nn_reach: 0.15
+min_range: 1.0
+score_ok: 0.45
+inlier_ok: 0.25
+fit_ok: 0.8
+rmse_ok: 0.02
+degen_ok: 0.12
+split_ground: 1    # 地面点占多数：水平退化只比 x/y；候选排序、歧义和内点率只看对应到竖直面的点；二维得分在精配后的位置上算（见 matching.py）
+fit_v_ok: 0.65     # split_ground 时代替 fit_ok：竖直面内点率门限（11-05 实测真解 0.77～0.85、竞争解 0.34～0.55）
+amb_max: 0.9
+candidate_ratio: 0.6
+n_candidates: 8
+max_tilt_deg: 3.0
+window: 2.0
+confirmations: 2
+consensus_m: 0.05
+consensus_deg: 1.0
+still_m: 0.03
+still_deg: 2.0
+freshness: 0.5
+timeout: 60.0
+tries: 3
+max_grid_cells: 100000000
+max_expand_bytes: 2147483648
+crop_radius: 20.0
+crop_below: 0.5
+crop_above: 4.0
+map_voxel: 0.1
+ground_voxel: 0.2
+zone_radius: 3.0
+zone_height: 0.5
+max_range: 16.0

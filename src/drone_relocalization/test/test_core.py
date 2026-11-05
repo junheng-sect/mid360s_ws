@@ -102,6 +102,12 @@ class FieldTests(unittest.TestCase):
         b=dict(R=np.eye(3),t=np.array([1.,0,0]),inlier=.61,support=.53,rmse=.0105)
         _,ambiguity=rank_hypotheses([(a,.6),(b,.6)])
         self.assertLess(b['inlier']/a['inlier'],.9);self.assertGreater(ambiguity,.9)
+    def test_vertical_evidence_ignores_ground(self):
+        # 室外：错开 2 m 的解靠地面照样有九成内点；只数竖直面内点时它就不算竞争解（数字取自合成场景）
+        a=dict(R=np.eye(3),t=np.zeros(3),inlier=.98,support=.97,inlier_v=.19,support_v=.18,rmse=.002)
+        b=dict(R=np.eye(3),t=np.array([2.,0,0]),inlier=.91,support=.90,inlier_v=.12,support_v=.11,rmse=.002)
+        self.assertGreater(rank_hypotheses([(a,.6),(b,.6)])[1],.9)
+        self.assertLess(rank_hypotheses([(a,.6),(b,.6)],vertical=True)[1],.7)
     def test_empty_cloud_rejected(self):
         m=MapModel.__new__(MapModel);m.cfg=load();r=relocalize(m,np.zeros((0,3)),np.zeros(3));self.assertFalse(r['ok'])
     def test_single_plane_has_no_pose_observability(self):
@@ -109,6 +115,50 @@ class FieldTests(unittest.TestCase):
         m=MapModel.__new__(MapModel);m.cfg=load();m.nn=NNField(P)
         r=m.icp(P,[0,0,0,0]);self.assertLess(r['rank_ratio'],1e-6);self.assertLess(r['degen'],.12)
         m.zf=0.;self.assertFalse(relocalize(m,P,np.array([0.,0.,1.]))['ok'])
+
+
+def outdoor_scene():
+    """地面 z=-0.2（原点 = 起点时雷达，离地 0.2 m），三面墙、一根方柱、一面斜墙，外加 18 m 外一面应被裁掉的墙"""
+    g=np.arange(-14,14,.1);x,y=np.meshgrid(g,g);parts=[np.c_[x.ravel(),y.ravel(),np.full(x.size,-.2)]]
+    h=np.arange(-.2,2.8,.1)
+    def wall(a,b):
+        n=int(np.linalg.norm(np.subtract(b,a))/.1)+1;s=np.linspace(0,1,n)[:,None]
+        xy=np.asarray(a)+s*(np.subtract(b,a));X,Z=np.repeat(xy,len(h),0),np.tile(h,n)
+        return np.c_[X,Z]
+    for a,b in [((-8,-8),(-8,8)),((-8,6),(10,6)),((4,-4),(5,-4)),((5,-4),(5,-5)),((5,-5),(4,-5)),((4,-5),(4,-4)),((5,-1),(10,-3)),((18,-6),(18,6))]:
+        parts.append(wall(a,b))
+    return np.concatenate(parts)
+
+
+class OutdoorTests(unittest.TestCase):
+    """室外配置：按原点裁图、候选只在起飞区、解在区外就拒绝"""
+    @classmethod
+    def setUpClass(cls):
+        from drone_mapping import mapio
+        cls.tmp=tempfile.TemporaryDirectory();d=cls.tmp.name;cls.P=outdoor_scene()
+        mapio.write_pcd(os.path.join(d,'map_world.pcd'),cls.P.astype('f4'),np.zeros(len(cls.P),'f4'))
+        with open(os.path.join(d,'meta.json'),'w') as f:json.dump(dict(floor=dict(height_m=.2,trusted=True)),f)
+        cls.cfg=load(overrides=dict(crop_radius=12.,zone_radius=3.,max_range=9.,map_voxel=.1,ground_voxel=.2,split_ground=1))
+        cls.M=MapModel(d,cls.cfg)
+    @classmethod
+    def tearDownClass(cls):cls.tmp.cleanup()
+    def test_crop_and_candidates_stay_near_origin(self):
+        self.assertLessEqual(np.hypot(self.M.P[:,0],self.M.P[:,1]).max(),12+1e-6)
+        self.assertFalse((abs(self.M.P[:,0]-18)<.2).any())
+        ii,jj=np.nonzero(self.M.cand);r=self.cfg['res']
+        self.assertLessEqual(np.hypot(self.M.ox+(jj+.5)*r,self.M.oy+(ii+.5)*r).max(),3.5+1e-6)
+    def look(self,p):
+        # 实时点云：从 p 看出去的场景，drone_odom 原点就在传感器上（c=0）
+        L=self.P-p;return L[np.linalg.norm(L,axis=1)<15]
+    def test_inside_zone_localizes(self):
+        p=np.array([1.,-.5,0.]);r=relocalize(self.M,self.look(p),np.zeros(3))
+        self.assertTrue(r['ok'],r['why']);np.testing.assert_allclose(r['drone_map'],p,atol=.03)
+    def test_outside_zone_rejected(self):
+        r=relocalize(self.M,self.look(np.array([6.,1.,0.])),np.zeros(3));self.assertFalse(r['ok'])
+    def test_zero_switches_and_zone_inside_crop(self):
+        c=load();self.assertEqual((c['crop_radius'],c['zone_radius'],c['split_ground']),(0.,0.,0))
+        with self.assertRaises(ValueError):load(overrides=dict(crop_radius=3.,zone_radius=3.))
+        with self.assertRaises(ValueError):load(overrides=dict(fit_ok=0.))
 
 
 if __name__=='__main__':unittest.main()

@@ -25,7 +25,7 @@ def main(entry=None):
     from .matching import MapModel
     from .session import BagSession,run_once
     from .offline import startup
-    p=argparse.ArgumentParser(description='室内一次性SE3全局重定位，双静止窗口确认，不接飞控')
+    p=argparse.ArgumentParser(description='一次性SE3全局重定位（室内小图；室外大图按起飞区裁图），双静止窗口确认，不接飞控')
     p.add_argument('--map',required=True);p.add_argument('--config',default='')
     p.add_argument('--bag',default='');p.add_argument('--at',type=float,default=1.)
     p.add_argument('--eval',action='store_true');p.add_argument('--startup-eval',action='store_true')
@@ -41,7 +41,7 @@ def main(entry=None):
     try:
         cfg=load(args.config or None,dict(window=args.window,tries=args.tries,timeout=args.still_timeout))
         M=MapModel(args.map,cfg)
-        print('室内地图 %d 点，载入 %.2fs，cache=%s'%(len(M.P),M.load_s,M.cache_hit),flush=True)
+        print('地图 %d 点%s，载入 %.2fs，cache=%s'%(len(M.P),'（起飞区 %g m 内裁图，起飞圆柱 r=%g m）'%(cfg['crop_radius'],cfg['zone_radius']) if cfg['crop_radius'] else '',M.load_s,M.cache_hit),flush=True)
         if not args.bag:
             from .runtime import online
             return online(M,args)
