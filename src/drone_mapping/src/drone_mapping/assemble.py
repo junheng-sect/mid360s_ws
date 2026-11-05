@@ -11,6 +11,12 @@
   - 只看距离会误删：10-21 那次设备从一个静止物体旁约 0.1 m 擦过，它全程 144 s 都看得到，靠「被看到的秒数」留下。
   - 上下只取 ±0.12 m：起点时雷达 IMU 离地约 0.16 m，地面不能切；比设备低很多的东西（桌面等）受 FOV 限制本来就
     只在走近时短暂可见，没法按时长区分，所以不往下延伸。人在设备高度的部分（手臂、肩、头）能去掉，腿和腰留着。
+- 去静止旁人（11-05 加，carve_still）：设备放在地上不动时，操作者常在旁边站着、走动，离轨迹远，上面那条去不掉。
+  设备静止 ≥ STILL_SECS 的时段前后各放宽 STILL_PAD 秒；静止位置水平 STILL_R 以内、离当地地面 STILL_Z 以内的格子，
+  只在这些时段里被看到、其余时间又有 ≥ STILL_SEEN 次射线穿过它打到后面，就是当时在那儿的人，整格去掉。
+  - 只看「射线穿过」会误删：贴着地面、墙面掠射的射线和透光的树丛都能穿过真东西。所以还要「只在静止前后出现过」，
+    并且不挨着（26 邻域）其他时间也看得到的格子：墙、树丛上漏看的格子旁边一定有同一面墙。
+  - 11-05 室外图只去掉起点西侧的人（1.2 万个原始点）；10-20、10-21 两张旧图同样只去掉站在起点旁边的人。
 """
 import json
 import math
@@ -30,6 +36,12 @@ CARVE_H = 0.12      # 去人：上下半高（m），要小于起点时雷达 IM
 CARVE_SECS = 5      # 去人：格子在少于这么多个不同的秒里被看到才算人（静止物体基本每秒都看得到）
 CARVE_CELL = 0.1    # 去人按这么大的格子判断、整格去掉；是地图体素 0.05 的整数倍，格子互相嵌套。
                     # 不用 0.05：静止物体边缘的 0.05 小格只偶尔被扫到，10-21 那次会把擦边物体削掉约 35 个点
+STILL_SECS = 3.0    # 去静止旁人：设备至少静止这么久（前后 0.5 s 位移 < STILL_MOVE）才算放着
+STILL_MOVE = 0.03
+STILL_PAD = 5.0     # 静止前后各放宽这么多秒：拿起、放下那几秒人就在旁边
+STILL_R = 8.0       # 只看静止位置水平这么远以内
+STILL_Z = (0.25, 2.2)   # 只看离当地地面（0.5 m 柱子里最低 1% 的点）这个高度范围：地面、树冠不动
+STILL_SEEN = 5      # 其余时间至少这么多次（每 0.05 s 一组）射线穿过格子、打到它后面 0.15 m 以外
 
 
 def read_state(path):
@@ -162,6 +174,87 @@ def carve(P, T, tw, r=CARVE_R, h=CARVE_H, secs=CARVE_SECS, cell=CARVE_CELL):
                       cells_dropped=int(drop.sum()), points_dropped=int((~keep).sum()))
 
 
+def still_windows(tt, tw, secs=STILL_SECS, move=STILL_MOVE):
+    """设备静止（前后 0.5 s 位移 < move）且持续 ≥ secs 的时段，返回轨迹下标 [(i0, i1), ...]"""
+    j0 = np.searchsorted(tt, tt - 0.5)
+    j1 = np.clip(np.searchsorted(tt, tt + 0.5), 0, len(tt) - 1)
+    still = np.linalg.norm(tw[j1] - tw[j0], axis=1) < move
+    e = np.flatnonzero(np.diff(np.r_[0, still.astype(np.int8), 0]))
+    return [(int(a), int(b) - 1) for a, b in zip(e[::2], e[1::2]) if tt[b - 1] - tt[a] >= secs]
+
+
+def dir_bin(v, r, ang, ne):
+    """方向 → 角度格编号（方位、俯仰各 ang 弧度一格）"""
+    return (np.floor((np.arctan2(v[:, 1], v[:, 0]) + np.pi) / ang).astype(np.int64) * ne
+            + np.floor((np.arcsin(np.clip(v[:, 2] / np.maximum(r, 1e-6), -1, 1)) + np.pi / 2) / ang).astype(np.int64))
+
+
+def carve_still(P, T, tt, tw, cell=CARVE_CELL, sub=0.05, ang=math.radians(0.5), margin=0.15, blind=0.5):
+    """去静止旁人：返回要保留的点（bool）和统计。T、tt 是相对轨迹起点的秒，tw 是地图系的轨迹；
+    射线起点用 IMU 位置（雷达外参约 2 cm，忽略）。格子同 carve，是 floor(p / cell)，整格去掉"""
+    W = still_windows(tt, tw)
+    stat = dict(windows_s=[[round(float(tt[a]), 1), round(float(tt[b]), 1)] for a, b in W], pad_s=STILL_PAD,
+                radius_m=STILL_R, height_m=list(STILL_Z), min_seen=STILL_SEEN, cell_m=cell,
+                cells_candidate=0, cells_dropped=0, points_dropped=0)
+    if not W:
+        return np.ones(len(P), bool), stat
+    near_t = np.zeros(len(T), bool)
+    for a, b in W:
+        near_t |= (T >= tt[a] - STILL_PAD) & (T <= tt[b] + STILL_PAD)
+    k = np.floor(P / cell).astype(np.int64)
+    k -= k.min(axis=0) - 1      # 四周空一格，邻格编号不会绕到另一边
+    m = k.max(axis=0) + 2
+    key, inv, cnt = np.unique(k[:, 0] + m[0] * (k[:, 1] + m[1] * k[:, 2]), return_inverse=True, return_counts=True)
+    c = np.stack([np.bincount(inv, P[:, j], len(cnt)) for j in range(3)], 1) / cnt[:, None]
+    seen_out = np.zeros(len(cnt), bool)     # 静止前后以外也被看到过
+    seen_out[inv[~near_t]] = True
+    # 当地地面：每个 0.5 m 柱子里最低 1% 的点
+    kc = np.floor(P[:, :2] / 0.5).astype(np.int64)
+    kc -= kc.min(axis=0)
+    col = kc[:, 0] * (kc[:, 1].max() + 1) + kc[:, 1]
+    o = np.lexsort((P[:, 2], col))
+    first = np.flatnonzero(np.r_[True, col[o][1:] != col[o][:-1]])
+    ground = np.zeros(col.max() + 1)
+    ground[col[o[first]]] = P[o[first + (np.diff(np.r_[first, len(o)]) * 0.01).astype(np.int64)], 2]
+    col_cell = np.zeros(len(cnt), np.int64)
+    col_cell[inv] = col
+    hg = c[:, 2] - ground[col_cell]
+    ctr = np.array([tw[a:b + 1].mean(axis=0) for a, b in W])
+    rh = np.hypot(c[:, None, 0] - ctr[None, :, 0], c[:, None, 1] - ctr[None, :, 1]).min(axis=1)
+    cand = np.flatnonzero(~seen_out & (rh <= STILL_R) & (hg > STILL_Z[0]) & (hg < STILL_Z[1]))
+    through = np.zeros(len(cand), np.int32)
+    if len(cand):
+        # 静止前后以外的点每 sub 秒一组，射线起点取这组中间时刻的轨迹位置；每个方向格只看最近的点，
+        # 它都打在候选格子后面 margin 以外，才算这组看穿了这个格子
+        cp = c[cand]
+        ne = int(math.ceil(math.pi / ang)) + 2
+        g = np.floor(T[~near_t] / sub).astype(np.int64)
+        o = np.argsort(g, kind='stable')
+        Po, g = P[~near_t][o], g[o]
+        st = np.flatnonzero(np.r_[True, g[1:] != g[:-1]])
+        for s, e in zip(st, np.r_[st[1:], len(g)]):
+            org = np.array([np.interp((g[s] + 0.5) * sub, tt, tw[:, j]) for j in range(3)])
+            v = Po[s:e] - org
+            r = np.linalg.norm(v, axis=1)
+            b = dir_bin(v, r, ang, ne)
+            oo = np.lexsort((r, b))
+            b, r = b[oo], r[oo]
+            f = np.r_[True, b[1:] != b[:-1]]
+            ub, mr = b[f], r[f]
+            vc = cp - org
+            rc = np.linalg.norm(vc, axis=1)
+            bc = dir_bin(vc, rc, ang, ne)
+            i = np.clip(np.searchsorted(ub, bc), 0, len(ub) - 1)
+            through += (ub[i] == bc) & (mr[i] > rc + margin) & (rc > blind)
+    off = np.array([i + m[0] * (j + m[1] * l) for i in (-1, 0, 1) for j in (-1, 0, 1) for l in (-1, 0, 1) if i or j or l])
+    tied = np.isin(key[cand][:, None] + off[None], key[seen_out]).any(axis=1)
+    drop = np.zeros(len(cnt), bool)
+    drop[cand[(through >= STILL_SEEN) & ~tied]] = True
+    keep = ~drop[inv]
+    stat.update(cells_candidate=int(len(cand)), cells_dropped=int(drop.sum()), points_dropped=int((~keep).sum()))
+    return keep, stat
+
+
 def build(d, bag, state, config, voxel, meta=None, say=print, carve_r=CARVE_R):
     """在目录 d 里写 map_world.pcd / preview.png / meta.json；meta 里已有的键（run、voxelslam 等）保留。
     carve_r：去人的水平半径，0 不去"""
@@ -172,13 +265,20 @@ def build(d, bag, state, config, voxel, meta=None, say=print, carve_r=CARVE_R):
     P, I, T, n_msg = gather(bag, traj, load_params(config), Rg)
     n_raw = len(P)
     tw = traj[:, 1:4] @ Rg.T
-    cv = dict(radius_m=0)
+    cv, cs = dict(radius_m=0), {}
     if carve_r > 0:
         keep, cv = carve(P, T, tw, carve_r)
-        P, I = P[keep], I[keep]
+        P, I, T = P[keep], I[keep], T[keep]
         say('去人：轨迹附近 %d 个 %.2f m 格子里去掉 %d 个、%d 点（水平 %.2f m、上下 %.2f m 以内，只在不到 %d 个不同的秒里被看到）'
             % (cv['cells_near_path'], cv['cell_m'], cv['cells_dropped'], cv['points_dropped'], carve_r, cv['half_height_m'],
                cv['min_secs']))
+        keep, cs = carve_still(P, T, traj[:, 0] - traj[0, 0], tw)
+        P, I = P[keep], I[keep]
+        win = '、'.join('%.1f–%.1f' % tuple(w) for w in cs['windows_s']) or '无'
+        say('去静止旁人：设备静止 %d 段（%s s），附近 %d 个候选格子里去掉 %d 个、%d 点（只在静止前后 %.0f s 内出现过、'
+            '其余时间被看穿 ≥ %d 次、不挨着其他时间也看得到的格子）'
+            % (len(cs['windows_s']), win, cs['cells_candidate'], cs['cells_dropped'], cs['points_dropped'], cs['pad_s'],
+               cs['min_seen']))
     n_carved = n_raw - len(P)
     q, qi = mapio.voxel_down(P, I, voxel)
     mapio.write_pcd(os.path.join(d, 'map_world.pcd'), q, qi)
@@ -195,7 +295,7 @@ def build(d, bag, state, config, voxel, meta=None, say=print, carve_r=CARVE_R):
         world_from_voxelslam=dict(q_xyzw=mapio.R_quat(Rg), t=[0.0, 0.0, 0.0],
                                   source='Voxel-SLAM 估计的重力（位姿文件第 18–20 列均值）转到 -z 的最小旋转'),
         gravity_voxelslam=g.tolist(), lidar_msgs_used=n_msg,
-        voxel_m=voxel, points_raw=int(n_raw), points_world=int(len(q)), carve=cv,
+        voxel_m=voxel, points_raw=int(n_raw), points_world=int(len(q)), carve=cv, carve_still=cs,
         extent_world=dict(min=q.min(axis=0).tolist(), max=q.max(axis=0).tolist()), floor=fl,
         trajectory=dict(n=int(len(traj)), duration_s=float(traj[-1, 0] - traj[0, 0]), path_m=float(step.sum()),
                         start_world=tw[0].tolist(), end_world=tw[-1].tolist(), end_minus_start_m=(tw[-1] - tw[0]).tolist(),

@@ -128,6 +128,36 @@ class TestAssemble(unittest.TestCase):
             self.assertTrue(keep[g].all(), g)
         self.assertEqual((cv['cells_near_path'], cv['cells_dropped'], cv['points_dropped']), (2, 1, 30))
 
+    def test_carve_still_drops_bystander(self):
+        """原点放 10 s 再沿 +x 走开：只在静止时出现、后来被看穿的人去掉；没被看穿的（挡住）、
+        挨着一直看得到的墙的、地面都留下"""
+        tt = np.linspace(0, 30, 301)
+        tw = np.c_[np.clip((tt - 10) * 0.2, 0, None), np.zeros_like(tt), np.zeros_like(tt)]
+        t_still = np.linspace(0, 9, 30)
+        groups = {'person': ([-2.0, 0.0, 1.0], t_still), 'hidden': ([0.0, -3.0, 1.0], t_still),
+                  'edge': ([-4.0, 1.0, 1.0], t_still), 'wall': ([-4.0, 1.1, 1.0], np.linspace(0, 29, 30))}
+        for name, xy in (('g_person', [-2.0, 0.0]), ('g_hidden', [0.0, -3.0]), ('g_edge', [-4.0, 1.0])):
+            groups[name] = (xy + [-0.2], np.linspace(0, 29, 30))
+        P = [np.tile(xyz, (len(t), 1)) for xyz, t in groups.values()]
+        T = [t for _, t in groups.values()]
+        n = sum(len(t) for t in T)
+        # 走开以后每 0.05 s 一束激光穿过人和 edge 打到后面 1 m（hidden 那边没有）
+        for t in np.arange(15.025, 30, 0.05):
+            o = np.array([np.interp(t, tt, tw[:, j]) for j in range(3)])
+            for c in ([-2.0, 0.0, 1.0], [-4.0, 1.0, 1.0]):
+                u = np.array(c) - o
+                P.append([o + u * (1 + 1.0 / np.linalg.norm(u))])
+                T.append([t])
+        P, T = np.concatenate(P).astype(np.float32), np.concatenate(T).astype(np.float32)
+        keep, cs = assemble.carve_still(P, T, tt, tw)
+        keep = dict(zip(groups, keep[:n].reshape(len(groups), 30)))
+        self.assertFalse(keep['person'].any())
+        for g in groups:
+            if g != 'person':
+                self.assertTrue(keep[g].all(), g)
+        self.assertEqual(cs['windows_s'], [[0.0, 9.6]])     # 9.6 s 时往后 0.5 s 只走了 2 cm，还算静止
+        self.assertEqual((cs['cells_candidate'], cs['cells_dropped'], cs['points_dropped']), (3, 1, 30))
+
     def test_launch_xml_well_formed(self):
         """生成的 launch 和包里的 launch 都要是合法 XML（注释里写 -- 会让 roslaunch 解析失败，10-20 踩过）"""
         import xml.etree.ElementTree as ET

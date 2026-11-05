@@ -21,6 +21,7 @@ Ctrl+C 收尾后离线跑 Voxel-SLAM，再拼图、摆正、降采样、出预�
   --keep-frames   保留 Voxel-SLAM 的逐帧点云 voxelslam_tmp/（默认成功后删掉，约 0.4 MB/s）
   --carve R       去人：拼图时去掉设备走过空间里（水平 R、上下 0.12 m 以内）只短暂出现的点，默认 0.25，0 关闭
                   （拿设备的人；静止物体全程都看得到，不会被去掉。见 assemble.py；FAST-LIO 那一路不做）
+                  同时去掉设备静止时旁边站着、走动的人（只在静止前后出现、其余时间被激光看穿的格子）；0 也一起关掉
   实机会先等 chrony 对上时间（同 fusion.sh，最多 60 s）；确定没外网也要建图，加 --allow-unsynced-clock。
   录包期间同 fusion.sh 冻结板端时钟（停 chronyd，录完收拢残留再恢复），运行中联网不会跳时间
   --set NAME=VALUE  只对本次覆盖实时 FAST-LIO 的参数，可重复，例如 --set preprocess/blind=1.0 --set filter_size_surf=0.3
@@ -699,7 +700,7 @@ def main(entry):
     p.add_argument('--out-root', default=os.path.expanduser('~/test_data/mapping'))
     p.add_argument('--keep-frames', action='store_true', help='保留 Voxel-SLAM 的逐帧点云')
     p.add_argument('--carve', type=float, default=assemble.CARVE_R, metavar='R',
-                   help='去人：去掉设备走过空间里（水平 R m 以内）只短暂出现的点，默认 %(default)s，0 关闭')
+                   help='去人：去掉设备走过空间里（水平 R m 以内）只短暂出现的点和设备静止时旁边的人，默认 %(default)s，0 都关闭')
     p.add_argument('--allow-unsynced-clock', action='store_true', help='实机：板端时间没对上也照样建图')
     p.add_argument('--set', action='append', default=[], metavar='NAME=VALUE', help='只对本次覆盖实时 FAST-LIO 参数，可重复')
     a = p.parse_args()
