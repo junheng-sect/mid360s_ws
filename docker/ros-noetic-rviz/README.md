@@ -1,7 +1,72 @@
 # 本机 Docker RViz
 
 本目录随 mid360s_ws 管理显示脚本、Dockerfile、RViz/launch 配置与面板测量工具。
-用于 Ubuntu 桌面 X11 + NVIDIA Docker 环境，不在 Orange Pi 板端运行。
+支持 Ubuntu 桌面 X11 + NVIDIA Docker，以及 Apple Silicon Mac 的 ARM64 Docker + 浏览器 RViz。
+显示和辅助节点都在本机容器运行，不在 Orange Pi 板端增加进程。
+
+## Apple Silicon Mac
+
+安装 Docker Desktop 4.34 或更新版本，并启用 Settings → Resources → Network → Enable host networking。
+若未创建系统级 CLI 链接，入口会自动使用 `/Applications/Docker.app/Contents/Resources/bin/docker`。
+Ubuntu 原 `scripts/run_rviz.sh`、`scripts/build_image.sh`、`common.sh` 和 launch 文件保持原样；
+Mac 使用独立入口，不通过原命令按系统分流。首次构建与日常使用（仓库根目录）：
+
+```bash
+./docker/ros-noetic-rviz/scripts/build_image_mac.sh
+./scripts/run_rviz_mac.sh
+./scripts/run_rviz_mac.sh --reloc
+./scripts/run_rviz_mac.sh --check
+./scripts/run_rviz_mac.sh --reloc --check
+./scripts/run_rviz_mac.sh --stop
+./scripts/run_rviz_mac.sh --dry-run
+```
+
+Mac 镜像 `ros-noetic-rviz:noetic-arm64-web` 使用固定摘要的 ARM64 `ros:noetic-ros-base`，
+只安装显示依赖。默认使用 Mesa llvmpipe 软件渲染、1440×900 虚拟桌面和无 JPEG 的 noVNC，
+自动打开 `http://localhost:6080/vnc.html`。浏览器画面可缩放、旋转和操作完整 RViz。
+`--no-open` 可仅启动显示容器，不自动打开浏览器。
+关闭 **RViz 窗口** 或 `--stop` 会退出桌面、辅助节点和容器；关闭浏览器标签页不会停止容器。
+FAST-LIO 与重定位共用默认容器和端口，切换前先执行 `--stop`。
+要并行打开 FAST-LIO 与重定位视图，使用不同的 `--name` 和 `--web-port`，例如：
+
+```bash
+./scripts/run_rviz_mac.sh --reloc --name rviz_reloc --web-port 6082
+```
+
+HTTP 和 VNC 仅监听本机回环地址；`--web-port` 范围为 1024–55535，另保留该端口加 10000 给 VNC。
+个人配置首次初始化为适合虚拟桌面的窗口尺寸，后续保存不会被覆盖。
+保持历史点云 **1000 秒**、原有话题与配色，不默认降采样；长时间运行的资源占用取决于累计点数。
+EGO 独立显示在 Orange 仓库 `tools/ego_rviz` 中，默认使用浏览器端口 6081。
+
+Mac 仍需与板端同网或有可达路由。入口自动识别宿主机源 IP，按需用 `sudo route` 添加到
+`10.250.32.1` 的临时主机路由；`BOARD_IP` 可指定板端 Wi-Fi 下一跳，`--ros-master` 和 `--ros-ip` 可覆盖。
+不会改变默认路由、板端配置或添加板端代理。
+启动前会通过 **声明的宿主机 IP** 检查宿主机与容器双向 TCP；通过不代表外部板端回调已验收。
+`--check` 实际接收所选视图的点云、里程计／重定位状态和 TF，列出 compressed 图像接收状态；
+缺少必需数据时返回非零。Master 可达或话题已登记不能单独判定显示可用。
+
+`--dry-run` 不调用 Docker、不创建目录、不添加路由、不生成 X 授权。`--shell`、`--cmd`、`--check`
+不启动桌面。Mac 不使用 NVIDIA、宿主机 X11 或宿主机 ROS，也不扩展无人机状态桥或开机自启。
+
+离线脚本回归：`python3 docker/ros-noetic-rviz/tests/test_launchers.py -v`。
+脚本回归不代替接板端的点云／图像、回调及性能验收。
+本次本机验证结果、性能观测和待验收项见 [Mac 验证记录](MAC_VALIDATION.md)。
+重定位和 FAST-LIO 的 Mac RViz 节点分别按容器名命名，避免并行视图互相退出；
+检查容器和检查节点也使用独立名称，可并行执行 `--check`。
+
+本机快捷命令 `rviz-mac` 指向 `scripts/run_rviz_mac.sh`，可用 `rviz-mac --reloc` 切换视图。
+Mac 只读取 `local.mac.env`，不读取 Ubuntu 的 `local.env`，构建记录写入 `.image.mac.env`。
+按需创建配置（已有文件不覆盖）：
+
+```bash
+cp -n docker/ros-noetic-rviz/local.mac.env.example docker/ros-noetic-rviz/local.mac.env
+```
+
+配置优先级：命令行参数 > `local.mac.env` 的 RVIZ_* / EGO_* > 内置默认值；
+ROS Master 未覆盖时也接受已有 `ROS_MASTER_URI`。Mac 使用 `Dockerfile.macos`、
+`common_mac.sh`、`display_runtime_mac.sh` 和 `*_mac.launch`；原 Ubuntu 文件不加载这些文件。
+
+## Ubuntu
 
 在仓库根目录调用（仓库可放在任意路径，用户名不必相同）：
 
@@ -92,6 +157,7 @@ cp -n docker/ros-noetic-rviz/local.env.example docker/ros-noetic-rviz/local.env
   个人配置 `home/ros/.rviz/` 只在不存在时从模板复制，已有个人配置需自行 Add 该面板或删除后重新生成。
 - 保留 GPU 渲染、历史/当前点云与路径配置。2026-09-26 在旧入口完成隔离容器的 IPC 对照、滚动/加宽复测，用户确认手动最大化正常；不是板端实时点云验收。
 
-`local.env`、`home/`、`runtime/`、`logs/` 和 `.image.env` 为自动生成的本机数据，已忽略，
+`local.env`、`local.mac.env`、`home/`、`runtime/`、`logs/`、`.image.env` 和 `.image.mac.env`
+为自动生成的本机数据，已忽略，
 不迁入旧目录中的授权文件、用户缓存、日志或 bag。首次运行自动创建所需目录。
 旧 `/home/zjh/docker/ros-noetic-rviz` 保留用于兼容已有会话，今后维护本仓库版本。

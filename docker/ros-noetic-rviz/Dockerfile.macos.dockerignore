@@ -1,0 +1,5 @@
+**
+!Dockerfile.macos
+!scripts/
+scripts/**
+!scripts/web_desktop.sh

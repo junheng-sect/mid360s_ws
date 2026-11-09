@@ -1,0 +1,20 @@
+# Native Apple Silicon display image; algorithms and hardware stay on the board.
+FROM ros:noetic-ros-base@sha256:c84e573d2f2beb679ea5b03015eb2876e9962657c23d0073e4ae9d7ba41c4700
+ARG UBUNTU_MIRROR=https://mirrors.ustc.edu.cn/ubuntu-ports
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    sed -i "s|http://ports.ubuntu.com/ubuntu-ports|${UBUNTU_MIRROR}|g" /etc/apt/sources.list && \
+    apt-get update -o Acquire::Retries=3 && \
+    apt-get install -o Acquire::Retries=3 -o Acquire::https::Timeout=20 -y --no-install-recommends \
+    ros-noetic-rviz ros-noetic-pcl-ros ros-noetic-image-transport-plugins \
+    ros-noetic-tf ros-noetic-tf2-ros ros-noetic-cv-bridge \
+    libarmadillo-dev cmake build-essential python3-numpy python3-opencv \
+    python3-websocket python3-yaml mesa-utils libgl1-mesa-dri \
+    xvfb openbox x11vnc novnc websockify x11-utils procps \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/web_desktop.sh /usr/local/bin/rviz-web-desktop
+# Leave the JPEG quality pseudo-encoding unset: LibVNCServer uses lossless Tight/PNG.
+RUN python3 -c 'from pathlib import Path; p=Path("/usr/share/novnc/core/rfb.js"); s=p.read_text(); token="encs.push(encodings.pseudoEncodingQualityLevel0 + 6);"; assert token in s, "noVNC encoding API changed"; p.write_text(s.replace(token, "// Lossless RViz: no JPEG quality request"))'
+RUN chmod +x /usr/local/bin/rviz-web-desktop && mkdir -p /home/ros /tmp/.X11-unix && chmod 777 /home/ros && chmod 1777 /tmp/.X11-unix
+ENV HOME=/home/ros LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe QT_X11_NO_MITSHM=1
+WORKDIR /home/ros

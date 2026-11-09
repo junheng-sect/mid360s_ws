@@ -31,3 +31,11 @@ __pycache__/
 
 # Agent instructions are per machine, never shared through the repo.
 AGENTS.md
+
+# Private local RViz configuration and runtime files.
+docker/ros-noetic-rviz/local.env
+docker/ros-noetic-rviz/.image.env
+docker/ros-noetic-rviz/local.mac.env
+docker/ros-noetic-rviz/.image.mac.env
+docker/ros-noetic-rviz/home/
+docker/ros-noetic-rviz/runtime/

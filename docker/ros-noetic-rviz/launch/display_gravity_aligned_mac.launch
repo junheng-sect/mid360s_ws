@@ -1,0 +1,23 @@
+<launch>
+  <!--
+    本机显示专用：在重力对齐的 drone_odom 下显示板端 FAST-LIO2 的点云与里程计。
+
+    - drone_odom -> camera_init 静态 TF 由**板端 fastlio_gravity_bridge 节点**发布：它用本次
+      FAST-LIO2 初始化重力自动算出对齐旋转并 latched 发布，因此不会像本机固定四元数那样
+      在板端重新初始化后过期。本机不再发布这一段，避免同一对坐标系出现两个发布者。
+    - 前置条件：板端正在运行桥接节点（一键脚本 scripts/start_mid360s_fastlio.sh 已包含；
+      单独启动用 roslaunch fastlio_gravity_bridge gravity_bridge.launch）。
+      板端没跑时 RViz 会提示 Fixed Frame [drone_odom] does not exist。
+    - 不改动板端消息，也不做任何坐标转换：点云、Odometry 仍按原始 frame 发布，
+      由 RViz 通过 TF 变换到 drone_odom 显示。
+    - RViz 节点 required="true"：关闭窗口、Ctrl+C 或 docker stop 时整体退出，不留孤儿进程。
+  -->
+
+  <!-- 容器内路径（宿主机 <仓库>/rviz 挂载到 /opt/rviz-ws/rviz） -->
+  <arg name="config" default="/opt/rviz-ws/rviz/fastlio_mid360s.rviz" />
+  <arg name="rviz_name" default="rviz" />
+
+  <node pkg="rviz" type="rviz" name="$(arg rviz_name)"
+        args="-d $(arg config)"
+        output="screen" required="true" />
+</launch>
