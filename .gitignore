@@ -28,3 +28,6 @@ src/LiDAR_IMU_Init/result/*.txt
 *~
 __pycache__/
 .commandcode/
+
+# Agent instructions are per machine, never shared through the repo.
+AGENTS.md
