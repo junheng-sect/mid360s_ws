@@ -1,0 +1,31 @@
+# 室外 EGO 单点测试配置（11-05，由 drone_navigation/config/navigation.yaml 复制改出）
+# 地图：室外大图 20261105_114605_outdoor，必须和重定位 --map 完全一致（abspath）
+# 机体：320 轴距 + 两侧各 110 桨保 = 对角总宽 540 mm（11-05 用户给）。
+config:
+  deployment_verified: true
+  map_id: /home/orangepi/test_data/mapping/20261105_114605_outdoor
+  # 雷达 IMU -> PX4 控制参考点（重心），机体 FLU。由飞控 EKF2_EV_POS_X/Y/Z = (0.016, -0.021, -0.053)（FRD，
+  # 雷达相对重心）取反换轴得到，11.3 log89 的参数；换过雷达安装要重新核对
+  lever_body: [-0.016, -0.021, -0.053]
+  sensor_offset_imu: [-0.011, -0.02329, 0.04412] # 激光发射点在 IMU 系，沿用模板
+  # 以控制参考点为中心的机体半包络。EGO 膨胀是世界系方盒、不随 yaw 转，水平取外接圆半径 540/2 = 0.27；
+  # 竖直 0.15：机高 26 cm，重心不在正中，取重心到顶 / 到底中较大的一个（雷达 IMU 在重心上方 5.3 cm，估计到底约 15 cm，
+  # 11-07 用户定）。网关要求 half_height ≥ 0.15 + clearance，launch 默认 half_height 已改 0.30（和 0.25 一样都是 3 格）；
+  # grid_map 要求机体框必须已观测，竖直从 ±1 格变成 ±2 格（±0.2 m）
+  body_half_extent: [0.27, 0.27, 0.15]
+  # 膨胀半径按用户定的 1.5 倍：0.27 x 1.5 = 0.405。EGO 按 ceil(半径/0.1 m) 取格，0.405 会进成 5 格（±0.5 m），
+  # 所以用 launch 默认 radius 0.40（4 格，1.48 倍）；网关要求 radius ≥ 0.27 + clearance，故 clearance 0.13
+  clearance: 0.13
+  # 11-07 头顶未知当空闲，和 outdoor_nav.yaml 一致（说明见那边）
+  allow_unknown_above: true
+  # 本次 drone_odom（起 fusion 时地上雷达 IMU 为原点）下目标允许范围；test4 专用 ±5 m，场地清空后使用
+  goal_boundary_margin: 0.30 # 航点距任一边界至少 30 cm；整轮发出前预检
+  bounds_min: [-5.0, -5.0, 0.4]
+  bounds_max: [5.0, 5.0, 2.5]
+  # 11-07 室外从 0.5 / 0.5 放宽，和 outdoor_nav.yaml 一致（说明见那边）
+  max_vel: 1.0
+  max_acc: 1.0
+  # 11-07 晚竖直单独限速、原地转向速率，和 outdoor_nav.yaml 一致（说明见那边）
+  max_vel_z: 0.3
+  max_acc_z: 0.3
+  yaw_rate_deg: 30
