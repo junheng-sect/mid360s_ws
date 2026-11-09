@@ -5,6 +5,7 @@ from car_bridge import calib  # noqa: E402
 from car_bridge.node import car_state,status  # noqa: E402
 
 CFG=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),'config','map_frame.yaml')
+CFG_OUT=os.path.join(os.path.dirname(CFG),'map_frame_outdoor.yaml')
 
 
 def apply(T,x,y,yaw_deg=0.):
@@ -71,6 +72,30 @@ class CarStateTests(unittest.TestCase):
         self.assertEqual(car_state(FakeBridge(**{'/tracked_pose':pose()}),self.F),(None,'car map id unknown'))
         self.assertEqual(car_state(FakeBridge(),self.F),(None,'car offline'))
         s=status(FakeBridge(),self.F,5.);self.assertFalse(s['online'] or s['valid']);self.assertIsNone(s['age_s'])
+
+
+class OutdoorTests(unittest.TestCase):
+    def setUp(self):self.F=calib.load(CFG_OUT)
+
+    def test_map_is_mapping_flu_with_floor_at_z0(self):
+        # map = drone_map at mapping start (nose = +x); only z moves so the ground under the start is 0
+        x,y,a=apply(self.F['map_drone'],1.,2.,30.)
+        self.assertAlmostEqual(x,1.,delta=1e-12);self.assertAlmostEqual(y,2.,delta=1e-12);self.assertAlmostEqual(a,30.,delta=1e-9)
+        self.assertAlmostEqual((self.F['map_drone']@np.array([0,0,-.151,1.]))[2],0,delta=1e-9)
+
+    def test_no_car_map_withholds_car(self):
+        self.assertIsNone(self.F['map_car']);self.assertIsNone(self.F['car_drone'])
+        b=FakeBridge(**{'/tracked_pose':pose(),'/current_floormap':{'mapId':self.F['car_map_id'],'mapName':'x'}})
+        self.assertEqual(car_state(b,self.F),(None,'no car map registered for this site'))
+        s=status(b,self.F,100.);self.assertFalse(s['valid'] or s['map_ok']);self.assertTrue(s['online'])
+        self.assertFalse(status(FakeBridge(),self.F,5.)['map_ok'])
+
+    def test_half_car_calibration_rejected(self):
+        with open(CFG_OUT) as f:text=f.read().replace('car_map_id: null','car_map_id: 123')
+        with tempfile.NamedTemporaryFile('w',suffix='.yaml',delete=False) as f:f.write(text)
+        try:
+            with self.assertRaises(ValueError):calib.load(f.name)
+        finally:os.unlink(f.name)
 
 
 if __name__=='__main__':

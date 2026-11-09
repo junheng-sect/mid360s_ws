@@ -22,12 +22,16 @@ def quat_yaw(a):
 
 
 def load(path):
+    """car_map_id and map_from_car_map are both null at a site whose car map is not registered yet:
+    then map_car / car_drone are None and only map->drone_map is calibrated."""
     with open(os.path.expanduser(path)) as f:d=yaml.safe_load(f)
     if not isinstance(d,dict) or set(d)!=KEYS:raise ValueError('map_frame keys must be exactly %s'%sorted(KEYS))
-    T={k:se2(*(float(d[k][a]) for a in ('x','y','z','yaw_deg'))) for k in ('map_from_drone_map','map_from_car_map')}
-    return dict(drone_map=str(d['drone_map']),car_map_id=int(d['car_map_id']),height=float(d['car_base_height']),
-                map_drone=T['map_from_drone_map'],map_car=T['map_from_car_map'],
-                car_drone=np.linalg.inv(T['map_from_car_map'])@T['map_from_drone_map'])
+    if (d['car_map_id'] is None)!=(d['map_from_car_map'] is None):raise ValueError('car_map_id and map_from_car_map must both be set or both be null')
+    T={k:se2(*(float(d[k][a]) for a in ('x','y','z','yaw_deg'))) for k in ('map_from_drone_map','map_from_car_map') if d[k] is not None}
+    car=T.get('map_from_car_map')
+    return dict(drone_map=str(d['drone_map']),car_map_id=None if car is None else int(d['car_map_id']),height=float(d['car_base_height']),
+                map_drone=T['map_from_drone_map'],map_car=car,
+                car_drone=None if car is None else np.linalg.inv(car)@T['map_from_drone_map'])
 
 
 def pose_xyyaw(msg):

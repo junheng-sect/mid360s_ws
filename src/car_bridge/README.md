@@ -35,6 +35,19 @@ map ──静态──> drone_map ──重定位──> drone_odom ──> came
 - `car_base_height`：car_base 离地高度，取车激光高度 0.20 m（车 TF 里 `base_footprint→scan`）。用相对位姿时注意它比车的
   `base_footprint` 高 0.20 m。
 
+### 室外（`config/map_frame_outdoor.yaml`，无人机图 `20261105_114605_outdoor`）
+
+- map 就是建图时无人机机头为 x 的 FLU 系：x、y、yaw 和 drone_map 相同，只把 z=0 放到起点下方的地面（起点 1 m 内地面拟合
+  z=−0.151，所以 map←drone_map = (0, 0, 0.151, 0°)）。
+- 室外还没有车图，`car_map_id`、`map_from_car_map` 写 `null`：不发 `map→car_map`、`car_base` 和 `/car/pose`，
+  `/car/status` 的 why 是 `no car map registered for this site`。车建好室外图后按室内的做法配准再填上（两项要同时填）。
+- 重定位时带上：
+
+```bash
+roslaunch drone_relocalization relocalize.launch map_dir:=$HOME/test_data/mapping/20261105_114605_outdoor \
+  config:=$(rospack find drone_relocalization)/config/outdoor.yaml map_frame:=$(rospack find car_bridge)/config/map_frame_outdoor.yaml
+```
+
 ## 测试
 
 ```bash

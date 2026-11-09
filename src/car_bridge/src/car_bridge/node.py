@@ -1,12 +1,12 @@
 """Car pose into the board's TF tree. Reads the M65 car's rosbridge only; never publishes to the car.
 
   /tf_static  map -> drone_map   map_frame.yaml; only when --drone-map is the calibrated drone map
-              map -> car_map     map_frame.yaml
+              map -> car_map     map_frame.yaml; only when the site has a registered car map
   /tf         car_map -> car_base  every /tracked_pose (10 Hz), z = car_base_height, board receive time
   /car/pose   PoseStamped, map <- car_base, same stamp as the TF
   /car/status latched JSON at 1 Hz: online, age_s, map_ok, score, why, valid
 The car clock is not synced with the board, so stamps are the board's receive time (rosbridge throttle <= 0.1 s).
-A car map id other than the calibrated one withholds car_base and /car/pose; status says why.
+A car map id other than the calibrated one (or no car map registered for the site) withholds car_base and /car/pose; status says why.
 """
 import argparse
 import importlib.util
@@ -62,6 +62,7 @@ def car_state(bridge,F):
     """(tracked pose dict or None, reason); a pose only when the car is fresh and on the calibrated map."""
     floor=bridge.get('/current_floormap');pose=bridge.get('/tracked_pose',CAR_STALE_S)
     if pose is None:return None,'car offline'
+    if F['car_map_id'] is None:return None,'no car map registered for this site'
     if floor is None:return None,'car map id unknown'
     if int(floor.get('mapId',-1))!=F['car_map_id']:
         return None,'car map %s (id %s) is not the calibrated %d'%(floor.get('mapName'),floor.get('mapId'),F['car_map_id'])
@@ -72,7 +73,7 @@ def status(bridge,F,now):
     pose,why=car_state(bridge,F);floor=bridge.get('/current_floormap') or {};score=bridge.get('/local_global_score',5.)
     t=bridge.stamp('/tracked_pose')
     return dict(schema_version=1,online=bridge.get('/tracked_pose',CAR_STALE_S) is not None,age_s=round(now-t,3) if t else None,
-                map_id=floor.get('mapId'),map_name=floor.get('mapName'),map_ok=floor.get('mapId')==F['car_map_id'],
+                map_id=floor.get('mapId'),map_name=floor.get('mapName'),map_ok=F['car_map_id'] is not None and floor.get('mapId')==F['car_map_id'],
                 score=score['data'][-1] if score and score.get('data') else None,valid=pose is not None,why=why)
 
 
@@ -85,7 +86,8 @@ class CarBridgeNode:
         self.static=tf2_ros.StaticTransformBroadcaster();self.dynamic=tf2_ros.TransformBroadcaster()
         self.pub_pose=rospy.Publisher('/car/pose',PoseStamped,queue_size=5)
         self.pub_status=rospy.Publisher('/car/status',String,queue_size=1,latch=True)
-        static=[self.tf('map','car_map',F['map_car'],rospy.Time.now())]
+        static=[] if F['map_car'] is None else [self.tf('map','car_map',F['map_car'],rospy.Time.now())]
+        if F['map_car'] is None:rospy.logwarn('car_bridge: 本场地还没有配准车图，不发 map->car_map 和车位姿')
         name=os.path.basename(os.path.normpath(os.path.expanduser(drone_map)))
         if name==F['drone_map']:static.append(self.tf('map','drone_map',F['map_drone'],rospy.Time.now()))
         else:rospy.logerr('car_bridge: 无人机图 %s 不是标定用的 %s，不发 map->drone_map'%(name,F['drone_map']))
