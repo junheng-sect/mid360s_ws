@@ -79,6 +79,125 @@ bash /home/orangepi/mid360s_ws/scripts/nav_test/tests/run_indoor2_isolated.sh
 
 现场结束时人工切回定点、降落、上锁，再 Ctrl+C。验证记录见 `INDOOR2_VALIDATION.md`。
 
+
+## test7：室外全局航点（drone_map 绝对坐标）
+
+```bash
+cd /home/orangepi/mid360s_ws/scripts
+./nav_test7.sh
+# 自定义航点（可重复 --point，按给出顺序飞）；--hold 改每点保持秒数
+./nav_test7.sh --point "0,0,1,0" --point "1.5,0,1.5,90" --hold 5
+```
+
+与 test2/4/5/indoor 的区别：**航点直接按 `drone_map` 绝对坐标发**，不再按“当前位姿 + 偏移”算。
+任务层 `/drone_nav/execute_route` 本来就只收 `drone_map` 帧，所以这里把绝对点原样交给它，
+只为了边界检查和记录反算一次 `drone_odom`。默认用室外链（`20261105_114605_outdoor` + `outdoor.yaml`
+`map_frame_outdoor.yaml` + `outdoor_nav.yaml`）。
+
+默认航点（`drone_map`，m，第四个数是偏航角 °），每个点稳定到达后保持 3 s：
+`(0,0,1,0)` → `(2,0,1,0)` → `(2,-2,1,0)` → `(0,-2,1,0)` → `(0,0,1,0)`。
+
+- **z 的语义**：`drone_map` 原点 = 建图/重定位启动时机体（雷达 IMU）所在位置，也就是飞机停在地面时的
+  机体高度，不是地面海拔；`z=1` 表示机体离地约 1 m（腿和桨保在机体下方约 0.15 m）。`car_bridge` 的
+  `map` 帧把地面定在 z=0，比它低 0.151 m（`map_frame_outdoor.yaml`，照室内抄的假设值，未实测）。
+- 启动横幅打印当前位置（`drone_map` 与 `drone_odom` 两套）、首点距离、每个点换算后的 odom 坐标；
+  首点离当前位置超过 `--max-start-offset`（默认 2 m）直接拒绝，防止拿错地图或原点。
+- **首点已在脚下就不发**：离当前位置 <0.2 m 且航向差 ≤5° 时只保持 `--hold` 秒。任务层明确拒绝
+  离当前位置 <0.2 m 的新目标（原地转向只在“重复同一终点”时放行），而人工起飞点通常就在首点正下方；
+  若 <0.2 m 但航向差 >5°，脚本报错并拒绝，需要先挪开或改点。
+- 拒绝条件：相邻航点 <0.2 m、航点换算到 `drone_odom` 后越过边界（`outdoor_nav.yaml` 的
+  `[-3,-3,0.4]~[3,3,2.5]` 加 0.30 m 余量，即 x/y 在 ±2.7 m、z 在 0.70~2.20 m）、目标足迹未知/被占
+  （`--check-segments` 时查整段直线）、地图变换重置、输入/重定位失效、执行器或网关故障。
+- 到点判据由任务层给：位置误差 ≤0.15 m、速度 ≤0.1 m/s、航向误差 ≤5°，连续满足 1 s；到点后保持
+  `--hold` 秒再 `prepare` 下一段。
+- 每点单独一次 action；记录在 `~/test_data/nav_test/<时间>_test7/goal_test7_*.json`，含
+  `goals_map`/`goals_odom`、每段发送/到达/保持时间、终点误差；跳过的段记为 `SKIPPED_AT_POINT`。
+- 接管、上锁、故障或 Ctrl+C 立即终止本轮，不续飞剩余航点；不自动解锁、起飞或降落。
+
+预览（导航不发飞控，需手持按目标移动）：
+
+```bash
+cd /home/orangepi/mid360s_ws/scripts
+./nav_test7.sh --preview --ev-mode odom
+
+# 离线单测：绝对点、反变换、每点保持、已在点上跳过、拒绝条件（不需要 master/飞控）
+cd /home/orangepi/mid360s_ws/scripts/nav_test/tests && python3 -m unittest -v test_nav_global
+```
+
+## test8：全局航点 + 段前转向（机头朝前进方向）
+
+```bash
+cd /home/orangepi/mid360s_ws/scripts
+./nav_test8.sh
+./nav_test8.sh --hold 3          # 每个"前进"段到点后再停 3 s 观察
+```
+
+和 test7 同一条路线、同一条室外链，区别只在航向：**每一段都先把机头转到该段的前进方向，再飞这一段**，
+也就是"前进 → 原地转 → 前进 → 原地转"。实现上不是改执行器，而是把每个拐点拆成两个目标：
+
+- **前进**：下一拐点的位置 + 该段连线方向作为航向。执行器在平移期间锁住这个航向，所以机头与前进方向一致。
+- **原地转向**：与刚完成的终点**完全相同的位置** + 下一段方向，走任务层“重复同一终点”的放行条件
+  （位置 1 μm 内、实际误差 ≤0.15 m、速度 ≤0.1 m/s）；执行器按导航配置的 `yaw_rate_deg` 逐 tick 步进。
+
+默认路线（`drone_map` 绝对坐标，与 test7 相同；方括号是自动算出的机头方向）：
+`(0,0,1)` → `(2,0,1)[0°]` → `(2,-2,1)[-90°]` → `(0,-2,1)[180°]` → `(0,0,1)[+90°]`。
+第 4 个字段（航向）在 test8 里被忽略，只用位置。
+
+- 转向速率来自导航配置：test8 默认 `outdoor_nav_yaw45.yaml`（`yaw_rate_deg: 45`，**转 90° 约 2 s**），
+  其余限速/包络/边界/起飞高度与 `outdoor_nav.yaml` 完全一致；test7 仍用 30°/s。
+- **第一段转不了**：任务层不接受首目标的原地转向，所以起飞后机头要大致对着首段方向
+  （默认路线是 `map +x`，即建图时的机头方向）；偏了只会让第一段轻微侧飞，第二段起就完全对齐。
+- 起飞前仍要升到 **0.70 m 以上**（边界 z_min 0.40 + 余量 0.30），否则发目标前就会被预检拒绝。
+- 默认不保持（`--hold 0`）：转向段转完立刻前进；`--hold S` 只对“前进”段生效。
+- 记录在 `~/test_data/nav_test/<时间>_test8/goal_test8_*.json`，`legs` 里每个目标的 `direction` 标明是
+  "前进 #i→#j，机头 X°"还是"原地转向到 X°（±Δ°）"，并带发送、到达、保持时间与终点误差。
+
+**原地转向在本项目是第一次上实飞**：隔离测试里（test5 的 90° 原地转向）转向漂移 7.7 mm、无异常，
+但实飞的推力、地面效应和 LIO/PX4 航向残差还没验证过；第一次跑建议低空、空旷、留足余量，并盯住转向时的位置漂移。
+
+```bash
+# 预览（导航不发飞控，手持按目标移动/转向）
+cd /home/orangepi/mid360s_ws/scripts
+./nav_test8.sh --preview --ev-mode odom
+
+# 离线单测：前进/转向展开、航向=前进方向、转向段不保持、共线路线不转向、180° 掉头
+cd /home/orangepi/mid360s_ws/scripts/nav_test/tests && python3 -m unittest -v test_nav_turn
+```
+
+## test9：竖直矩形（1 m ↔ 3 m）
+
+```bash
+cd /home/orangepi/mid360s_ws/scripts
+./nav_test9.sh                    # 默认路线，每点停 3 s
+./nav_test9.sh --hold 0           # 到点就飞，不停
+./nav_test9.sh --point "2,0,1" --point "2,-2,2"   # 自定义（3 个数=只管位置）
+```
+
+默认路线在 **x=2 平面上的 2 m × 2 m 竖直矩形**，全程机头保持进入本轮时的朝向：
+`(2,0,1)` → `(2,-2,1)` → `(2,-2,3)` → `(2,0,3)` → `(2,0,1)`
+（先在 1 m 沿 −y 飞 2 m → 竖直爬到 3 m → 沿 +y 飞 2 m → 竖直降回 1 m）。
+
+- **必须用 `nav_test/outdoor_nav_z3.yaml`**（脚本默认）：它只把 z 上界从 2.5 抬到 3.5，配合
+  `goal_boundary_margin 0.30` 允许航点到 **3.20 m**；用默认 `outdoor_nav.yaml`（上界 2.20 m）时
+  z=3 的两个点会在发目标前被边界预检拒掉。竖直限速仍是 `max_vel_z 0.3`，2 m 爬升约 8 s。
+- `--point` 支持 3 个数（`x,y,z`，航向保持）或 4 个数（`x,y,z,yaw_deg`，给目标航向），test7 那种写法照样能用。
+- `--max-start-offset` 默认 **3 m**（首点 (2,0,1) 离起飞点约 2 m，用默认 2 m 会贴边界）。
+- 起飞前升到 0.70 m 以上；到点判据同其它测试（位置 ≤0.15 m、速度 ≤0.1 m/s、航向 ≤5° 连续 1 s）。
+- 记录在 `~/test_data/nav_test/<时间>_test9/goal_test9_*.json`（`--record-prefix test9`；
+  json 里的 `test` 字段仍是 test7——两者共用同一个 runner）。
+- **风险**：3 m 高度上雷达往上只看到 +52°，头顶是未知格，靠 `allow_unknown_above: true` 当空闲放行；
+  室外要留意头顶树枝/电线（看不见就不会被发现），并确认 3 m 附近没有障碍。竖直爬升只靠 LIO/PX4 高度，
+  本机没装测距仪。
+
+```bash
+# 预览（导航不发飞控，手持按目标移动）
+cd /home/orangepi/mid360s_ws/scripts
+./nav_test9.sh --preview --ev-mode odom
+
+# 离线单测（含"test9 路线需要 z3 配置""省略航向时保持机头"两项）
+cd /home/orangepi/mid360s_ws/scripts/nav_test/tests && python3 -m unittest -v test_nav_global
+```
+
 ## 其他航段测试
 
 所有入口都先运行定位、重定位和导航；等待“导航就绪”以后，人工定点起飞并悬停。

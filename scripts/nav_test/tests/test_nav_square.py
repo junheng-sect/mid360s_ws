@@ -77,6 +77,9 @@ class Client:
 
 
 class Harness:
+    # 子类换成本模块的 runner 即可复用整套假时钟/假 action/假 TF/遥测传送。
+    RUNNER = nav.SquareRunner
+
     def __init__(self, preview=False):
         self.clock = Clock()
         self.preview = preview
@@ -103,11 +106,14 @@ class Harness:
         self.state = nav.SquareState()
         self.tmp = tempfile.TemporaryDirectory(prefix='square-unit-')
         self.client = Client(self)
-        self.args = NS(preview=preview, delay=3.0, out=self.tmp.name)
+        self.args = self.make_args()
         self.cfg = dict(map_id='synthetic', bounds_min=[-3., -3., .4], bounds_max=[3., 3., 2.5], max_vel=.5, max_acc=.5)
-        self.runner = nav.SquareRunner(self.args, self.cfg, self.state, self, self.prepare, self.check, self.client)
+        self.runner = self.RUNNER(self.args, self.cfg, self.state, self, self.prepare, self.check, self.client)
         self.clock.hook = self.tick
         self.publish()
+
+    def make_args(self):
+        return NS(preview=self.preview, delay=3.0, out=self.tmp.name)
 
     def close(self):
         self.tmp.cleanup()

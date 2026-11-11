@@ -119,9 +119,22 @@ class SquareRunner:
     check_segments = False
     side_m = 1.0
     hold_seconds = HOLD_SECONDS
+    goals_in_map = False
 
     def make_route(self, position, yaw):
         return square_points(position, yaw), np.full(4, yaw), DIRECTIONS
+
+    def make_route_map(self):
+        """goals_in_map 子类：直接给 drone_map 绝对航点 (n×3) 与航向 (rad)，不参考当前位置。"""
+        raise NotImplementedError('goals_in_map 子类必须实现 make_route_map')
+
+    def skip_leg(self, i, goal, yaw):
+        """返回 True 表示这一段不发目标（子类自己记录并保持）。默认不跳过。"""
+        return False
+
+    def hold_for(self, i):
+        """第 i 段到点后保持多少秒。默认每段都一样，子类可按段类型区分（如原地转向不保持）。"""
+        return self.hold_seconds
 
     def __init__(self, args, cfg, state, buf, prepare, check, client):
         self.a, self.cfg, self.s, self.buf = args, cfg, state, buf
@@ -207,19 +220,27 @@ class SquareRunner:
     def freeze(self):
         self.guard()
         p, yaw, _ = self.s.pose()
-        goals, yaws, self.names = self.make_route(p, yaw)
-        try:
-            check_goal_bounds(np.vstack([p, goals]), self.cfg,
-                              ['起点'] + ['#%d %s' % (i + 1, n) for i, n in enumerate(self.names)])
-        except ValueError as error:
-            raise Stopped(str(error))
+        # 先取地图变换：goals_in_map 的子类要用它把 drone_map 航点反变换到 drone_odom，
+        # 而 check_goal_bounds 的边界是 drone_odom 口径，必须用换好的 odom 点检查。
         self.reference = self.transform()
         r, t = self.reference
         direction = r @ np.array([math.cos(yaw), math.sin(yaw), 0.0])
         if np.linalg.norm(direction[:2]) < .9:
             raise Stopped('地图变换不能保持水平航向')
-        yaw_map = np.array([heading(r, a) for a in yaws])
-        goals_map = goals @ r.T + t
+        if self.goals_in_map:
+            goals_map, yaw_map, self.names = self.make_route_map()
+            goals = (goals_map - t) @ r
+            yaws = np.array([heading(r.T, a) for a in yaw_map])
+        else:
+            goals, yaws, self.names = self.make_route(p, yaw)
+            yaw_map = np.array([heading(r, a) for a in yaws])
+            goals_map = goals @ r.T + t
+        self.yaws = yaws
+        try:
+            check_goal_bounds(np.vstack([p, goals]), self.cfg,
+                              ['起点'] + ['#%d %s' % (i + 1, n) for i, n in enumerate(self.names)])
+        except ValueError as error:
+            raise Stopped(str(error))
         out = os.path.expanduser(self.a.out or '~/test_data/nav_test/' + time.strftime('%Y%m%d_%H%M%S'))
         os.makedirs(out, exist_ok=True)
         self.record_path = os.path.join(out, 'goal_%s_%s_%d.json' % (self.record_prefix, time.strftime('%H%M%S'), time.time_ns()))
@@ -235,7 +256,8 @@ class SquareRunner:
                            transform_translation=t.tolist(), goals_odom=goals.tolist(), goals_map=goals_map.tolist(),
                            start_wall=time.time(), start_ros=rospy.Time.now().to_sec(), legs=[], end='RUNNING')
         self.save()
-        say('本圈起点（drone_odom）%.3f %.3f %.3f，固定航向 %.1f°' % (*p, math.degrees(yaw)))
+        say('本圈起点（drone_odom）%.3f %.3f %.3f，当前航向 %.1f°%s' % (
+            *p, math.degrees(yaw), '' if not self.goals_in_map else '；航点用 drone_map 绝对坐标，不随起点平移'))
         for i, (g, gm) in enumerate(zip(goals, goals_map)):
             say('#%d %s：drone_odom (%.3f %.3f %.3f)；drone_map (%.3f %.3f %.3f)' % (i + 1, self.names[i], *g, *gm))
         return goals, goals_map, yaw_map
@@ -323,12 +345,13 @@ class SquareRunner:
         self.save()
         if state != 3 or result is None or result.success is not True:
             raise Stopped('#%d 任务 %s：%s' % (i + 1, leg['end'], hint(leg['reason'])))
-        say('#%d 稳定到点，保持 %g s' % (i + 1, self.hold_seconds))
+        hold = self.hold_for(i)
+        say('#%d 稳定到点，保持 %g s' % (i + 1, hold))
         leg.update(hold_start_wall=time.time(), hold_start_ros=rospy.Time.now().to_sec(), hold_elapsed_s=0.0)
         self.save()
         hold_at = time.monotonic()
         try:
-            self.pause(self.hold_seconds, stopped=True)
+            self.pause(hold, stopped=True)
         finally:
             leg['hold_elapsed_s'] = time.monotonic() - hold_at
             leg['hold_end_wall'] = time.time()
@@ -342,10 +365,14 @@ class SquareRunner:
                 say('进入 OFFBOARD：保持 %g s 后开始一圈（期间切出即取消）' % self.a.delay)
                 self.pause(self.a.delay, preparing=True)
             goals, goals_map, yaw_map = self.freeze()
+            sent = 0
             for i in range(len(goals)):
-                if i:
+                if self.skip_leg(i, goals[i], self.yaws[i]):
+                    continue
+                if sent:
                     self.reprepare()
                 self.send_leg(i, goals[i], goals_map[i], yaw_map[i])
+                sent += 1
             self.record['end'] = 'SUCCEEDED'
             say('%s完成，终点已保持 %g s，继续悬停。切回定点再切 OFFBOARD 才重跑' % (self.route_name, self.hold_seconds))
             return True
