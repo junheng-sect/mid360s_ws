@@ -654,6 +654,7 @@ def main():
         time.sleep(.05)
     if s.initial_armed:
         raise Stopped('启动时已经解锁，test10 不触发')
+    cfg = rospy.get_param('/drone_nav/config')
     for name in ('/drone_nav/prepare', '/drone_nav/check_trajectory',
                  '/drone_nav/prepare_takeoff', '/drone_nav/takeoff', '/drone_nav/land', '/mavros/set_mode'):
         rospy.wait_for_service(name, timeout=10)

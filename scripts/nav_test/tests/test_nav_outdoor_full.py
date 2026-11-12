@@ -7,7 +7,7 @@ import sys
 import unittest
 import threading
 from types import SimpleNamespace as NS
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import rospy
@@ -480,6 +480,34 @@ class FullTests(unittest.TestCase):
         runner_cls = serve.call_args[0][2]
         with self.assertRaises(ValueError):
             runner_cls(args, dict(h.cfg, yaw_rate_deg=30.), h.state, h, h.prepare, h.check, h.client)
+
+    def test_main_loads_the_config_and_constructs_the_flight_runner(self):
+        """Exercises the real (non-preview) main() body: no name may be missing there."""
+        h = self.harness()
+        cfg = dict(h.cfg)
+        state = NS(fcu=NS(armed=False), initial_armed=False)
+        client = Mock(); client.wait_for_server.return_value = True
+        runner = Mock(); runner.inputs_problem.return_value = ''
+        runner.run_once.return_value = True
+        fc = Mock(); fc.ext_fresh.return_value = True
+        fc.pos.return_value, fc.descent.return_value = np.zeros(3), 0.
+        args = NS(preview=False, delay=3., out=h.tmp.name, nav_config='')
+        wanted = []
+        with patch.object(nav, 'arguments', return_value=args), \
+                patch.object(rospy, 'wait_for_service',
+                             side_effect=lambda name, timeout=None: wanted.append(name)), \
+                patch.object(rospy, 'has_param', return_value=True), \
+                patch.object(rospy, 'get_param', return_value=cfg), \
+                patch.object(rospy, 'Duration'), patch.object(rospy, 'ServiceProxy'), \
+                patch.object(nav.actionlib, 'SimpleActionClient', return_value=client), \
+                patch.object(nav, 'FullState', return_value=state), \
+                patch.object(nav, 'Fc', return_value=fc), \
+                patch.object(nav.tf2_ros, 'Buffer'), patch.object(nav.tf2_ros, 'TransformListener'), \
+                patch.object(nav, 'FullRunner', return_value=runner) as ctor:
+            self.assertEqual(nav.main(), 0)
+        self.assertIs(ctor.call_args[0][1], cfg)
+        self.assertIn('/drone_nav/land', wanted)
+        self.assertEqual(len(wanted), 6)
 
 
 if __name__=='__main__':
