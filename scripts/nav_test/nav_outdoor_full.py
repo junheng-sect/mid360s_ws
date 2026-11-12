@@ -667,8 +667,23 @@ def main():
                         rospy.ServiceProxy('/drone_nav/takeoff', Trigger),
                         rospy.ServiceProxy('/drone_nav/land', Trigger),
                         rospy.ServiceProxy('/mavros/set_mode', SetMode))
-    end = time.monotonic() + 15.
-    while runner.inputs_problem() or not fc.ext_fresh() or fc.pos() is None or fc.descent() is None:
+    end = time.monotonic() + 60.
+    healthy_at, noted = None, False
+    while True:
+        est_why = s.ekf_problem()
+        ok = (not runner.inputs_problem() and fc.ext_fresh() and fc.pos() is not None
+              and fc.descent() is not None and (not est_why or s.resting_only()))
+        if ok:
+            healthy_at = time.monotonic() if healthy_at is None else healthy_at
+            if time.monotonic() - healthy_at >= 2.:
+                break
+        else:
+            healthy_at = None
+            if not noted:
+                noted = True
+                say('飞控数据流未就绪（%s）。PX4 的 estimator_status 等可能在 MAVROS 连接后几十秒才开始'
+                    '（11-11 test9 等约 30 s 恢复）；飞机未解锁、原地等待最多 60 s' %
+                    (est_why or runner.inputs_problem() or '位置/速度/着地状态断流'))
         if s.fcu.armed or rospy.is_shutdown() or time.monotonic() >= end:
             raise Stopped('输入未就绪/预检前已解锁，不起飞')
         time.sleep(.05)

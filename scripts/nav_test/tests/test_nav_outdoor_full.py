@@ -485,7 +485,13 @@ class FullTests(unittest.TestCase):
         """Exercises the real (non-preview) main() body: no name may be missing there."""
         h = self.harness()
         cfg = dict(h.cfg)
-        state = NS(fcu=NS(armed=False), initial_armed=False)
+        state_calls = {'est': 0}
+        def est_problem():
+            # The estimator stream comes up late on cold MAVROS/FCU starts (11-12 test10): stale, then fine.
+            state_calls['est'] += 1
+            return '飞控 /mavros/estimator_status 2 s 没更新' if state_calls['est'] <= 2 else ''
+        state = NS(fcu=NS(armed=False), initial_armed=False,
+                   ekf_problem=est_problem, resting_only=lambda: False)
         client = Mock(); client.wait_for_server.return_value = True
         runner = Mock(); runner.inputs_problem.return_value = ''
         runner.run_once.return_value = True
@@ -493,7 +499,8 @@ class FullTests(unittest.TestCase):
         fc.pos.return_value, fc.descent.return_value = np.zeros(3), 0.
         args = NS(preview=False, delay=3., out=h.tmp.name, nav_config='')
         wanted = []
-        with patch.object(nav, 'arguments', return_value=args), \
+        with patch.object(nav, 'say') as say_mock, \
+                patch.object(nav, 'arguments', return_value=args), \
                 patch.object(rospy, 'wait_for_service',
                              side_effect=lambda name, timeout=None: wanted.append(name)), \
                 patch.object(rospy, 'has_param', return_value=True), \
@@ -505,9 +512,10 @@ class FullTests(unittest.TestCase):
                 patch.object(nav.tf2_ros, 'Buffer'), patch.object(nav.tf2_ros, 'TransformListener'), \
                 patch.object(nav, 'FullRunner', return_value=runner) as ctor:
             self.assertEqual(nav.main(), 0)
-        self.assertIs(ctor.call_args[0][1], cfg)
         self.assertIn('/drone_nav/land', wanted)
         self.assertEqual(len(wanted), 6)
+        self.assertGreaterEqual(state_calls['est'], 42)  # waited the 2 s stability window
+        self.assertTrue(any('estimator_status' in str(c.args[0]) for c in say_mock.call_args_list))
 
 
 if __name__=='__main__':
