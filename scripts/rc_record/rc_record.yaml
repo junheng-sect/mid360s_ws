@@ -21,6 +21,8 @@ rc_bag_recorder:
   # ---- 录制话题（必须都在 bag_recorder_node.py 的类型登记表里）----
   topics:
     - /mavros/state
+    - /mavros/extended_state                 # 原始着地状态，核对 TOUCHED 与真实接触
+    - /mavros/estimator_status               # const_pos 及定位/速度有效标志
     - /mavros/timesync_status
     - /mavros/local_position/pose
     - /mavros/local_position/odom

@@ -23,6 +23,11 @@ LEG_TIMEOUT = 20.
 LAND_TIMEOUT = 40.  # ~1.1 m at 0.1 m/s, plus the prepare/READY window and COM_DISARM_LAND
 STABLE_SECONDS = 2.
 SERVICE_TIMEOUT = 2.
+PREFLIGHT_MAP_TIMEOUT = 10.
+PREFLIGHT_MAP_RETRY = .5
+LEG_COVERAGE_TIMEOUT = 10.
+STARTUP_READY_TIMEOUT = 60.
+STARTUP_READY_STABLE = 2.
 EXIT_REASON = 'OFFBOARD exited; explicit prepare/start required'
 
 
@@ -66,7 +71,7 @@ def dry_run(a):
     print('人工解锁 → 等 %g s → OFFBOARD 自动起飞1 m → 实测稳定2 s' % a.delay)
     for i, (p, hold) in enumerate(zip(ROUTE, HOLDS), 1):
         print('#%d %s (%g,%g,%g,%g°)，额外保持%g s' % (i, NAMES[i-1], *p, hold))
-    print('返回稳定 → prepare 后 /drone_nav/land 慢速下降（0.1 m/s）→ 新鲜着地/上锁确认；只飞一圈，不自动解锁')
+    print('返回稳定 → prepare 后 /drone_nav/land 慢速下降（0.1 m/s）→ 近地速度下压 → 新鲜着地后普通上锁确认；只飞一圈，不自动解锁')
     print('水平8 m，范围2×2 m，高度1–2 m；yaw45°/s，上升0.3 m/s、0.3 m/s²，降落0.1 m/s')
     print('预计解锁至上锁70–90 s（非保证）；单起飞/航段20 s，慢速降落最多%g s' % LAND_TIMEOUT)
     if a.preview:
@@ -102,6 +107,7 @@ class FullState(SquareState):
         self.phase = 'STARTUP'
         self.fc = None
         self.initial_armed = None
+        self.startup_armed = False
         self.arm_at = None
         self.land_requested = False
         self.land_confirmed_at = None
@@ -114,6 +120,8 @@ class FullState(SquareState):
             old = self.fcu
             if self.initial_armed is None:
                 self.initial_armed = bool(m.armed)
+            if self.phase == 'STARTUP' and m.armed:
+                self.startup_armed = True
             State.on_fcu(self, m)
             if not self.monitor or not self.real:
                 return
@@ -180,12 +188,12 @@ class FullState(SquareState):
             # The gateway owns the slow descent, so its state replaces the old AUTO.LAND confirmation.
             land = d.get('land')
             if self.land_requested and self.phase in ('LAND_REQUEST', 'LANDING'):
-                if land in ('DESCENDING', 'TOUCHED'):
+                if land in ('DESCENDING', 'PRESSING', 'TOUCHED', 'DONE'):
                     self.land_confirmed_at = self.land_confirmed_at or time.monotonic()
                 elif land == 'STOPPED' and self.land_confirmed_at is not None and not (
                         self.fc is not None and self.fc.on_ground() and
                         self.fcu is not None and not self.fcu.armed):
-                    self.stop('降落中止：网关停止下降')
+                    self.stop('降落中止：' + (d.get('reason') or '网关停止下降'))
             if d.get('state') == 'FAULT':
                 reason = d.get('reason', '')
                 normal = reason == STOP_REASON
@@ -220,6 +228,7 @@ class FullRunner(GlobalRunner):
         self.current = None
         self.holding = False
         self.stage_deadline = None
+        self.map_deadline = None
         self.prepare = lambda: self.service_call('prepare', prepare, stopped=True, preparing=True)
         self.check = lambda path: self.service_call('check_trajectory', check, path)
         self.prepare_takeoff = lambda: self.service_call('prepare_takeoff', prepare_takeoff)
@@ -237,8 +246,13 @@ class FullRunner(GlobalRunner):
         done, abandoned, result = threading.Event(), threading.Event(), {}
         start = time.monotonic()
         until = min(start + SERVICE_TIMEOUT, self.stage_deadline or math.inf,
-                    self.deadline or math.inf)
+                    self.deadline or math.inf, self.map_deadline or math.inf)
         event = dict(service=name, request=kwargs, wall=time.time(), phase=self.s.phase)
+        if name == 'check_trajectory' and args:
+            path = args[0]
+            event['request'] = dict(frame_id=path.header.frame_id,
+                                   positions=[[p.pose.position.x, p.pose.position.y, p.pose.position.z]
+                                              for p in path.poses])
         if self.flight is not None:
             self.flight.setdefault('services', []).append(event)
             self.save()
@@ -284,7 +298,16 @@ class FullRunner(GlobalRunner):
                     fc_position=fp.tolist() if fp is not None and np.isfinite(fp).all() else None,
                     odom_position=p[0].tolist() if valid_pose else None,
                     speed=p[2] if valid_pose else None,
-                    gateway=self.s.get('gateway_status'), takeoff=self.s.get('gateway_status', 'takeoff'))
+                    gateway=self.s.get('gateway_status'), takeoff=self.s.get('gateway_status', 'takeoff'),
+                    land=self.s.get('gateway_status', 'land'),
+                    land_target_z=self.s.get('gateway_status', 'land_target_z'),
+                    land_ground_z=self.s.get('gateway_status', 'land_ground_z'),
+                    land_limit_z=self.s.get('gateway_status', 'land_limit_z'),
+                    land_limit_reached=self.s.get('gateway_status', 'land_limit_reached'),
+                    land_z_velocity_only=self.s.get('gateway_status', 'land_z_velocity_only'),
+                    land_command_vz=self.s.get('gateway_status', 'land_command_vz'),
+                    land_disarm_requests=self.s.get('gateway_status', 'land_disarm_requests'),
+                    land_disarm_result=self.s.get('gateway_status', 'land_disarm_result'))
 
     def save(self):
         super().save()
@@ -351,6 +374,8 @@ class FullRunner(GlobalRunner):
         elif self.s.phase == 'TAKEOFF' and self.s.get('gateway_status') != 'READY':
             raise Stopped('起飞网关不再 READY')
         if self.stage_deadline is not None and time.monotonic() >= self.stage_deadline:
+            if self.s.phase in ('LAND_REQUEST', 'LANDING'):
+                raise Stopped(self.land_timeout_reason())
             raise Stopped(self.s.phase + ' 阶段等待超时')
         if self.deadline is not None and time.monotonic() >= self.deadline:
             raise Stopped('单点任务超时（20 s）')
@@ -392,6 +417,7 @@ class FullRunner(GlobalRunner):
             self.holding = False
 
     def send_leg(self, i, goal, goal_map, yaw_map):
+        self.wait_leg_coverage(i, goal)
         self.current = i
         self.deadline = time.monotonic() + LEG_TIMEOUT
         try:
@@ -430,7 +456,7 @@ class FullRunner(GlobalRunner):
     def preflight(self):
         profile(self.cfg)
         self.guard()
-        if self.s.initial_armed or self.s.fcu.armed or not self.fc.on_ground() or self.fc.ground_z is None:
+        if self.s.initial_armed or self.s.startup_armed or self.s.fcu.armed or not self.fc.on_ground() or self.fc.ground_z is None:
             raise Stopped('必须从地面上锁状态启动，不自动上锁/解锁')
         self.reference = self.transform()  # Only capture ONCE, before any arming.
         p = self.ground_geometry()
@@ -446,11 +472,7 @@ class FullRunner(GlobalRunner):
         expected = p + np.array([0., 0., 1.])
         check_goal_bounds(np.vstack([expected, self.goals]), self.cfg,
                           ['预计起飞终点'] + list(NAMES))
-        for target in np.vstack([expected, self.goals]):
-            self.guard()
-            reply = self.check(path_of([target]))
-            if not reply.valid:
-                raise Stopped('起飞终点/路线目标包络预检拒绝：' + getattr(reply, 'reason', 'unknown/occupied'))
+        self.preflight_map(np.vstack([expected, self.goals]), ['预计起飞终点'] + list(NAMES), p)
         self.record.update(goals_odom=self.goals.tolist(), goal_yaw_odom_deg=np.degrees(self.yaws).tolist(),
                            transform_rotation=r.tolist(), transform_translation=t.tolist(),
                            max_vel=self.cfg['max_vel'], max_acc=self.cfg['max_acc'])
@@ -458,9 +480,108 @@ class FullRunner(GlobalRunner):
                            start_ground=self.snapshot(), goal_record=os.path.basename(self.record_path))
         self.save()
 
+    def preflight_map(self, targets, names, start):
+        self.map_deadline = time.monotonic() + PREFLIGHT_MAP_TIMEOUT
+        try:
+            return self.check_ground_map(targets, names, start)
+        finally:
+            self.map_deadline = None
+
+    def check_ground_map(self, targets, names, start):
+        """Retry only read-only map checks, while still disarmed on the ground.
+
+        READY is input freshness, not coverage. The takeoff endpoint must be known;
+        only future unknown goals may be deferred to strict per-leg observation.
+        Never defer an occupied goal or retry a flight command, ambiguous RPC or fault.
+        """
+        started = self.map_deadline - PREFLIGHT_MAP_TIMEOUT
+        attempt = 0
+        last_detail = '地图覆盖检查未完成'
+        while True:
+            attempt += 1
+            for index, (target, name) in enumerate(zip(targets, names)):
+                self.guard()
+                if self.s.fcu.armed or not self.fc.on_ground():
+                    raise Stopped('地图预检等待期间必须保持地面上锁')
+                if np.linalg.norm(self.ground_geometry() - start) > .05:
+                    raise Stopped('地图预检等待期间机体移动超过5 cm，重新放置后启动')
+                if time.monotonic() >= self.map_deadline:
+                    raise Stopped('起飞终点/路线目标包络预检等待%g s仍未通过：%s' %
+                                  (PREFLIGHT_MAP_TIMEOUT, last_detail))
+                reply = self.check(path_of([target]))
+                reason = getattr(reply, 'reason', 'clear' if reply.valid else 'unknown/occupied')
+                unknown = reason.startswith(('unknown footprint', 'unknown path center'))
+                deferred = index > 0 and not reply.valid and unknown
+                self.flight.setdefault('preflight_checks', []).append(dict(
+                    attempt=attempt, target_index=index, target_name=name,
+                    target_odom=target.tolist(), valid=bool(reply.valid), reason=reason,
+                    deferred_until_leg=deferred,
+                    elapsed_s=time.monotonic()-started))
+                self.save()
+                if reply.valid:
+                    continue
+                if deferred:
+                    # The ground view need not cover every future hover point. This is NOT a
+                    # free-space approval: the goal must pass again before its own leg is sent.
+                    continue
+                retryable = reason.startswith(('unknown footprint', 'unknown path center')) or (
+                    reason == 'stale map or invalid frame')
+                elapsed = time.monotonic() - started
+                detail = '目标%d（%s） %s：%s' % (index, name, target.tolist(), reason)
+                last_detail = detail
+                if not retryable:
+                    raise Stopped('起飞终点/路线目标包络预检拒绝：' + detail)
+                if elapsed >= PREFLIGHT_MAP_TIMEOUT:
+                    raise Stopped('起飞终点/路线目标包络预检等待%g s仍未通过：%s' %
+                                  (PREFLIGHT_MAP_TIMEOUT, detail))
+                say('地面上锁等待地图覆盖（%.1f/%g s）：%s' %
+                    (elapsed, PREFLIGHT_MAP_TIMEOUT, detail))
+                self.pause(min(PREFLIGHT_MAP_RETRY, PREFLIGHT_MAP_TIMEOUT-elapsed))
+                break  # Restart the complete target sweep against fresh map evidence.
+            else:
+                checks = [x for x in self.flight['preflight_checks'] if x['attempt'] == attempt]
+                self.flight['deferred_ground_targets'] = [x for x in checks if x['deferred_until_leg']]
+                if self.flight['deferred_ground_targets']:
+                    say('起飞点预检通过；后续目标 %s 地面尚未观测，逐段出发前再核验，不向未知目标发指令' %
+                        ','.join(str(x['target_index']) for x in self.flight['deferred_ground_targets']))
+                self.save()
+                return
+
+    def wait_leg_coverage(self, i, goal):
+        """Hold at the current verified point until this leg's goal is observed free."""
+        hold = self.s.pose()[0].copy()
+        started, attempt, last_reason = time.monotonic(), 0, '尚未完成检查'
+        self.map_deadline = started + LEG_COVERAGE_TIMEOUT
+        try:
+            while True:
+                self.guard()
+                p = self.s.pose()
+                if np.linalg.norm(p[0]-hold) > .15 or p[2] > .15:
+                    raise Stopped('#%d 等待目标观测期间悬停位置/速度未稳定，本轮终止' % (i+1))
+                if time.monotonic() >= self.map_deadline:
+                    raise Stopped('#%d 目标包络等待%g s仍未通过：%s；保持当前点，不发本段目标' %
+                                  (i+1, LEG_COVERAGE_TIMEOUT, last_reason))
+                attempt += 1
+                reply = self.check(path_of([goal]))
+                last_reason = getattr(reply, 'reason', 'clear' if reply.valid else 'unknown/occupied')
+                self.flight.setdefault('leg_coverage_checks', []).append(dict(
+                    leg=i+1, attempt=attempt, target_odom=goal.tolist(), hold_odom=hold.tolist(),
+                    valid=bool(reply.valid), reason=last_reason, elapsed_s=time.monotonic()-started))
+                self.save()
+                if reply.valid:
+                    return
+                if not (last_reason.startswith(('unknown footprint', 'unknown path center')) or
+                        last_reason == 'stale map or invalid frame'):
+                    raise Stopped('#%d 目标包络检查拒绝：%s' % (i+1, last_reason))
+                say('#%d 悬停等待目标观测（%.1f/%g s）：%s；尚未发送本段目标' %
+                    (i+1, time.monotonic()-started, LEG_COVERAGE_TIMEOUT, last_reason))
+                self.pause(min(PREFLIGHT_MAP_RETRY, max(0., self.map_deadline-time.monotonic())))
+        finally:
+            self.map_deadline = None
+
     def wait_arm(self):
         self.phase('WAIT_ARM')
-        say('预检通过：通道6开录包，然后 POSCTL 地面人工解锁；只触发这一轮')
+        say('起飞预检通过：通道6开录包，然后 POSCTL 地面人工解锁；起飞后逐段检查目标，只触发这一轮')
         while self.s.arm_at is None:
             self.guard()
             self.ground_geometry()
@@ -543,6 +664,11 @@ class FullRunner(GlobalRunner):
         self.record['end_wall'] = time.time()
         self.save()
 
+    def land_timeout_reason(self):
+        if self.fc.on_ground():
+            return '慢速降落%g s超时：已确认着地但尚未上锁，请飞手确认' % LAND_TIMEOUT
+        return '慢速降落%g s超时：未检测到新鲜着地确认，请飞手接管' % LAND_TIMEOUT
+
     def land_once(self):
         self.guard(stopped=True)
         self.check_return()
@@ -558,7 +684,8 @@ class FullRunner(GlobalRunner):
         self.flight['land_request_wall'] = time.time()
         # The completed route leaves the gateway in its normal STOPPED fault, and a stopped gateway streams
         # nothing. Prepare it again (1 s to READY) and let /drone_nav/land descend inside OFFBOARD at ~0.1 m/s
-        # to the ground reference taken at takeoff; PX4's own land detector then arms COM_DISARM_LAND.
+        # to the takeoff reference, then bounded near-ground velocity press. Fresh PX4 touchdown
+        # permits ordinary disarm requests from the gateway (never force-disarm or automatic arm).
         self.reprepare()
         self.guard()
         reply = self.land_start()
@@ -566,9 +693,19 @@ class FullRunner(GlobalRunner):
             raise Stopped('慢速降落被拒：' + reply.message)
         self.s.land_requested = True
         self.flight['land_service_wall'] = time.time()
+        last_land_status = None
         while True:
             self.guard()
             now = time.monotonic()
+            land_status = (self.s.get('gateway_status', 'land'),
+                           self.s.get('gateway_status', 'land_limit_reached'),
+                           self.s.get('gateway_status', 'land_disarm_requests'),
+                           self.s.get('gateway_status', 'land_disarm_result'))
+            if land_status != last_land_status:
+                self.flight.setdefault('landing_states', []).append(dict(
+                    wall=time.time(), ros=rospy.Time.now().to_sec(), state=self.snapshot()))
+                self.save()
+                last_land_status = land_status
             if self.s.land_confirmed_at is not None and self.s.phase != 'LANDING':
                 self.flight['land_confirmed_wall'] = time.time()
                 self.phase('LANDING')
@@ -578,7 +715,7 @@ class FullRunner(GlobalRunner):
                 self.stage_deadline = None
                 return
             if now - start >= LAND_TIMEOUT:
-                raise Stopped('慢速降落 %g s 超时（着地和上锁必须同时有新鲜确认）' % LAND_TIMEOUT)
+                raise Stopped(self.land_timeout_reason())
             time.sleep(.05)
 
     def run_once(self):
@@ -614,7 +751,11 @@ class FullRunner(GlobalRunner):
                     self.record['legs'][-1].update(end=self.record['end'], reason=reason)
             self.flight.update(end='INTERRUPTED' if isinstance(e, KeyboardInterrupt) else 'ABORTED', reason=reason,
                                stop_state=self.snapshot())
-            say('test10 终止：%s；不会续飞/抢回模式。定位链路保留，请飞手接管或监视已开始的降落' % reason)
+            if (self.s.fcu is not None and not self.s.fcu.armed and self.fc.on_ground() and
+                    self.s.phase in ('PREFLIGHT', 'WAIT_ARM')):
+                say('test10 地面终止：%s；未进入自动起飞，保持上锁。定位链路保留' % reason)
+            else:
+                say('test10 终止：%s；不会续飞/抢回模式。定位链路保留，请飞手接管或监视已开始的降落' % reason)
             if isinstance(e, KeyboardInterrupt):
                 raise
             return False
@@ -624,6 +765,50 @@ class FullRunner(GlobalRunner):
             self.flight.update(end_wall=time.time(), end_ros=rospy.Time.now().to_sec())
             self.save()
             say('完整流程记录：' + self.flight_path)
+
+
+def wait_ground_ready(runner):
+    """Wait for the pilot's ground mode selection before enabling flight monitoring.
+
+    An initial ALTCTL is a missing startup condition, not an in-flight takeover.
+    Never switch modes here; any observed arming permanently cancels this start.
+    """
+    s, fc = runner.s, runner.fc
+    end = time.monotonic() + STARTUP_READY_TIMEOUT
+    healthy_at, last_note = None, None
+    while True:
+        f = s.fcu
+        if s.initial_armed or s.startup_armed or (f is not None and f.armed):
+            raise Stopped('启动等待期间已解锁，本轮取消；保持上锁后重新启动，不自动起飞')
+        if rospy.is_shutdown():
+            raise Stopped('ROS 已退出')
+        if fc.ext_fresh() and not fc.on_ground():
+            raise Stopped('启动时不在地面，不触发自动起飞')
+        est_why = s.ekf_problem()
+        why = runner.inputs_problem()
+        if f is None or not f.connected or time.monotonic()-s.fcu_at >= 2.:
+            why = '飞控状态未就绪或断流'
+        elif not fc.ext_fresh() or fc.pos() is None or fc.descent() is None or fc.ground_z is None:
+            why = '飞控位置/速度/着地状态未就绪'
+        elif est_why and not s.resting_only():
+            why = '飞控数据流未就绪：' + est_why
+        elif f.mode != 'POSCTL':
+            why = '地面模式未就绪：当前 %s，请保持上锁，用遥控器切到 POSCTL（定点）' % f.mode
+        if not why:
+            healthy_at = time.monotonic() if healthy_at is None else healthy_at
+            if time.monotonic()-healthy_at >= STARTUP_READY_STABLE:
+                say('地面启动条件就绪：POSCTL、上锁、着地及输入稳定，开始包络预检')
+                return
+        else:
+            healthy_at = None
+            if why != last_note:
+                say('%s；等待就绪后自动继续预检（最多 %g s），不要提前解锁，无需重启脚本' %
+                    (why, STARTUP_READY_TIMEOUT))
+                last_note = why
+        if time.monotonic() >= end:
+            raise Stopped('启动就绪等待%g s超时：%s；保持上锁后重新启动' %
+                          (STARTUP_READY_TIMEOUT, why or '输入尚未连续稳定'))
+        time.sleep(.05)
 
 
 def main():
@@ -667,26 +852,7 @@ def main():
                         rospy.ServiceProxy('/drone_nav/takeoff', Trigger),
                         rospy.ServiceProxy('/drone_nav/land', Trigger),
                         rospy.ServiceProxy('/mavros/set_mode', SetMode))
-    end = time.monotonic() + 60.
-    healthy_at, noted = None, False
-    while True:
-        est_why = s.ekf_problem()
-        ok = (not runner.inputs_problem() and fc.ext_fresh() and fc.pos() is not None
-              and fc.descent() is not None and (not est_why or s.resting_only()))
-        if ok:
-            healthy_at = time.monotonic() if healthy_at is None else healthy_at
-            if time.monotonic() - healthy_at >= 2.:
-                break
-        else:
-            healthy_at = None
-            if not noted:
-                noted = True
-                say('飞控数据流未就绪（%s）。PX4 的 estimator_status 等可能在 MAVROS 连接后几十秒才开始'
-                    '（11-11 test9 等约 30 s 恢复）；飞机未解锁、原地等待最多 60 s' %
-                    (est_why or runner.inputs_problem() or '位置/速度/着地状态断流'))
-        if s.fcu.armed or rospy.is_shutdown() or time.monotonic() >= end:
-            raise Stopped('输入未就绪/预检前已解锁，不起飞')
-        time.sleep(.05)
+    wait_ground_ready(runner)
     return 0 if runner.run_once() else 1
 
 

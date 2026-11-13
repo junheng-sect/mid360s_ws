@@ -9,10 +9,20 @@ import yaml
 import rospy
 from geometry_msgs.msg import Vector3Stamped
 from sensor_msgs.msg import PointCloud2
+from mavros_msgs.msg import ExtendedState, EstimatorStatus
 from bag_recorder_node import RcBagRecorder, topic_type_registry
 
 
 class TopicTests(unittest.TestCase):
+    def test_landing_feedback_topics_are_registered_and_in_defaults(self):
+        with Path(__file__).with_name('rc_record.yaml').open() as stream:
+            topics=yaml.safe_load(stream)['rc_bag_recorder']['topics']
+        registry=topic_type_registry()
+        self.assertIn('/mavros/extended_state',topics)
+        self.assertIn('/mavros/estimator_status',topics)
+        self.assertIs(registry['/mavros/extended_state'],ExtendedState)
+        self.assertIs(registry['/mavros/estimator_status'],EstimatorStatus)
+
     def recorder(self, cloud=False, topics=None):
         params = {'~record_registered_cloud': cloud,
                   '~topics': topics if topics is not None else ['/fastlio/velocity']}

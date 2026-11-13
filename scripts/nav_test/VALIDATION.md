@@ -61,3 +61,72 @@
 - 旧 test1/test2/test3 shell 入口未修改；test2 目标 JSON 的单值地图航向字段格式保留。
 - 源文件部署前检查 SHA-256 并备份到 `/home/orangepi/test_data/nav45_backup/`；未提交、未推送，未触碰已有车桥或独立 RViz/demo 改动。
 - 最终源文件和二进制哈希见 `/home/orangepi/test_data/nav45_validation/SOURCE_MANIFEST.json`。
+
+
+## 2026-11-13：test10 地面 unknown footprint 修复
+
+证据目录：`/home/orangepi/test_data/nav10_validation/20261113_unknown_fix/`。本轮未实飞、未修改 PX4 参数、速度、路线或包络，未启停常驻服务。
+
+- 修复 `allow_unknown_above` 支持列判定：下方首个已知格以原始占据证据判定，避免把地面膨胀层投影成无限高障碍；目标当前位置的膨胀碰撞检查保留。原始障碍、整列未观测与室内严格 unknown 策略仍拒绝。
+- test10 在地面上锁静止时对 unknown/尚未更新地图每 0.5 s 重查全部目标，地图预检总截止时间 10 s（也约束在途 RPC）。占据/越界、提前解锁、移动超过 5 cm、状态故障、通信异常或 RPC 超时立即退出，不重发飞行命令。
+- flight JSON 新增目标编号/名称/坐标、各次预检结果，服务记录包含实际查询点；地图拒绝原因给出下方首个已知体素或整列未观测。地面终止文案明确未进入自动起飞。
+- 板端 `catkin build drone_navigation`：7 包通过；Python 脚本回归 111 项、导航核心回归 50 项、实际 GridMap 的 rostest/GTest 8 项全部通过。15 个独立 Master 的模拟 ROS 场景全部通过（含持续 unknown、已占据目标不触发飞行）。真实 EGO + 执行器/网关隔离集成通过，包括已知自由、未知/越界拒绝、占据目标拒绝、墙体绕行、取消、断云不续飞、规划器退出和时钟暂停，enable_output=false。
+- 同一历史地面 bag `20261112_110907_test10/test10_000001.bag`（20.3 s）只回放 `/drone_nav/odom`、`sensor_odom`、`cloud`，不发送规划目标或飞控控制：10 次预计原地起飞终点查询，旧逻辑 1/10 通过、修复后 10/10 通过。`before_replay/probe.json`、`after_replay/probe.json` 可复查。
+- 今天 `20261113_121451_test10` 没有 bag/栅格快照，历史回放不能替代今天的精确复现，也不代表完整航线或实飞验收。现场仍需预检全部目标；持续未知仍终止。
+- ROS 集成夹具另修复跨场景排队 FCU 消息污染 initial_armed 的问题：测试按场景开始时间过滤旧包，不放宽生产端启动已解锁拒绝。
+- 地图回归可用 `catkin build plan_env --no-deps --make-args run_tests_plan_env` 运行，rostest 自动提供独立 Master；全流程模拟仍用 `tests/run_outdoor_full_isolated.sh`。
+
+源码/二进制哈希、两仓库补丁与完整测试日志已归档于证据目录；未 commit/push。
+
+
+## 2026-11-13：继续修复地面 ALTCTL 启动误终止
+
+现场 `20261113_124011_test10` 与 `20261113_124211_test10` 均在地面上锁、ALTCTL 的 PREFLIGHT 入口被报为接管；没有进入地图服务检查。前轮地图修复遗漏了正式模式守卫前的启动模式等待。
+
+- 新增统一启动就绪等待：地面上锁时提示遥控器切 POSCTL，最多等 60 s；POSCTL 与输入连续稳定 2 s 后才进入正式预检，不发送模式/起飞命令。
+- 启动期间任何已观察到的解锁都锁存，即使随后上锁也取消本轮；不允许空中启动，正式预检后的模式改变与飞行中接管仍终止。
+- test10 单元 39 项、全部任务脚本 117 项、独立 Master 模拟 ROS 16 场景通过。新增 startup_altctl 通过实际 ROS 消息复现 ALTCTL→POSCTL 后完整流程成功，并确认等待期间无飞行请求。
+- 证据：`/home/orangepi/test_data/nav10_validation/20261113_startup_mode_fix/`。本轮仅修改任务 Python、测试和说明，不需重建 C++，没有实飞，未改地图/飞控参数、速度或包络，未 commit/push。
+- 最新 bag 从脚本已退出后的 12:43:53 才开始；其中后来有 POSCTL 解锁及升高，不能当成脚本自动起飞成功或全段地面观测。
+
+
+## 2026-11-13：test10 按阶段核验目标，修复地面远端未知阻塞
+
+现场批次：`20261113_133208_test10`。目标2的包络点 `(2.174798,-2.098767,0.810442)` 位于地图列121,79；本次后续19.5 s地面 bag 195帧的真实射线比较（原算法/完整遍历/精确方向等）均没有穿过该列下方。dense_publish 已开启，因此不修改射线算法，也不把未观测区域补为空闲。
+
+- 地面仍严格验证起飞终点（未知/未更新最多等10 s）、全航点边界/地图身份与已知占据。只有后续目标的纯 unknown 可记录为 deferred，允许进入 WAIT_ARM；其 valid 仍为 false。
+- 人工解锁→默认3 s→脚本切 OFFBOARD→升高1 m实测稳定 的流程保留。每段发目标前严格核验该段目标包络；未知时保持当前点，0.5 s复查、最多10 s，持续未知或占据/越界则不发送该段并终止。原有任务发出前复查、EGO与执行器轨迹检查继续执行。
+- 地图拒绝分类修复：实际膨胀占据优先于未知中心报告，防止已知障碍被误列为 deferred。
+- 本次真实 bag 的10个地图快照：起飞点10/10通过；目标2始终0/10已知、10/10待核验；新地面阶段10/10具备进入 WAIT_ARM 的条件。该结果不是整圈可飞证明；未虚构起飞后的点云。
+- 7包构建成功。任务脚本120项（test10 42项）、导航核心50项、地图C++/rostest 9项、模拟ROS 18场景和真实EGO隔离集成均通过。新增场景：到新视角后覆盖目标2才发出并完成六段；目标2持续未知时仅发过第一段，第二段从未发送。静态墙绕行、未知/占据拒绝、取消、断流与模式故障仍通过。
+- flight JSON 新增 deferred_until_leg、deferred_ground_targets、leg_coverage_checks，记录原始未知原因、当前保持点及出发前检查。
+- 证据：`/home/orangepi/test_data/nav10_validation/20261113_unknown_column_fix/`。未改 PX4 参数、速度、包络或路线，未恢复用户撤回的起飞状态过渡改动，未实飞，未 commit/push。
+
+
+## 2026-11-13：test10 降落末段不再提前停降
+
+飞行 `20261113_140022_test10` 六段全部成功；14:03:35目标到地面参考下2 cm时网关标TOUCHED并清零速度，约20 s后飞手接管时PX4仍报空中。按确认方案改为：保留0.1 m/s慢降，新鲜PX4着地反馈才TOUCHED；目标最低地面下10 cm，到限位清零速度、固定目标等最多2 s，仍未确认则STOPPED并按实测位置保持。触地后冻结最后目标等实际上锁；40 s总超时不变，不强制上锁，不自动重试。
+
+状态增加 land_target_z/land_ground_z/land_limit_z/land_limit_reached；flight增加landing_states及末态字段，明确区分未确认着地与着地后未上锁。落地原始extended_state/estimator_status加入默认录包。另修复prepare后缓存READY未立即清零的短窗口竞态，避免过早接受降落请求。
+
+验证：54项导航核心、121项任务脚本、5项录包测试通过；18个完整test10模拟ROS场景、2个真实Gateway类ROS服务专项场景及真实EGO隔离集成通过。专项仍为模拟FCU、预览输出，未创建真实设定值发布者或解锁服务。
+
+本次bag固定位置输入回归412帧：越过旧终点继续慢降，无虚假TOUCHED；目标不低于地面下10 cm，无确认时等2 s后受控停止。原bag缺少原始着地/估计器话题，回放明确按未确认接触/估计健康处理，不能预测修改后的实飞结果。
+
+证据：`/home/orangepi/test_data/nav10_validation/20261113_landing_fix/`。起飞/路线方法AST与改前一致，保留此前地图与分阶段预检修复；未改PX4参数或固件，未实飞，未commit/push。需重新启动test10才载入新逻辑与录包配置，现场仍需验收无需人工补降并着地上锁。
+
+## 2026-11-13：参考 land_with_tracking_v2 的末段速度下压与普通上锁
+
+16:41批次（`/home/orangepi/test_data/nav_test/20261113_164142_test10/`）六段再次完成，但在地面下10 cm位置目标处，PX4仍报IN_AIR；2 s后旧逻辑STOPPED。该批次已有原始extended_state/estimator_status录包。上一节的仅位置限位方案未完成实飞验收，现由本节实现替代。
+
+参考：[land_with_tracking_v2_node.py](https://github.com/junheng-sect/ROS2PUBLIC/blob/rasip_pi/src/land_with_tracking_v2/land_with_tracking_v2/land_with_tracking_v2_node.py)，blob SHA `930b12525c69434da20400626602c6e13f517187`。其核心是恒速下降、近地检测后持续Z速度下压和普通disarm。源码中的“最低油门”实际发布0.35 m/s下降速度，未直接设置电机油门；其5 s参数未实际结束下压，本项目显式执行5 s上限。
+
+本项目仍以上段0.1 m/s、XY/yaw保持开始，低于参考上方15 cm、|vz|≤0.20 m/s、水平速度≤0.25 m/s连续3 s后进入PRESSING，Z位置忽略、下降速度0.35 m/s最长5 s。下压期间速度保护门槛允许指令速度（竖直≤0.40 m/s），否则刚开始下降就会被误判异常。虚拟Z位置仍不低于ground-0.10 m；到虚拟位置下限后不再把vz清零，而是维持慢降最多2 s以等待接地/下压条件。Z速度模式的位置字段不参与闭环，实测低于ground-0.10 m则停止；这是基于离散估计的停止保护，不是实际离地高度真值或零超调保证。
+
+低/慢条件只允许下压，未采用参考项目基于启发式直接请求上锁。只有新鲜PX4着地才TOUCHED、冻结最后目标、速度清零；随后后台每秒最多一次普通CommandBool(value=False)，最多5 s；不阻断设定值流、不重叠RPC，不发value=True或force命令。ACK不算实际上锁，真实着地且上锁才DONE。模式接管、定位/反馈断流、5 s下压无着地、着地后5 s未上锁均分别STOPPED，无自动续飞或重试降落；总监视40 s保留。PX4自行上锁与着地反馈可先于下一次tick，只要新鲜着地且已上锁就正常DONE。
+
+板端验证：导航核心62项、任务122项单元通过；真实Gateway六个私有ROS场景通过（2 cm停滞需速度下压后普通上锁、始终不报着地、拒绝上锁、下压时接管/输入故障/着地状态断流），上锁服务人为延迟250 ms期间仍正常发布设定值；完整test10模拟ROS18场景通过。catkin build drone_navigation --no-deps及两仓库diff --check通过。用AST确认prepare_takeoff/takeoff及预检、起飞调度、路线方法未改。
+
+新批次bag固定输入回放405样本，使用真实PX4着地、估计器、模式和位置数据；41个样本处于PRESSING，vz=-0.35且IGNORE_PZ，不误报TOUCHED、无空中上锁请求。原记录结束时新状态机仍PRESSING，不将其说成着地成功；历史位置不会响应新命令，只验证状态机。模拟闭环也不能替代实飞。
+
+本轮完整证据与基线：`/home/orangepi/test_data/nav10_validation/20261113_velocity_press_fix/`。改动仅降落末段、相关测试/记录/文档，保留之前起飞/路线/地图修复。本轮未启动实机节点或发起实飞、未修改PX4参数/固件、未commit/push；下次重新启动test10链路加载新版后现场验收。

@@ -41,7 +41,7 @@ from geometry_msgs.msg import (PoseStamped, PoseWithCovarianceStamped, TwistStam
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, PointCloud2
 from tf2_msgs.msg import TFMessage
-from mavros_msgs.msg import EstimatorStatus, PositionTarget, RCIn, State, TimesyncStatus
+from mavros_msgs.msg import EstimatorStatus, ExtendedState, PositionTarget, RCIn, State, TimesyncStatus
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rc_record_policy import RcRecordSession  # noqa: E402
@@ -50,6 +50,8 @@ from sequence_allocator import SequenceAllocator  # noqa: E402
 TICK_PERIOD = 0.2            # 5 Hz 心跳：保证尾巴到期有人关包
 DEFAULT_TOPICS = [
     '/mavros/state',
+    '/mavros/extended_state',
+    '/mavros/estimator_status',
     '/mavros/timesync_status',
     '/mavros/local_position/pose',
     '/mavros/local_position/odom',
@@ -73,6 +75,7 @@ DEFAULT_LATCHED_TOPICS = ['/front_marker_control/control_mode']
 def topic_type_registry():
     registry = {
         '/mavros/state': State,
+        '/mavros/extended_state': ExtendedState,
         '/mavros/estimator_status': EstimatorStatus,
         '/mavros/timesync_status': TimesyncStatus,
         '/mavros/local_position/pose': PoseStamped,

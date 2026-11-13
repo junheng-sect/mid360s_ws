@@ -33,6 +33,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import nav_outdoor_full as nav
 
 
+class ScenarioState(nav.FullState):
+    """A new mock flight must not latch queued FCU packets from the previous scenario."""
+    def __init__(self, since):
+        self.since = since
+        super().__init__()
+
+    def on_fcu(self, message):
+        if message.header.stamp >= self.since:
+            super().on_fcu(message)
+
+
 class Fixture:
     def __init__(self):
         self.lock = threading.RLock()
@@ -64,19 +75,23 @@ class Fixture:
 
     def reset(self, scenario):
         with self.lock:
+            self.reset_stamp = rospy.Time.now()
             self.scenario = scenario
             self.position = np.array([.31 if scenario == 'bad_origin' else 0., 0., 0.])
             self.yaw = math.radians(11 if scenario == 'bad_yaw' else 0)
             self.translation = np.zeros(3)
-            self.mode, self.armed, self.landed = 'POSCTL', scenario == 'startup_armed', 1
+            self.mode = 'ALTCTL' if scenario == 'startup_altctl' else 'POSCTL'
+            self.armed, self.landed = scenario == 'startup_armed', 1
             self.gw, self.reason, self.exec_state, self.takeoff_state = 'ALIGNING', '', 'IDLE', ''
             self.input_state = 'READY'
             self.arm_timer = self.climb_timer = self.land_timer = None
             self.land_z0, self.land_state, self.land_count = 1., '', 0
             self.ready_timer = self.inject_timer = None
+            self.mode_ready_timer = None
             self.stale_state = False
             self.requests, self.goals = [], []
             self.prepare_count = self.takeoff_count = 0
+            self.check_count = 0
             self.runner = None
 
     def prepare(self, _):
@@ -100,7 +115,17 @@ class Fixture:
             self.takeoff_state = 'CLIMBING'
         return TriggerResponse(True, 'mock climb')
 
-    def check(self, _):
+    def check(self, request):
+        self.check_count += 1
+        if self.scenario in ('future_unknown_new_view', 'future_unknown_persistent'):
+            p = request.path.poses[0].pose.position
+            target2 = p.x > 1.5 and p.y < -1.5 and p.z < 1.5
+            if target2 and (self.scenario == 'future_unknown_persistent' or self.position[0] < 1.5):
+                return CheckTrajectoryResponse(valid=False, reason='unknown footprint at 2.17,-2.10,.81; no observed voxel below')
+        if self.scenario == 'map_unknown':
+            return CheckTrajectoryResponse(valid=False, reason='unknown footprint at 0,-.3,.8; no observed voxel below')
+        if self.scenario == 'map_occupied':
+            return CheckTrajectoryResponse(valid=False, reason='occupied inflated footprint at 0,0,1')
         if self.scenario == 'service_timeout':
             time.sleep(1.)
         return CheckTrajectoryResponse(valid=True, reason='mock free space; not a real map proof')
@@ -170,6 +195,9 @@ class Fixture:
         while not self.closed and not rospy.is_shutdown():
             with self.lock:
                 now = time.monotonic()
+                if self.mode_ready_timer is not None and now >= self.mode_ready_timer:
+                    assert not self.requests and self.takeoff_count == 0 and not self.goals
+                    self.mode, self.mode_ready_timer = 'POSCTL', None
                 if self.runner is not None and self.runner.s.phase == 'WAIT_ARM' and self.arm_timer is None:
                     self.arm_timer = now+.15
                 if self.arm_timer is not None and now >= self.arm_timer:
@@ -265,11 +293,12 @@ def main():
     cfg = rospy.get_param('/drone_nav/config')
     cfg['map_id'] = f.map_id
     try:
-        for scenario in ('normal', 'done_low', 'bad_origin', 'bad_yaw', 'startup_armed',
+        for scenario in ('normal', 'startup_altctl', 'future_unknown_new_view', 'future_unknown_persistent',
+                         'done_low', 'bad_origin', 'bad_yaw', 'startup_armed', 'map_unknown', 'map_occupied',
                          'takeover_recovers', 'input_recovers', 'map_reset', 'stale_state',
                          'leg_timeout', 'land_refused', 'land_no_disarm', 'service_timeout'):
             f.reset(scenario)
-            s = nav.FullState()
+            s = ScenarioState(f.reset_stamp)
             fc = nav.Fc(s)
             s.fc = fc
             buf = tf2_ros.Buffer()
@@ -285,21 +314,39 @@ def main():
                                rospy.ServiceProxy('/mavros/set_mode', SetMode))
             wait_ready(r)
             f.runner = r
+            if scenario == 'startup_altctl':
+                with f.lock:
+                    f.mode_ready_timer = time.monotonic()+.6
+                nav.wait_ground_ready(r)
+                assert not f.requests and not f.goals and f.takeoff_count == 0
             # Normal uses unmodified production timing; fault cases shorten only deadlines.
             with patch.object(nav, 'TAKEOFF_TIMEOUT', 4. if scenario != 'normal' else 20.), \
                     patch.object(nav, 'LEG_TIMEOUT', 1. if scenario == 'leg_timeout' else 20.), \
-                    patch.object(nav, 'LAND_TIMEOUT', 4. if scenario == 'land_no_disarm' else 30.), \
+                    patch.object(nav, 'LAND_TIMEOUT', 14. if scenario == 'land_no_disarm' else 30.), \
+                    patch.object(nav, 'PREFLIGHT_MAP_TIMEOUT', 1. if scenario == 'map_unknown' else 10.), \
+                    patch.object(nav, 'LEG_COVERAGE_TIMEOUT', .8 if scenario == 'future_unknown_persistent' else 10.), \
                     patch.object(nav, 'SERVICE_TIMEOUT', .25 if scenario == 'service_timeout' else 2.):
                 ok = r.run_once()
-            assert ok == (scenario == 'normal'), (scenario, r.flight)
+            assert ok == (scenario in ('normal', 'startup_altctl', 'future_unknown_new_view')), (scenario, r.flight)
             requests = [x['mode'] for x in f.requests]
-            if scenario == 'normal':
+            if scenario in ('normal', 'startup_altctl', 'future_unknown_new_view'):
                 assert requests == ['OFFBOARD'] and len(f.goals) == 6 and f.land_count == 1
                 np.testing.assert_allclose(f.goals, np.array(nav.ROUTE)[:,:3])
                 assert r.flight['touchdown_disarmed']['landed'] == 1
                 assert r.flight['touchdown_disarmed']['armed'] is False
-            elif scenario in ('bad_origin', 'bad_yaw', 'startup_armed', 'service_timeout'):
+                if scenario == 'future_unknown_new_view':
+                    assert [x['target_index'] for x in r.flight['deferred_ground_targets']] == [2]
+                    covered = [x for x in r.flight['leg_coverage_checks'] if x['leg'] == 2]
+                    assert covered and covered[-1]['valid'] and covered[-1]['hold_odom'][0] > 1.5
+            elif scenario == 'future_unknown_persistent':
+                assert requests == ['OFFBOARD'] and len(f.goals) == 1 and f.land_count == 0
+                assert '#2 目标包络等待' in r.flight['reason']
+            elif scenario in ('bad_origin', 'bad_yaw', 'startup_armed', 'service_timeout', 'map_unknown', 'map_occupied'):
                 assert requests == [] and f.takeoff_count == 0
+                if scenario == 'map_unknown':
+                    assert f.check_count >= 2 and '仍未通过' in r.flight['reason']
+                if scenario == 'map_occupied':
+                    assert f.check_count == 1
             elif scenario in ('done_low', 'map_reset', 'stale_state'):
                 assert not f.goals and requests == ['OFFBOARD']
             elif scenario in ('takeover_recovers', 'input_recovers', 'leg_timeout'):
@@ -308,6 +355,8 @@ def main():
                 assert requests == ['OFFBOARD'] and len(f.goals) == 6 and f.land_count == 0
             else:
                 assert requests == ['OFFBOARD'] and len(f.goals) == 6 and f.land_count == 1
+                if scenario == 'land_no_disarm':
+                    assert '已确认着地但尚未上锁' in r.flight['reason']
             # No mode switch may be re-issued once the descent owns the vehicle.
             assert 'AUTO.LAND' not in requests
             # Keep publishing recovery briefly: the terminated state machine must stay inert.

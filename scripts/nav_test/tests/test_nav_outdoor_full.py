@@ -196,6 +196,81 @@ class FullTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             nav.profile(dict(h.cfg, takeoff_height=1.5))
 
+    def test_initial_altctl_waits_for_posctl_then_runs_preflight(self):
+        h = self.harness()
+        h.mode = 'ALTCTL'
+        h.publish()
+        start = h.clock.t
+        def inject():
+            self.assertEqual(h.mode_calls, [])
+            self.assertEqual(h.checked, [])
+            if h.clock.t-start >= .5:
+                h.mode = 'POSCTL'
+                h.publish()
+        h.inject = inject
+        nav.wait_ground_ready(h.runner)
+        h.inject = lambda: None
+        self.assertGreaterEqual(h.clock.t-start, .5+nav.STARTUP_READY_STABLE)
+        self.assertEqual(h.state.issue, '')
+        self.assertTrue(h.runner.run_once())
+
+    def test_initial_altctl_timeout_does_not_send_flight_requests(self):
+        h = self.harness()
+        h.mode = 'ALTCTL'
+        h.publish()
+        with patch.object(nav, 'STARTUP_READY_TIMEOUT', .3):
+            with self.assertRaisesRegex(nav.Stopped, 'ALTCTL'):
+                nav.wait_ground_ready(h.runner)
+        self.assertEqual(h.mode_calls, [])
+        self.assertEqual(h.checked, [])
+        self.assertEqual(h.prepare_takeoff_calls, 0)
+
+    def test_startup_arming_is_latched_even_if_disarmed_again(self):
+        h = self.harness()
+        def inject():
+            h.state.on_fcu(NS(connected=True, mode='POSCTL', armed=True))
+            h.state.on_fcu(NS(connected=True, mode='POSCTL', armed=False))
+        h.inject = inject
+        with self.assertRaisesRegex(nav.Stopped, '启动等待期间已解锁'):
+            nav.wait_ground_ready(h.runner)
+        self.assertTrue(h.state.startup_armed)
+        self.assertEqual(h.mode_calls, [])
+        h.inject = lambda: None
+        self.assertFalse(h.runner.run_once())
+
+    def test_startup_mode_stability_window_resets(self):
+        h = self.harness()
+        start = h.clock.t
+        def inject():
+            dt = h.clock.t-start
+            h.mode = 'ALTCTL' if dt < .2 or .8 <= dt < 1.2 else 'POSCTL'
+            h.publish()
+        h.mode = 'ALTCTL'
+        h.publish()
+        h.inject = inject
+        nav.wait_ground_ready(h.runner)
+        self.assertGreaterEqual(h.clock.t-start, 1.2+nav.STARTUP_READY_STABLE)
+        self.assertEqual(h.mode_calls, [])
+
+    def test_startup_in_air_never_waits_to_trigger_a_flight(self):
+        h = self.harness()
+        h.landed = 2
+        h.publish()
+        with self.assertRaisesRegex(nav.Stopped, '启动时不在地面'):
+            nav.wait_ground_ready(h.runner)
+        self.assertEqual(h.mode_calls, [])
+
+    def test_mode_change_after_preflight_is_still_a_takeover(self):
+        h = self.harness()
+        def inject():
+            if h.state.phase == 'WAIT_ARM':
+                h.mode = 'ALTCTL'
+                h.publish()
+        h.inject = inject
+        self.assertFalse(h.runner.run_once())
+        self.assertIn('ALTCTL', h.runner.flight['reason'])
+        self.assertEqual(h.mode_calls, [])
+
     def test_full_once_ground_constpos_height_gate_phase_records(self):
         h = self.harness()
         self.assertTrue(h.runner.run_once())
@@ -248,6 +323,133 @@ class FullTests(unittest.TestCase):
         h = self.harness()
         h.check_valid = False
         self.assertFalse(h.runner.run_once())
+        self.assertEqual(h.mode_calls, [])
+
+    def test_ground_map_unknown_waits_then_checks_every_target_before_arm(self):
+        h = self.harness()
+        original = h.runner.check
+        replies = [NS(valid=False, reason='unknown footprint at 0,-.3,.8; no observed voxel below')]*2
+        def check(path):
+            return replies.pop(0) if replies else original(path)
+        with patch.object(h.runner, 'check', side_effect=check):
+            self.assertTrue(h.runner.run_once())
+        checks = h.runner.flight['preflight_checks']
+        self.assertEqual([x['valid'] for x in checks[:3]], [False, False, True])
+        self.assertEqual([x['target_index'] for x in checks[2:]], list(range(7)))
+        self.assertGreaterEqual(checks[2]['elapsed_s'], 1.)
+        request = next(x['request'] for x in h.runner.flight['services']
+                       if x['service'] == 'check_trajectory')
+        self.assertEqual(request['frame_id'], 'drone_odom')
+        self.assertEqual(len(request['positions']), 1)
+
+    def test_persistent_unknown_stops_on_ground_with_target_diagnostics(self):
+        h = self.harness()
+        with patch.object(h.runner, 'check', return_value=NS(
+                valid=False, reason='unknown footprint at 0,-.3,.8; no observed voxel below')):
+            self.assertFalse(h.runner.run_once())
+        checks = h.runner.flight['preflight_checks']
+        elapsed = h.clock.time()-h.runner.flight['start_wall']
+        self.assertGreaterEqual(elapsed, nav.PREFLIGHT_MAP_TIMEOUT)
+        self.assertLess(elapsed, nav.PREFLIGHT_MAP_TIMEOUT+.6)
+        self.assertGreaterEqual(checks[-1]['elapsed_s'], nav.PREFLIGHT_MAP_TIMEOUT-.6)
+        self.assertIn('预计起飞终点', h.runner.flight['reason'])
+        self.assertIn('no observed voxel below', h.runner.flight['reason'])
+        self.assertEqual(h.prepare_takeoff_calls, 0)
+        self.assertEqual(h.mode_calls, [])
+        self.assertEqual(h.client.goals, [])
+
+    def test_occupied_map_does_not_wait_or_retry(self):
+        h = self.harness()
+        with patch.object(h.runner, 'check', return_value=NS(
+                valid=False, reason='occupied inflated footprint at 0,0,1')) as check:
+            self.assertFalse(h.runner.run_once())
+        self.assertEqual(check.call_count, 1)
+        self.assertEqual(h.runner.flight['preflight_checks'][0]['elapsed_s'], 0.)
+        self.assertEqual(h.mode_calls, [])
+
+    def test_arming_during_map_wait_never_enters_offboard(self):
+        h = self.harness()
+        def inject():
+            if h.state.phase == 'PREFLIGHT':
+                h.armed = True
+                h.publish()
+        h.inject = inject
+        with patch.object(h.runner, 'check', return_value=NS(valid=False, reason='unknown path center at 0,0,1')):
+            self.assertFalse(h.runner.run_once())
+        self.assertIn('预检未结束就解锁', h.runner.flight['reason'])
+        self.assertEqual(h.mode_calls, [])
+
+    def test_input_loss_during_map_wait_is_not_retried(self):
+        h = self.harness()
+        def inject():
+            h.input_state = 'FAULT'
+            h.publish()
+        h.inject = inject
+        with patch.object(h.runner, 'check', return_value=NS(valid=False, reason='unknown path center at 0,0,1')):
+            self.assertFalse(h.runner.run_once())
+        self.assertEqual(h.mode_calls, [])
+        self.assertEqual(h.prepare_takeoff_calls, 0)
+
+    def test_ground_movement_during_map_wait_stops(self):
+        h = self.harness()
+        def inject():
+            h.position[0] = .08
+            h.publish()
+        h.inject = inject
+        with patch.object(h.runner, 'check', return_value=NS(valid=False, reason='unknown path center at 0,0,1')):
+            self.assertFalse(h.runner.run_once())
+        self.assertIn('移动超过5 cm', h.runner.flight['reason'])
+        self.assertEqual(h.mode_calls, [])
+
+    def test_future_unknown_is_deferred_without_being_marked_free(self):
+        h = self.harness()
+        replies = [NS(valid=True)]*3 + [NS(valid=False, reason='unknown footprint at 2,-2,1')]
+        def check(path):
+            return replies.pop(0) if replies else NS(valid=True)
+        with patch.object(h.runner, 'check', side_effect=check):
+            self.assertTrue(h.runner.run_once())
+        self.assertEqual([x['target_index'] for x in h.runner.flight['preflight_checks']], list(range(7)))
+        deferred = h.runner.flight['deferred_ground_targets']
+        self.assertEqual([x['target_index'] for x in deferred], [3])
+        self.assertFalse(deferred[0]['valid'])
+        self.assertEqual({x['leg'] for x in h.runner.flight['leg_coverage_checks']}, set(range(1,7)))
+
+    def test_unknown_future_goal_observed_from_next_hold_point_then_completes(self):
+        h = self.harness()
+        def check(path):
+            p = path.poses[0].pose.position
+            missing = p.x > 1.5 and p.y < -1.5 and p.z < 1.5 and h.position[0] < 1.5
+            return NS(valid=not missing, reason='unknown footprint; no observed voxel below' if missing else 'clear')
+        with patch.object(h.runner, 'check', side_effect=check):
+            self.assertTrue(h.runner.run_once())
+        self.assertEqual([x['target_index'] for x in h.runner.flight['deferred_ground_targets']], [2])
+        self.assertEqual(len(h.client.goals), 6)
+        leg2 = next(x for x in h.runner.flight['leg_coverage_checks'] if x['leg'] == 2)
+        self.assertGreater(leg2['hold_odom'][0], 1.5)
+        self.assertTrue(leg2['valid'])
+
+    def test_persistent_future_unknown_stops_at_previous_hold_without_sending_that_leg(self):
+        h = self.harness()
+        def check(path):
+            p = path.poses[0].pose.position
+            missing = p.x > 1.5 and p.y < -1.5 and p.z < 1.5
+            return NS(valid=not missing, reason='unknown footprint; no observed voxel below' if missing else 'clear')
+        with patch.object(h.runner, 'check', side_effect=check):
+            self.assertFalse(h.runner.run_once())
+        self.assertEqual(h.takeoff_calls, 1)
+        self.assertEqual(len(h.client.goals), 1)
+        self.assertEqual(h.land_calls, 0)
+        self.assertIn('#2 目标包络等待', h.runner.flight['reason'])
+        self.assertTrue(all(x['leg'] in (1,2) for x in h.runner.flight['leg_coverage_checks']))
+
+    def test_known_future_obstacle_still_rejected_after_an_unknown_goal(self):
+        h = self.harness()
+        replies = [NS(valid=True)]*2 + [NS(valid=False, reason='unknown footprint')] + [
+            NS(valid=False, reason='occupied inflated footprint')]
+        with patch.object(h.runner, 'check', side_effect=replies):
+            self.assertFalse(h.runner.run_once())
+        self.assertIn('occupied inflated footprint', h.runner.flight['reason'])
+        self.assertEqual(h.takeoff_calls, 0)
         self.assertEqual(h.mode_calls, [])
 
     def test_done_but_low_height_never_sends_route(self):
@@ -339,6 +541,34 @@ class FullTests(unittest.TestCase):
                 self.assertEqual(h.land_calls, 1)
                 if kind != 'service':
                     self.assertIn('超时', h.runner.flight['reason'])
+                    self.assertIn('已确认着地但尚未上锁' if kind == 'disarm' else '未检测到新鲜着地确认',
+                                  h.runner.flight['reason'])
+
+    def test_land_limit_failure_preserves_reason_and_never_retries(self):
+        h=self.harness()
+        def inject():
+            if h.land_state == 'DESCENDING':
+                h.land_state='STOPPED'
+                h.status('gateway_status',state='FAULT',real_output=True,land='STOPPED',
+                         reason='landing not detected at 0.10 m below ground after 2.0 s grace',
+                         land_target_z=.02,land_ground_z=0.,land_limit_z=-.1,land_limit_reached=True)
+        h.inject=inject
+        self.assertFalse(h.runner.run_once())
+        self.assertIn('landing not detected',h.runner.flight['reason'])
+        self.assertTrue(h.runner.flight['stop_state']['land_limit_reached'])
+        self.assertEqual(h.land_calls,1)
+        self.assertEqual([x[1] for x in h.mode_calls],['OFFBOARD'])
+
+    def test_velocity_press_status_and_diagnostics_do_not_abort_landing(self):
+        h=self.harness()
+        h.state.phase='LANDING';h.state.land_requested=True
+        h.status('gateway_status',state='READY',real_output=True,land='PRESSING',
+                 land_z_velocity_only=True,land_command_vz=-.35,land_disarm_requests=0)
+        self.assertIsNotNone(h.state.land_confirmed_at)
+        self.assertFalse(h.state.issue)
+        snap=h.runner.snapshot()
+        self.assertTrue(snap['land_z_velocity_only'])
+        self.assertAlmostEqual(snap['land_command_vz'],-.35)
 
     def test_land_takeover_latched_does_not_reassert_modes(self):
         h = self.harness()
@@ -489,14 +719,17 @@ class FullTests(unittest.TestCase):
         def est_problem():
             # The estimator stream comes up late on cold MAVROS/FCU starts (11-12 test10): stale, then fine.
             state_calls['est'] += 1
+            state.fcu_at = h.clock.t
             return '飞控 /mavros/estimator_status 2 s 没更新' if state_calls['est'] <= 2 else ''
-        state = NS(fcu=NS(armed=False), initial_armed=False,
+        state = NS(fcu=NS(armed=False, connected=True, mode='POSCTL'), initial_armed=False,
+                   startup_armed=False, fcu_at=h.clock.t,
                    ekf_problem=est_problem, resting_only=lambda: False)
         client = Mock(); client.wait_for_server.return_value = True
         runner = Mock(); runner.inputs_problem.return_value = ''
         runner.run_once.return_value = True
         fc = Mock(); fc.ext_fresh.return_value = True
         fc.pos.return_value, fc.descent.return_value = np.zeros(3), 0.
+        runner.s, runner.fc = state, fc
         args = NS(preview=False, delay=3., out=h.tmp.name, nav_config='')
         wanted = []
         with patch.object(nav, 'say') as say_mock, \
