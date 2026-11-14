@@ -1,0 +1,16 @@
+# drone_map XYZ in metres. Each segment ends at its only stop.
+map_id: /home/orangepi/test_data/mapping/20261105_114605_outdoor
+start: [0, 0, 1]
+segments:
+  - name: 巡检 A
+    points: [[3, 0, 1], [6, -2, 1]]
+    hold_s: 3
+  - name: 巡检 B
+    points: [[8, 0, 1.5], [7, 3, 2]]
+    hold_s: 3
+  - name: 巡检 C
+    points: [[4, 5, 2.5], [1, 4, 3]]
+    hold_s: 3
+  - name: 返回
+    points: [[2, 1, 2.5], [4, -2, 2], [2, -4, 1.5], [0, -2, 1], [0, 0, 1]]
+    hold_s: 0

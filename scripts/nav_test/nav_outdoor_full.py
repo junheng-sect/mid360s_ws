@@ -212,10 +212,22 @@ class FullRunner(GlobalRunner):
     test_name = 'test10'
     route_name = '完整室外综合测试'
     record_prefix = 'test10'
+    route = ROUTE
+    holds = HOLDS
+    names = NAMES
+    @property
+    def leg_timeout(self):
+        return LEG_TIMEOUT
+
+    def verify_profile(self):
+        profile(self.cfg)
+
+    def preflight_targets(self):
+        return self.goals, self.names
 
     def __init__(self, args, cfg, state, buf, prepare, check, client, fc,
                  prepare_takeoff=None, takeoff=None, land=None, set_mode=None):
-        args.points, args.hold, args.check_segments, args.max_start_offset = list(ROUTE), 0., False, 3.
+        args.points, args.hold, args.check_segments, args.max_start_offset = list(self.route), 0., False, 3.
         super().__init__(args, cfg, state, buf, prepare, check, client)
         self.fc = fc
         self.s.fc = fc
@@ -324,7 +336,7 @@ class FullRunner(GlobalRunner):
             self.flight['phases'].append(dict(phase=name, wall=time.time(), ros=rospy.Time.now().to_sec(),
                                               state=self.snapshot()))
             self.save()
-        say('test10 阶段：' + name)
+        say(self.test_name + ' 阶段：' + name)
 
     def guard(self, stopped=False, preparing=False):
         if rospy.is_shutdown():
@@ -378,8 +390,8 @@ class FullRunner(GlobalRunner):
                 raise Stopped(self.land_timeout_reason())
             raise Stopped(self.s.phase + ' 阶段等待超时')
         if self.deadline is not None and time.monotonic() >= self.deadline:
-            raise Stopped('单点任务超时（20 s）')
-        if self.holding and self.current == 5:
+            raise Stopped('单段任务超时（%g s）' % self.leg_timeout)
+        if self.holding and self.current == len(self.route) - 1:
             self.check_return()
 
     def check_return(self):
@@ -389,7 +401,7 @@ class FullRunner(GlobalRunner):
             raise Stopped('返回点位置/速度/航向未稳定，不降落')
 
     def hold_for(self, i):
-        return HOLDS[i]
+        return self.holds[i]
 
     def trace_leg(self):
         if self.current is None or not self.record or len(self.record['legs']) <= self.current:
@@ -419,7 +431,7 @@ class FullRunner(GlobalRunner):
     def send_leg(self, i, goal, goal_map, yaw_map):
         self.wait_leg_coverage(i, goal)
         self.current = i
-        self.deadline = time.monotonic() + LEG_TIMEOUT
+        self.deadline = time.monotonic() + self.leg_timeout
         try:
             # Existing action/result/bounds/cancel/reprepare semantics stay unchanged.
             return super().send_leg(i, goal, goal_map, yaw_map)
@@ -440,39 +452,39 @@ class FullRunner(GlobalRunner):
         return p
 
     def create_records(self):
-        out = os.path.expanduser(self.a.out or '~/test_data/nav_test/' + time.strftime('%Y%m%d_%H%M%S') + '_test10')
+        out = os.path.expanduser(self.a.out or '~/test_data/nav_test/' + time.strftime('%Y%m%d_%H%M%S') + '_' + self.test_name)
         os.makedirs(out, exist_ok=True)
         suffix = '%s_%d' % (time.strftime('%H%M%S'), time.time_ns())
-        self.record_path = os.path.join(out, 'goal_test10_' + suffix + '.json')
-        self.flight_path = os.path.join(out, 'flight_test10_' + suffix + '.json')
-        self.flight = dict(test='test10', map_id=self.cfg['map_id'], real_output=self.real,
+        self.record_path = os.path.join(out, 'goal_' + self.test_name + '_' + suffix + '.json')
+        self.flight_path = os.path.join(out, 'flight_' + self.test_name + '_' + suffix + '.json')
+        self.flight = dict(test=self.test_name, map_id=self.cfg['map_id'], real_output=self.real,
                            phases=[], end='RUNNING', start_wall=time.time(), start_ros=rospy.Time.now().to_sec())
-        self.record = dict(test='test10', map_id=self.cfg['map_id'], real_output=self.real,
-                           trigger='manual_arm', goals_map=[list(p[:3]) for p in ROUTE],
-                           goal_yaw_map_deg=[p[3] for p in ROUTE], legs=[], hold_s=list(HOLDS),
+        self.record = dict(test=self.test_name, map_id=self.cfg['map_id'], real_output=self.real,
+                           trigger='manual_arm', goals_map=[list(p[:3]) for p in self.route],
+                           goal_yaw_map_deg=[p[3] for p in self.route], legs=[], hold_s=list(self.holds),
                            end='RUNNING', start_wall=time.time(), start_ros=rospy.Time.now().to_sec())
         self.save()
 
     def preflight(self):
-        profile(self.cfg)
+        self.verify_profile()
         self.guard()
         if self.s.initial_armed or self.s.startup_armed or self.s.fcu.armed or not self.fc.on_ground() or self.fc.ground_z is None:
             raise Stopped('必须从地面上锁状态启动，不自动上锁/解锁')
         self.reference = self.transform()  # Only capture ONCE, before any arming.
         p = self.ground_geometry()
-        self.goals_map = np.array([p[:3] for p in ROUTE])
+        self.goals_map = np.array([p[:3] for p in self.route])
         r, t = self.reference
         yaw = self.s.pose()[1]
         if np.linalg.norm((r @ np.array([math.cos(yaw), math.sin(yaw), 0.]))[:2]) < .9:
             raise Stopped('地图变换不能保持水平航向')
         self.goals = (self.goals_map - t) @ r
-        self.yaw_map = np.radians([p[3] for p in ROUTE])
+        self.yaw_map = np.radians([p[3] for p in self.route])
         self.yaws = np.array([heading(r.T, a) for a in self.yaw_map])
-        self.names = NAMES
+        targets, names = self.preflight_targets()
         expected = p + np.array([0., 0., 1.])
-        check_goal_bounds(np.vstack([expected, self.goals]), self.cfg,
-                          ['预计起飞终点'] + list(NAMES))
-        self.preflight_map(np.vstack([expected, self.goals]), ['预计起飞终点'] + list(NAMES), p)
+        check_goal_bounds(np.vstack([expected, targets]), self.cfg,
+                          ['预计起飞终点'] + list(names))
+        self.preflight_map(np.vstack([expected, targets]), ['预计起飞终点'] + list(names), p)
         self.record.update(goals_odom=self.goals.tolist(), goal_yaw_odom_deg=np.degrees(self.yaws).tolist(),
                            transform_rotation=r.tolist(), transform_translation=t.tolist(),
                            max_vel=self.cfg['max_vel'], max_acc=self.cfg['max_acc'])
@@ -669,6 +681,10 @@ class FullRunner(GlobalRunner):
             return '慢速降落%g s超时：已确认着地但尚未上锁，请飞手确认' % LAND_TIMEOUT
         return '慢速降落%g s超时：未检测到新鲜着地确认，请飞手接管' % LAND_TIMEOUT
 
+    def route_finished(self):
+        return len(self.record['legs']) == len(self.route) and all(
+            leg['end'] == 'SUCCEEDED' for leg in self.record['legs'])
+
     def land_once(self):
         self.guard(stopped=True)
         self.check_return()
@@ -676,7 +692,7 @@ class FullRunner(GlobalRunner):
         if why:
             raise Stopped('降落预检拒绝：' + why)
         # Check the last action really succeeded; never clear an arbitrary fault.
-        if len(self.record['legs']) != 6 or any(l['end'] != 'SUCCEEDED' for l in self.record['legs']):
+        if not self.route_finished():
             raise Stopped('路线没有全部成功，不自动降落')
         self.phase('LAND_REQUEST')
         start = time.monotonic()
@@ -720,7 +736,7 @@ class FullRunner(GlobalRunner):
 
     def run_once(self):
         if self.used:
-            raise Stopped('test10 已执行过一轮，禁止自动重跑')
+            raise Stopped(self.test_name + ' 已执行过一轮，禁止自动重跑')
         self.used = True
         self.create_records()
         self.s.begin(True, self.cfg['map_id'])
@@ -733,7 +749,7 @@ class FullRunner(GlobalRunner):
             self.land_once()
             self.flight['end'] = 'SUCCEEDED'
             self.phase('DONE')
-            say('test10 完整成功：已确认着地且上锁。先停止通道6录包，再拿飞机，最后 Ctrl+C')
+            say(self.test_name + ' 完整成功：已确认着地且上锁。先停止通道6录包，再拿飞机，最后 Ctrl+C')
             return True
         except BaseException as e:
             cancel_error = ''
@@ -753,9 +769,9 @@ class FullRunner(GlobalRunner):
                                stop_state=self.snapshot())
             if (self.s.fcu is not None and not self.s.fcu.armed and self.fc.on_ground() and
                     self.s.phase in ('PREFLIGHT', 'WAIT_ARM')):
-                say('test10 地面终止：%s；未进入自动起飞，保持上锁。定位链路保留' % reason)
+                say(self.test_name + ' 地面终止：%s；未进入自动起飞，保持上锁。定位链路保留' % reason)
             else:
-                say('test10 终止：%s；不会续飞/抢回模式。定位链路保留，请飞手接管或监视已开始的降落' % reason)
+                say(self.test_name + ' 终止：%s；不会续飞/抢回模式。定位链路保留，请飞手接管或监视已开始的降落' % reason)
             if isinstance(e, KeyboardInterrupt):
                 raise
             return False
@@ -826,7 +842,11 @@ def main():
                 return HOLDS[i]
         say('test10 PREVIEW：仅预览空中六段，不验证起飞/降落，不切飞控模式')
         return serve('nav_test10_preview', a, PreviewRunner)
-    rospy.init_node('nav_test10', anonymous=True, disable_signals=True)
+    return run_full(a, FullRunner, 'test10')
+
+
+def run_full(a, runner_cls, test_name):
+    rospy.init_node(test_name, anonymous=True, disable_signals=True)
     s = FullState()
     fc = Fc(s)
     s.fc = fc
@@ -838,7 +858,7 @@ def main():
             raise Stopped('15 s没收到配置/飞控状态')
         time.sleep(.05)
     if s.initial_armed:
-        raise Stopped('启动时已经解锁，test10 不触发')
+        raise Stopped('启动时已经解锁，%s 不触发' % test_name)
     cfg = rospy.get_param('/drone_nav/config')
     for name in ('/drone_nav/prepare', '/drone_nav/check_trajectory',
                  '/drone_nav/prepare_takeoff', '/drone_nav/takeoff', '/drone_nav/land', '/mavros/set_mode'):
@@ -846,7 +866,7 @@ def main():
     client = actionlib.SimpleActionClient('/drone_nav/execute_route', ExecuteRouteAction)
     if not client.wait_for_server(rospy.Duration(10)):
         raise Stopped('10 s没等到 execute_route')
-    runner = FullRunner(a, cfg, s, buf, rospy.ServiceProxy('/drone_nav/prepare', Trigger),
+    runner = runner_cls(a, cfg, s, buf, rospy.ServiceProxy('/drone_nav/prepare', Trigger),
                         rospy.ServiceProxy('/drone_nav/check_trajectory', CheckTrajectory), client, fc,
                         rospy.ServiceProxy('/drone_nav/prepare_takeoff', Trigger),
                         rospy.ServiceProxy('/drone_nav/takeoff', Trigger),
