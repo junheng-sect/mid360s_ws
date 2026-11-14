@@ -38,7 +38,7 @@ import rospy
 from std_msgs.msg import String
 from geometry_msgs.msg import (PoseStamped, PoseWithCovarianceStamped, TwistStamped,
                                Vector3Stamped)
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import Imu, PointCloud2
 from tf2_msgs.msg import TFMessage
 from mavros_msgs.msg import EstimatorStatus, ExtendedState, PositionTarget, RCIn, State, TimesyncStatus
@@ -118,6 +118,7 @@ def topic_type_registry():
             '/drone_nav/sensor_odom': Odometry,
             '/drone_nav/cloud': PointCloud2,
             '/drone_nav/planner_goal': PoseStamped,
+            '/drone_nav/planner_path': Path,
             '/drone_nav/bspline': Bspline,
             '/drone_nav/command': NavigationCommand,
             '/drone_nav/setpoint_preview': PositionTarget,
@@ -130,6 +131,11 @@ def topic_type_registry():
         })
     except ImportError:
         rospy.logwarn('navigation recording types not built; existing recorder topics remain available')
+    try:
+        from traj_utils.msg import PathTrajectory
+        registry['/drone_nav/path_trajectory'] = PathTrajectory
+    except ImportError:
+        pass
     return registry
 
 

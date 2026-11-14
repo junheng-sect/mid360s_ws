@@ -44,6 +44,8 @@ rc_bag_recorder:
     - /drone_nav/sensor_odom
     - /drone_nav/cloud
     - /drone_nav/planner_goal
+    - /drone_nav/planner_path
+    - /drone_nav/path_trajectory
     - /drone_nav/bspline
     - /drone_nav/command
     - /drone_nav/setpoint_preview
