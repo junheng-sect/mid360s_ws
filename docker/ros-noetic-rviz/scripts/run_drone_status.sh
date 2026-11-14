@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # 本机起无人机状态桥（local_view/drone_status.py）：在 docker 里只读订阅板端常驻 MAVROS 和 fusion 的几个低频话题，
-# 汇总成 JSON 给网页（tools/car_web 的无人机面板）取：http://<本机 IP>:8091/status。板端不加任何进程。
+# 汇总成 JSON 给本机仓库巡检页取：http://127.0.0.1:8091/status。板端不加任何进程。
 #
 #   ./scripts/run_drone_status.sh --install    # 装成本机用户服务 drone-status：开机自启、退出 10 s 后重起（平时用这个）
 #   ./scripts/run_drone_status.sh --uninstall  # 卸掉服务
 #   ./scripts/run_drone_status.sh              # 不装服务时：后台起（容器 drone_status，已有同名容器先替换）
 #   ./scripts/run_drone_status.sh --fg         # 前台起，看日志用（服务也是这样跑的）
 #   ./scripts/run_drone_status.sh --stop       # 停掉
-#   ./scripts/run_drone_status.sh --port 8091 --ros-master URI --ros-ip IP
+#   ./scripts/run_drone_status.sh --port 8091 --bind 127.0.0.1 --ros-master URI --ros-ip IP
 #
 # 本机 ROS_IP 在起容器时按到板端的路由定下。自动识别时，状态桥发现本机到板端的源地址变了（换网）会自己退出，
 # 服务重起时重选；手动起的要重跑本脚本。板端重启（master 换了）不用管，节点自己会重来。
@@ -21,6 +21,7 @@ name="drone_status"
 unit="drone-status.service"
 unit_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit"
 port=8091
+bind=127.0.0.1
 ros_master_uri="${RVIZ_ROS_MASTER:-}"
 ros_ip="${RVIZ_ROS_IP:-}"
 action=background
@@ -32,6 +33,7 @@ while [ $# -gt 0 ]; do
     --install) action=install; shift ;;
     --uninstall) action=uninstall; shift ;;
     --port) port="$2"; shift 2 ;;
+    --bind) bind="$2"; shift 2 ;;
     --ros-master) ros_master_uri="$2"; shift 2 ;;
     --ros-ip) ros_ip="$2"; shift 2 ;;
     -h|--help) sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -47,11 +49,11 @@ install_unit() {
   mkdir -p "$(dirname "$unit_file")"
   cat >"$unit_file" <<EOF
 [Unit]
-Description=无人机状态桥（mid360s_ws docker/ros-noetic-rviz，:$port/status，给 car_web 无人机面板）
+Description=无人机状态桥（mid360s_ws docker/ros-noetic-rviz，:$port/status，给仓库无人机巡检页）
 
 [Service]
 Environment=DRONE_STATUS_SERVICE=1
-ExecStart="$SCRIPT_DIR/run_drone_status.sh" --fg --port $port
+ExecStart="$SCRIPT_DIR/run_drone_status.sh" --fg --port $port --bind $bind
 ExecStopPost=-$docker_bin rm -f $name
 Restart=always
 RestartSec=10
@@ -124,7 +126,7 @@ docker_args=(
   -v "$CONFIG_DIR/home/ros:/home/ros"
   -w /home/ros
 )
-cmd=(python3 /opt/rviz-ws/local_view/scripts/drone_status.py --port "$port")
+cmd=(python3 /opt/rviz-ws/local_view/scripts/drone_status.py --port "$port" --bind "$bind")
 if [ "$action" = foreground ]; then
   exec docker "${docker_args[@]}" "$IMAGE_TAG" "${cmd[@]}"
 fi
