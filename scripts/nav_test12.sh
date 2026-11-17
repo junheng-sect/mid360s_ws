@@ -6,17 +6,20 @@ SELF=$(realpath -e -- "$0") || exit 1
 source "$(dirname -- "$SELF")/nav_test/common.sh" || exit 1
 MAP="$MAP_ROOT/20261105_114605_outdoor"
 RELOC_CONFIG="$WS/src/drone_relocalization/config/outdoor.yaml"
+DLL_MAP="${MAP}_screenshot_roi"
 RECORDER="$DIR/rc_record/record_outdoor_dll_ywl"
 PROBE="$NT_DIR/test12_state.py"
 TASK_ID=${WAREHOUSE_TASK_ID:-}
 EV_MODE=pose
+USE_DLL=1
 DRY_RUN=0
 args=("$@")
 
 usage() {
   cat <<'HELP'
-用法：nav_test12.sh [--ev-mode pose|odom] [--dry-run]
-室外 test12：启动原 FAST-LIO2、室外重定位和 Channel 6 原始录包，人工遥控飞行。
+用法：nav_test12.sh [--ev-mode pose|odom] [--no-dll] [--dry-run]
+室外 test12：启动 FAST-LIO2、室外重定位、DLL 和 Channel 6 录包，人工遥控飞行。
+--no-dll 按原手飞流程录包。
 默认 pose。--dry-run 仅显示启动配置。
 SSH 断开后用 tmux attach -t nav12 接回。
 HELP
@@ -29,6 +32,7 @@ while (( $# > 0 )); do
       EV_MODE=$2
       shift
       ;;
+    --no-dll) USE_DLL=0 ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
@@ -45,6 +49,11 @@ if (( DRY_RUN )); then
   printf '%s\n' "室外 test12 · 人工遥控" "地图：$MAP" "重定位配置：$RELOC_CONFIG" \
     "启动：Channel 6 录包待命 → fusion.sh --no-record --no-camera --no-winch --ev-mode $EV_MODE → 室外重定位" \
     "录包目录：$HOME/test_data/nav_test/<时间>_test12/"
+  if (( USE_DLL )); then
+    printf '%s\n' "DLL 裁图：$DLL_MAP（10 cm，1280 MiB）"
+  else
+    printf '%s\n' 'DLL：关闭'
+  fi
   exit 0
 fi
 
@@ -68,7 +77,17 @@ for file in "$WS_SETUP" "$DIR/fusion.sh" "$DIR/ros_net.sh" "$PROBE" \
   [[ -r "$file" ]] || { echo "缺少 $file" >&2; exit 1; }
 done
 [[ -x "$RECORDER" ]] || { echo "找不到内部录包器：$RECORDER" >&2; exit 1; }
-source "$ROS_SETUP" && source "$WS_SETUP" && source "$DIR/ros_net.sh" || exit 1
+source "$ROS_SETUP" && source "$WS_SETUP" || exit 1
+if (( USE_DLL )); then
+  [[ -r "$ORANGE_SETUP" ]] || { echo '缺少 Orange 构建，请先部署 DLL 或使用 --no-dll' >&2; exit 1; }
+  source "$ORANGE_SETUP" --extend || exit 1
+  DLL_PACKAGE=$(rospack find fastlio_dll) || exit 1
+  DLL_CONFIG="$DLL_PACKAGE/config/outdoor_large_field.yaml"
+  for file in "$DLL_CONFIG" "$DLL_MAP/map_world.pcd" "$DLL_MAP/meta.json" "$DLL_MAP/manifest.json"; do
+    [[ -r "$file" ]] || { echo "缺少 $file" >&2; exit 1; }
+  done
+fi
+source "$DIR/ros_net.sh" || exit 1
 
 exec 199>"/tmp/mid360s-nav-test-$(id -u).lock"
 flock -n 199 || { echo '已有测试运行，请先收尾' >&2; exit 1; }
@@ -99,7 +118,8 @@ RUN_DIR=$(mktemp -d /tmp/nav_test12.XXXXXX) || exit 1
 PF_FUSION="$RUN_DIR/fusion.pid"
 PF_RELOC="$RUN_DIR/reloc.pid"
 PF_RECORD="$RUN_DIR/record.pid"
-tail_pid=
+PF_DLL="$RUN_DIR/dll.pid"
+tail_pids=()
 shutting_down=0
 
 owns_localization() {
@@ -125,15 +145,17 @@ finish12() {
     shutting_down=0
     return 1
   fi
-  if ! stop_child "$PF_RELOC" '室外重定位' INT 12 || ! stop_child "$PF_FUSION" 'fusion.sh' TERM 60; then
+  if ! stop_child "$PF_DLL" 'DLL 地图定位' INT 20 ||
+     ! stop_child "$PF_RELOC" '室外重定位' INT 12 ||
+     ! stop_child "$PF_FUSION" 'fusion.sh' TERM 60; then
     shutting_down=0
     return 1
   fi
-  if [[ -n "$tail_pid" ]]; then
+  local tail_pid bag
+  for tail_pid in "${tail_pids[@]}"; do
     kill -TERM "$tail_pid" 2>/dev/null || true
     wait "$tail_pid" 2>/dev/null || true
-  fi
-  local bag
+  done
   for bag in "$OUT"/outdoor_dll_ywl_*.bag; do
     [[ ! -f "$bag" ]] || log "实飞对照包：$bag"
   done
@@ -147,7 +169,7 @@ finish12() {
     clean=0
   fi
   log "test12 已收尾，日志和 bag：$OUT"
-  rm -f -- "$PF_RECORD" "$PF_RELOC" "$PF_FUSION"
+  rm -f -- "$PF_RECORD" "$PF_RELOC" "$PF_FUSION" "$PF_DLL"
   rmdir -- "$RUN_DIR"
   if (( ! clean )); then exit 1; fi
   if [[ -n "$TASK_ID" && "$code" -eq 143 ]]; then
@@ -176,9 +198,15 @@ bringup12() {
   log "test12 · 手飞，外部定位 $EV_MODE，记录目录 $OUT"
   ok '飞控已连接、已着地且已上锁'
   sha256sum "$MAP/map_world.pcd" "$MAP/meta.json" "$RELOC_CONFIG" >"$OUT/map.sha256" || return 1
-  start_child "$PF_RECORD" "$OUT/record.log" "$RECORDER" "$OUT"
+  local record_args=("$OUT")
+  if (( USE_DLL )); then
+    sha256sum "$DLL_MAP/map_world.pcd" "$DLL_MAP/meta.json" "$DLL_MAP/manifest.json" "$DLL_CONFIG" >>"$OUT/map.sha256" || return 1
+    cp -- "$DLL_CONFIG" "$OUT/dll_config.yaml" && cp -- "$DLL_MAP/manifest.json" "$OUT/dll_map_manifest.json" || return 1
+    record_args+=(--dll)
+  fi
+  start_child "$PF_RECORD" "$OUT/record.log" "$RECORDER" "${record_args[@]}"
   setsid tail -n +1 -F --pid="$$" "$OUT/record.log" &
-  tail_pid=$!
+  tail_pids+=("$!")
   wait_stage recorder 15 "$PF_RECORD" || { err '录包器未就绪，查看 record.log'; return 1; }
   ok 'Channel 6 录包已待命'
   local fusion_args=(--no-record --no-camera --no-winch --ev-mode "$EV_MODE")
@@ -192,9 +220,23 @@ bringup12() {
   ok 'FAST-LIO2 和重力桥已输出'
   start_child "$PF_RELOC" "$OUT/reloc.log" rosrun drone_relocalization relocalize \
     --map "$MAP" --config "$RELOC_CONFIG" --save "$OUT"
+  if (( USE_DLL )); then
+    log 'DLL 正在建立距离场并等待本次重定位确认'
+    start_child "$PF_DLL" "$OUT/dll.log" roslaunch fastlio_dll observe.launch \
+      "map_dir:=$DLL_MAP" "legacy_map_dir:=$MAP" "config:=$DLL_CONFIG"
+    setsid tail -n +1 -F --pid="$$" "$OUT/dll.log" &
+    tail_pids+=("$!")
+  fi
   wait_stage reloc 150 "$PF_RECORD" "$PF_FUSION" "$PF_RELOC" || { err '室外重定位未确认，查看 reloc.log'; return 1; }
+  local ready='室外重定位已确认'
+  if (( USE_DLL )); then
+    wait_stage dll 150 "$PF_RECORD" "$PF_FUSION" "$PF_RELOC" "$PF_DLL" ||
+      { err 'DLL 未进入 TRACKING，查看 dll.log；可用 --no-dll 重新启动手飞录包'; return 1; }
+    timeout 5 rosparam dump "$OUT/dll_params.yaml" /fastlio_dll || return 1
+    ready+='，DLL TRACKING'
+  fi
   check_ground || return 1
-  ok '室外重定位已确认。拨 Channel 6 开包，保持静止录够 20 秒，再按原流程手飞'
+  ok "$ready。拨 Channel 6 开包，保持静止录够 20 秒，再按原流程手飞"
   log '落地静止后拨回 Channel 6 封包。上锁后 Ctrl+C 收尾'
 }
 
@@ -206,7 +248,7 @@ fi
 reported=" "
 while :; do
   sleep 2
-  for stage in FUSION RELOC RECORD; do
+  for stage in FUSION RELOC RECORD DLL; do
     file_var="PF_$stage"
     pidfile="${!file_var}"
     if [[ -s "$pidfile" ]] && ! child_pid "$pidfile" >/dev/null && [[ "$reported" != *" $stage "* ]]; then

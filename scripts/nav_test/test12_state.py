@@ -6,7 +6,8 @@ import math
 import sys
 import time
 
-from geometry_msgs.msg import PoseStamped
+from diagnostic_msgs.msg import DiagnosticArray
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from mavros_msgs.msg import ExtendedState, State
 from nav_msgs.msg import Odometry
 import rosgraph
@@ -33,6 +34,26 @@ def decode(message):
     except ValueError:
         return {}
 
+def dll_ready(samples):
+    pose = samples.get("/dll_localization/pose")
+    correction = samples.get("/dll_localization/correction")
+    diagnostics = samples.get("/dll_localization/status")
+    if not (fresh(pose, .5) and fresh(correction, .5) and fresh(diagnostics, 1.5)):
+        return False
+    if (pose.header.frame_id != "drone_map" or correction.header.frame_id != "drone_map"
+            or correction.child_frame_id != "drone_odom" or pose.header.stamp != correction.header.stamp
+            or not valid_pose(pose.pose)):
+        return False
+    for status in diagnostics.status:
+        if status.name == "fastlio_dll" and status.message == "TRACKING" and status.level == 0:
+            fields = {item.key: item.value for item in status.values}
+            try:
+                age = (pose.header.stamp.to_nsec() - int(fields["accepted_stamp_ns"])) / 1e9
+            except (KeyError, ValueError):
+                return False
+            return fields.get("local_input") == "fresh" and 0 <= age < 1.5
+    return False
+
 
 def check(stage, map_dir):
     if stage == "recorder":
@@ -49,6 +70,8 @@ def check(stage, map_dir):
     topics = {
         "ground": [("/mavros/state", State), ("/mavros/extended_state", ExtendedState)],
         "fastlio": [("/fastlio/odom_world", Odometry)],
+        "dll": [("/dll_localization/pose", PoseStamped), ("/dll_localization/correction", TransformStamped),
+                ("/dll_localization/status", DiagnosticArray)],
         "reloc": [("/drone_reloc/result", String), ("/drone_reloc/status", String),
                   ("/drone_reloc/pose", PoseStamped)],
     }[stage]
@@ -65,6 +88,8 @@ def check(stage, map_dir):
             odom = samples.get("/fastlio/odom_world")
             return (fresh(odom, 0.5) and odom.header.frame_id == "drone_odom"
                     and odom.child_frame_id == "drone_base" and valid_pose(odom.pose.pose))
+        if stage == "dll":
+            return dll_ready(samples)
         result = decode(samples.get("/drone_reloc/result"))
         status = decode(samples.get("/drone_reloc/status"))
         pose = samples.get("/drone_reloc/pose")
@@ -89,7 +114,7 @@ def check(stage, map_dir):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("ground", "fastlio", "reloc", "recorder"))
+    parser.add_argument("stage", choices=("ground", "fastlio", "reloc", "recorder", "dll"))
     parser.add_argument("map_dir", nargs="?")
     args = parser.parse_args()
     if not check(args.stage, args.map_dir):

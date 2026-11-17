@@ -17,15 +17,18 @@ TOPICS = (
     "/mavros/state", "/mavros/local_position/odom", "/mavros/extended_state", "/mavros/timesync_status",
 )
 RECORDER = "/opt/ros/noetic/lib/rosbag/record"
+DLL_TOPICS = ("/drone_reloc/pose", "/dll_localization/pose", "/dll_localization/correction",
+              "/dll_localization/status")
 CHANNEL_INDEX = 5
 THRESHOLD_US = 1650
 
 
 class OutdoorRecorder:
-    def __init__(self, directory, session, stopped):
+    def __init__(self, directory, session, stopped, topics):
         self.directory = directory
         self.session = session
         self.stopped = stopped
+        self.topics = topics
         self.lock = threading.Lock()
         self.process = self.path = self.error = None
         self.open_reported = False
@@ -46,7 +49,7 @@ class OutdoorRecorder:
                     path = self.directory / name
                     if path.exists() or path.with_suffix(".bag.active").exists():
                         raise FileExistsError(str(path))
-                    self.process = subprocess.Popen([RECORDER, "-O", str(path), *TOPICS],
+                    self.process = subprocess.Popen([RECORDER, "-O", str(path), *self.topics],
                                                     start_new_session=True)
                     self.path = path
                     self.open_reported = False
@@ -110,7 +113,7 @@ class OutdoorRecorder:
 
 
 def main():
-    directory, policy_dir = sys.argv[1:]
+    directory, policy_dir, *options = sys.argv[1:]
     sys.path.insert(0, policy_dir)
     from rc_record_policy import RcRecordSession
 
@@ -122,7 +125,8 @@ def main():
         signal.signal(sig, lambda *_: stopped.set())
     rospy.loginfo("等待 Channel 6：先拨到关闭位，再拨到录制位。输出目录 %s", directory)
     session = RcRecordSession(confirm_samples=3, release_tail_s=1.0)
-    return OutdoorRecorder(Path(directory), session, stopped).run()
+    topics = TOPICS + DLL_TOPICS if options == ["--dll"] else TOPICS
+    return OutdoorRecorder(Path(directory), session, stopped, topics).run()
 
 
 if __name__ == "__main__":
