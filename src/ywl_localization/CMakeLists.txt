@@ -15,7 +15,7 @@ target_include_directories(ywl_localization_node PRIVATE include ${catkin_INCLUD
 target_link_libraries(ywl_localization_node PRIVATE ${catkin_LIBRARIES} ${PCL_LIBRARIES}
   Eigen3::Eigen OpenMP::OpenMP_CXX OpenSSL::Crypto)
 add_dependencies(ywl_localization_node ${catkin_EXPORTED_TARGETS})
-catkin_install_python(PROGRAMS scripts/ywl_init_adapter
+catkin_install_python(PROGRAMS scripts/ywl_init_adapter scripts/ywl_replay
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 install(TARGETS ywl_localization_node RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 install(DIRECTORY launch config DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})

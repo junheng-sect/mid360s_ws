@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Run one isolated seed, baseline, or YWL replay and collect per-scan evidence."""
+import argparse
+import csv
+import json
+import math
+import os
+from pathlib import Path
+import signal
+import socket
+import struct
+import subprocess
+import threading
+import time
+import xmlrpc.client
+
+import rosbag
+import rosgraph
+import roslib.packages
+import rospy
+from diagnostic_msgs.msg import DiagnosticArray
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import TransformStamped, Vector3Stamped
+from tf2_msgs.msg import TFMessage
+
+RAW = ("/livox/lidar", "/livox/imu")
+
+
+def validate_bag(path):
+    with rosbag.Bag(str(path)) as bag:
+        topics = bag.get_type_and_topic_info().topics
+        for name, expected in zip(RAW, ("livox_ros_driver2/CustomMsg", "sensor_msgs/Imu")):
+            if name not in topics or topics[name].msg_type != expected:
+                raise ValueError(f"missing {expected} on {name}")
+        lidar = topics[RAW[0]]
+        return {"duration_s": bag.get_end_time() - bag.get_start_time(),
+                "lidar_scans": lidar.message_count, "lidar_hz": lidar.frequency,
+                "imu_messages": topics[RAW[1]].message_count}
+
+
+def assert_isolated(master, mode):
+    pubs, _, _ = master.getSystemState()
+    for topic, nodes in pubs:
+        if topic.startswith(("/mavros", "/navigation", "/ego")):
+            raise RuntimeError(f"unexpected control publisher {topic}: {nodes}")
+        if mode == "ywl" and topic in ("/Odometry", "/tf", "/tf_static", "/cloud_registered"):
+            raise RuntimeError(f"unexpected YWL publisher {topic}: {nodes}")
+        if mode == "ywl" and topic.startswith("/fastlio/"):
+            raise RuntimeError(f"unexpected FAST-LIO output during YWL run: {topic}")
+
+
+def sample_process(pid):
+    proc = Path("/proc") / str(pid)
+    stat = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+    return (float(int(stat[11]) + int(stat[12])) / os.sysconf("SC_CLK_TCK"),
+            int(stat[21]) * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024))
+
+
+class Replay:
+    def __init__(self, args):
+        self.args = args
+        self.launches = []
+        self.streams = []
+
+    def spawn(self, name, *command):
+        log = (self.args.out / (name + ".log")).open("w")
+        self.streams.append(log)
+        process = subprocess.Popen(command, start_new_session=True, stdout=log, stderr=subprocess.STDOUT)
+        self.launches.append(process)
+        return process
+
+    def rows(self, name, header):
+        stream = (self.args.out / (name + ".csv")).open("w", buffering=1)
+        self.streams.append(stream)
+        writer = csv.writer(stream)
+        writer.writerow(header)
+        return writer
+
+    def wait_for(self, predicate, timeout, failure):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if any(p.poll() is not None for p in self.launches):
+                raise RuntimeError("replay child exited before readiness; inspect the run logs")
+            try:
+                if predicate():
+                    return
+            except (OSError, rosgraph.MasterException):
+                pass
+            time.sleep(0.1)
+        raise RuntimeError(failure)
+
+    def start_nodes(self, master):
+        args = self.args
+        if args.mode == "ywl":
+            self.spawn("ywl", "roslaunch", "ywl_localization", "ywl.launch",
+                       f"map_dir:={args.map}", f"seed_file:={args.seed}")
+            expected = ("/ywl_localization", "/ywl_init_adapter")
+        else:
+            self.spawn("baseline", "roslaunch", "fast_lio", "mapping_mid360s.launch")
+            self.spawn("bridge", "roslaunch", "fastlio_gravity_bridge", "gravity_bridge.launch",
+                       "send_to_mavros:=false")
+            expected = ("/laserMapping", "/gravity_bridge")
+        self.wait_for(lambda: set(expected) <= {n for group in master.getSystemState() for _, nodes in group
+                                               for n in nodes}, 45, "localization nodes did not start")
+        return expected[0]
+
+    def execute(self, info):
+        args = self.args
+        self.spawn("master", "roscore", "-p", str(args.port))
+        master = rosgraph.Master("/ywl_replay")
+        self.wait_for(lambda: master.getPid() > 0, 15, "isolated master failed to start")
+        master.setParam("/use_sim_time", True)
+        rospy.init_node("ywl_replay", disable_signals=True)
+        raw = self.rows("input", ("stamp_ns", "wall_s"))
+        odom_header = ("stamp_ns", "wall_s", "x", "y", "z", "qx", "qy", "qz", "qw")
+        odom = self.rows("pose", odom_header)
+        bootstrap = self.rows("bootstrap", odom_header) if args.mode == "ywl" else None
+        velocity = self.rows("velocity", ("stamp_ns", "wall_s", "x", "y", "z"))
+        resource = self.rows("resources", ("wall_s", "cpu_s", "rss_mib"))
+        init = self.rows("initial_transform", odom_header) if args.mode == "ywl" else None
+        diagnostics = (args.out / "diagnostics.jsonl").open("w", buffering=1)
+        self.streams.append(diagnostics)
+        start = time.monotonic()
+
+        def wall():
+            return time.monotonic() - start
+
+        def write_pose(writer, stamp, p, q):
+            writer.writerow((stamp.to_nsec(), wall(), p.x, p.y, p.z, q.x, q.y, q.z, q.w))
+
+        def diagnostic(msg):
+            for status in msg.status:
+                obj = {"stamp_ns": msg.header.stamp.to_nsec(), "wall_s": wall(), "state": status.message,
+                       **{v.key: v.value for v in status.values}}
+                diagnostics.write(json.dumps(obj) + "\n")
+
+        seed_lock = threading.Lock()
+        seed_inputs = rosbag.Bag(str(args.out / "seed_inputs.bag"), "w") if args.mode == "seed" else None
+
+        def capture(topic, msg):
+            with seed_lock:
+                stamp = msg.header.stamp if topic == "/Odometry" else rospy.Time.now()
+                seed_inputs.write(topic, msg, stamp)
+
+        def receive_scan(msg):
+            _, sec, nsec = struct.unpack_from("<III", msg._buff)
+            raw.writerow((sec * 10**9 + nsec, wall()))
+
+        def record_odom(msg):
+            cov = msg.pose.covariance
+            if not (all(math.isfinite(v) for v in cov) and
+                    all(cov[i * 6 + i] >= 0 for i in range(6)) and
+                    all(abs(cov[i * 6 + j] - cov[j * 6 + i]) <= 1e-12 for i in range(6) for j in range(i))):
+                self.invalid_covariances += 1
+            write_pose(odom, msg.header.stamp, msg.pose.pose.position, msg.pose.pose.orientation)
+
+        self.invalid_covariances = 0
+        subs = [
+            rospy.Subscriber(RAW[0], rospy.AnyMsg, receive_scan,
+                             queue_size=10, buff_size=2**23, tcp_nodelay=True),
+            rospy.Subscriber("/ywl/odom" if bootstrap else "/Odometry", Odometry,
+                             record_odom, queue_size=40, tcp_nodelay=True),
+            rospy.Subscriber("/ywl/velocity" if bootstrap else "/fastlio/velocity", Vector3Stamped,
+                             lambda m: velocity.writerow((m.header.stamp.to_nsec(), wall(),
+                                                         m.vector.x, m.vector.y, m.vector.z)),
+                             queue_size=40, tcp_nodelay=True),
+        ]
+        if seed_inputs:
+            subs += [
+                rospy.Subscriber("/Odometry", Odometry, lambda m: capture("/Odometry", m), queue_size=40),
+                rospy.Subscriber("/tf_static", TFMessage, lambda m: capture("/tf_static", m), queue_size=10),
+            ]
+        if bootstrap:
+            subs += [
+                rospy.Subscriber("/ywl/bootstrap_odom", Odometry,
+                                 lambda m: write_pose(bootstrap, m.header.stamp, m.pose.pose.position, m.pose.pose.orientation),
+                                 queue_size=40, tcp_nodelay=True),
+                rospy.Subscriber("/ywl/status", DiagnosticArray, diagnostic, queue_size=40, tcp_nodelay=True),
+                rospy.Subscriber("/ywl/initial_transform", TransformStamped,
+                                 lambda m: write_pose(init, m.header.stamp, m.transform.translation, m.transform.rotation),
+                                 queue_size=2),
+            ]
+        node = self.start_nodes(master)
+        self.wait_for(lambda: all(node in dict(master.getSystemState()[1]).get(name, ()) for name in RAW),
+                      15, "localizer did not subscribe to both raw inputs")
+        uri = master.lookupNode(node)
+        _, _, pid = xmlrpc.client.ServerProxy(uri).getPid("/ywl_replay")
+        assert_isolated(master, args.mode)
+        cmd = ["rosbag", "play", "--clock", "--delay=1", "--quiet", f"--rate={args.rate:g}"]
+        if args.seconds:
+            cmd += [f"--duration={args.seconds:g}"]
+        player = self.spawn("bag", *cmd, str(args.bag), "--topics", *RAW)
+        while player.poll() is None:
+            resource.writerow((wall(), *sample_process(pid)))
+            time.sleep(0.5)
+        if player.returncode not in (None, 0):
+            raise RuntimeError("rosbag play failed")
+        time.sleep(0.75)  # Observe the post-replay watchdog timeout.
+        assert_isolated(master, args.mode)
+        publishers = {topic: nodes for topic, nodes in master.getSystemState()[0]}
+        (args.out / "run.json").write_text(json.dumps(
+            {"bag": str(args.bag), "map": str(args.map), "rate": args.rate, "mode": args.mode,
+             "port": args.port, "requested_seconds": args.seconds, "ros_publishers": publishers,
+             "seed": str(args.seed) if args.seed else None, "invalid_pose_covariances": self.invalid_covariances,
+             **info}, indent=2) + "\n")
+        for sub in subs:
+            sub.unregister()
+        if seed_inputs:
+            with seed_lock:
+                seed_inputs.close()
+            self.compute_seed()
+
+    def compute_seed(self):
+        from drone_relocalization.geometry import R_quat, quat_R, unpack
+        from drone_relocalization.matching import MapModel
+        from drone_relocalization.offline import startup
+        from drone_relocalization.session import BagSession
+        from drone_relocalization.settings import load
+        import hashlib
+        import numpy as np
+
+        args = self.args
+        derived = args.out / "seed_inputs.bag"
+        # The seed uses freshly generated FAST-LIO poses and fixed TF, with the same raw scans.
+        with rosbag.Bag(str(args.bag)) as original, rosbag.Bag(str(derived), "a") as target:
+            end = rospy.Time.from_sec(original.get_start_time() + (args.seconds or 14))
+            for topic, msg, stamp in original.read_messages(topics=["/livox/lidar"], end_time=end):
+                target.write(topic, msg, stamp)
+        config = Path(roslib.packages.get_pkg_dir("drone_relocalization")) / "config/indoor.yaml"
+        model = MapModel(str(args.map), load(str(config)))
+        session = BagSession(str(derived))
+        try:
+            report = startup(model, session, at=0, solver_rate=0)
+            (args.out / "seed_evaluation.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+            if not report["ok"]:
+                raise RuntimeError("two-window offline relocalization failed: " + report["why"])
+
+            stamp = report["status"]["stamp"]
+            row = session.od[np.searchsorted(session.od[:, 0], stamp, side="right") - 1]
+            result = dict(report["result"], confirmed=True, stamp=stamp, map=str(args.map))
+            map_r, map_t = unpack(result)
+            rotation = map_r @ session.Rwc
+            translation = map_r @ session.twc + map_t
+            encoded = lambda r, t: dict(q_xyzw=R_quat(r), translation=t.tolist())
+            seed = {
+                "schema_version": 1,
+                "anchor_ns": rospy.Time.from_sec(row[0]).to_nsec(),
+                "map_sha256": {name: hashlib.sha256((args.map / name).read_bytes()).hexdigest()
+                               for name in ("map_world.pcd", "meta.json")},
+                "map_from_camera": encoded(rotation, translation),
+                "map_from_imu": encoded(rotation @ quat_R(row[4:8]), rotation @ row[1:4] + translation),
+                "result": result, "status": report["status"],
+            }
+            (args.out / "seed.json").write_text(json.dumps(seed, indent=2, allow_nan=False) + "\n")
+        finally:
+            session.close()
+
+    def close(self):
+        rospy.signal_shutdown("replay finished")
+        for process in reversed(self.launches):
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+        for process in reversed(self.launches):
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
+        for stream in self.streams:
+            stream.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("seed", "baseline", "ywl"))
+    parser.add_argument("--map", type=Path, required=True)
+    parser.add_argument("--bag", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--seed", type=Path)
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--rate", type=float, default=1)
+    parser.add_argument("--seconds", type=float)
+    args = parser.parse_args()
+    if not 0.25 <= args.rate <= 1 or args.mode == "ywl" and (not args.seed or not args.seed.is_file()):
+        parser.error("rate must be 0.25–1.0 and YWL needs a confirmed --seed")
+    if args.mode == "seed" and args.seconds is None:
+        args.seconds = 14
+    if args.seconds is not None and args.seconds <= 0:
+        parser.error("--seconds must be positive")
+    args.map, args.bag, args.out = (p.resolve() for p in (args.map, args.bag, args.out))
+    if args.seed:
+        args.seed = args.seed.resolve()
+    info = validate_bag(args.bag)
+    with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", args.port))
+    args.out.mkdir(parents=True, exist_ok=False)
+    os.environ.update(ROS_MASTER_URI=f"http://127.0.0.1:{args.port}", ROS_HOSTNAME="127.0.0.1",
+                      ROS_IP="127.0.0.1", ROS_HOME=str(args.out / "ros_home"))
+    replay = Replay(args)
+    try:
+        replay.execute(info)
+    finally:
+        replay.close()
+
+
+if __name__ == "__main__":
+    main()

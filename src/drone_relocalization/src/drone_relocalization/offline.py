@@ -5,7 +5,8 @@ from .controller import StartupController
 from .matching import relocalize
 
 
-def startup(M,S,at=0.):
+def startup(M,S,at=0.,solver_rate=1.):
+    """Run startup on recorded data. A solver_rate of zero models paused playback."""
     cfg=M.cfg;ctl=StartupController(cfg,now=0.);lidar=S.lidar_stamps();events=[]
     for i,row in enumerate(S.od):
         if row[0]>=S.t0+at:events.append((row[0]-S.t0-at,0,i))
@@ -31,7 +32,7 @@ def startup(M,S,at=0.):
             tic=time.monotonic();cloud=S.cloud(job['start']-S.t0,cfg['window'])
             center,_=S.pose_at((job['start']+job['end'])/2)
             result=relocalize(M,cloud,center,hint=job.get('hint'));elapsed=time.monotonic()-tic
-            advance(now+elapsed);accepted=ctl.submit(result,job['token'],now)
+            advance(now+elapsed*solver_rate);accepted=ctl.submit(result,job['token'],now)
             attempt_results.append(dict(start=job['start']-S.t0,end=job['end']-S.t0,elapsed_s=elapsed,accepted=accepted,result=result))
     if not ctl.valid and not ctl.terminal:ctl.invalidate('包结束前未取得启动定位',True)
     return dict(schema_version=2,ok=ctl.valid,why=ctl.why,elapsed_data_s=now,status=ctl.status(S.t0+at+now),
