@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Record Channel 6 flight segments for both offline localization replays.
+set -eo pipefail
+
+if [[ "${1:-}" == --help || "${1:-}" == -h || $# -gt 1 ]]; then
+  echo "Usage: $0 [output-directory]"
+  echo "Waits for Channel 6; records raw LiDAR, IMU and flight telemetry."
+  if (( $# > 1 )); then exit 2; fi
+  exit 0
+fi
+
+script_dir=$(dirname -- "$(realpath -e -- "$0")")
+ws=$(cd -- "$script_dir/../.." && pwd)
+source "$ws/devel/setup.bash"
+source "$ws/scripts/ros_net.sh"
+timeout 5 rosnode list >/dev/null
+
+out=${1:-$HOME/test_data/bags}
+mkdir -p -- "$out"
+out=$(realpath -e -- "$out")
+exec 9>"$out/.outdoor_dll_ywl.lock"
+flock -n 9 || { echo "室外对照录包已经在运行" >&2; exit 1; }
+exec python3 -u -B "$script_dir/record_outdoor_rc.py" "$out" "$script_dir"
