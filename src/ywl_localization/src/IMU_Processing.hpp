@@ -16,8 +16,6 @@
 #include <nav_msgs/Odometry.h>
 #include <pcl/common/transforms.h>
 #include <pcl/kdtree/kdtree_flann.h>
-#include <tf/transform_broadcaster.h>
-#include <eigen_conversions/eigen_msg.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
@@ -51,7 +49,6 @@ class ImuProcess
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
-  ofstream fout_imu;
   V3D cov_acc;
   V3D cov_gyr;
   V3D cov_acc_scale;
@@ -239,6 +236,10 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double dt = 0;
 
   input_ikfom in;
+  in.acc = V3D(last_imu_->linear_acceleration.x, last_imu_->linear_acceleration.y,
+               last_imu_->linear_acceleration.z) * G_m_s2 / mean_acc.norm();
+  in.gyro = V3D(last_imu_->angular_velocity.x, last_imu_->angular_velocity.y,
+                last_imu_->angular_velocity.z);
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);
@@ -253,7 +254,6 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
                 0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
                 0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
 
-    // fout_imu << setw(10) << head->header.stamp.toSec() - first_lidar_time << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
 
     acc_avr     = acc_avr * G_m_s2 / mean_acc.norm(); // - state_inout.ba;
 
@@ -356,13 +356,13 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
     {
       cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init_ = false;
+      last_lidar_end_time_ = meas.lidar_end_time;
 
       cov_acc = cov_acc_scale;
       cov_gyr = cov_gyr_scale;
       ROS_INFO("IMU Initial Done");
       // ROS_INFO("IMU Initial Done: Gravity: %.4f %.4f %.4f %.4f; state.bias_g: %.4f %.4f %.4f; acc covarience: %.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f",\
       //          imu_state.grav[0], imu_state.grav[1], imu_state.grav[2], mean_acc.norm(), cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2], cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1], cov_gyr[2]);
-      fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);
     }
 
     return;

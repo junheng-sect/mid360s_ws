@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Bridge the existing two-window relocalizer to the YWL estimator."""
+from collections import deque
+import hashlib
+import json
+import math
+from pathlib import Path
+import threading
+import time
+
+import numpy as np
+import rospy
+from diagnostic_msgs.msg import DiagnosticArray
+from geometry_msgs.msg import TransformStamped
+from nav_msgs.msg import Odometry
+from std_msgs.msg import String
+from tf2_msgs.msg import TFMessage
+
+from drone_relocalization.frames import ODOM_EDGE, init_edge
+from drone_relocalization.geometry import R_quat, angle, quat_R
+from drone_relocalization.settings import load
+
+NS = 10**9
+FRESH = 0.5
+MAX_BRACKET_NS = 150_000_000
+
+
+def map_identity(path):
+    result = {}
+    for name in ("map_world.pcd", "meta.json"):
+        digest = hashlib.sha256()
+        with (Path(path) / name).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        result[name] = digest.hexdigest()
+    return result
+
+
+def pose(translation, quaternion):
+    translation = np.asarray(translation, dtype=float)
+    if translation.shape != (3,) or not np.isfinite(translation).all():
+        raise ValueError("invalid pose translation")
+    matrix = np.eye(4)
+    matrix[:3, :3] = quat_R(quaternion)
+    matrix[:3, 3] = translation
+    return matrix
+
+
+def decode_pose(data):
+    return pose(data["translation"], data["q_xyzw"])
+
+
+def encode_pose(matrix):
+    return {"translation": matrix[:3, 3].tolist(), "q_xyzw": R_quat(matrix[:3, :3])}
+
+
+def ros_pose(translation, rotation):
+    return pose([translation.x, translation.y, translation.z],
+                [rotation.x, rotation.y, rotation.z, rotation.w])
+
+
+def interpolate(a, b, fraction):
+    qa, qb = np.array(R_quat(a[:3, :3])), np.array(R_quat(b[:3, :3]))
+    dot = qa @ qb
+    if dot < 0:
+        qb, dot = -qb, -dot
+    theta = math.acos(min(dot, 1.0))
+    if theta < 1e-5:
+        q = (1 - fraction) * qa + fraction * qb
+    else:
+        q = (math.sin((1 - fraction) * theta) * qa + math.sin(fraction * theta) * qb) / math.sin(theta)
+    t = (1 - fraction) * a[:3, 3] + fraction * b[:3, 3]
+    return pose(t, q / np.linalg.norm(q))
+
+
+def at_stamp(history, stamp_ns):
+    """Return the pose at the requested time, using only a bounded bracket."""
+    previous = None
+    for stamp, transform, _ in history:
+        if stamp == stamp_ns:
+            return transform
+        if stamp > stamp_ns:
+            if previous is None or stamp - previous[0] > MAX_BRACKET_NS:
+                return None
+            fraction = (stamp_ns - previous[0]) / (stamp - previous[0])
+            return interpolate(previous[1], transform, fraction)
+        previous = (stamp, transform)
+    return None
+
+
+def stationary(history, anchor_ns, settings):
+    anchor = at_stamp(history, anchor_ns)
+    if anchor is None:
+        return False
+    start = anchor_ns - int(0.9 * NS)
+    first = at_stamp(history, start)
+    if first is None or time.monotonic() - history[-1][2] > FRESH:
+        return False
+    previous = start
+    for stamp, transform in [(start, first)] + [(t, p) for t, p, _ in history if t > start]:
+        if stamp - previous > MAX_BRACKET_NS:
+            return False
+        previous = stamp
+        if (np.linalg.norm(transform[:3, 3] - anchor[:3, 3]) >= settings["still_m"] or
+                math.degrees(angle(transform[:3, :3] @ anchor[:3, :3].T)) >= settings["still_deg"]):
+            return False
+    return True
+
+
+def confirmed(result, status, settings):
+    required = max(2, settings["confirmations"])
+    return (result.get("schema_version") == status.get("schema_version") == 2
+            and result.get("confirmed") is True and result.get("ok") is True
+            and status.get("valid") is True and status.get("state") == "LOCALIZED"
+            and status.get("confirmations", 0) >= required and
+            0 <= status["stamp"] - result["stamp"] <= FRESH)
+
+
+class Adapter:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.done = False
+        self.invalid = False
+        self.map_dir = Path(rospy.get_param("~map_dir")).resolve(strict=True)
+        self.identity = map_identity(self.map_dir)
+        self.settings = load(rospy.get_param("~reloc_config", None))
+        seed_path = rospy.get_param("~seed_file", "")
+        self.capture = rospy.get_param("~capture_seed", "")
+        self.seed = None
+        if seed_path:
+            self.seed = json.loads(Path(seed_path).read_text())
+            if self.capture or self.seed["schema_version"] != 1 or self.seed["map_sha256"] != self.identity:
+                raise ValueError("seed mode or map identity mismatch")
+            if not confirmed(self.seed["result"], self.seed["status"], self.settings):
+                raise ValueError("seed was not confirmed")
+            if type(self.seed["anchor_ns"]) is not int or self.seed["anchor_ns"] <= 0:
+                raise ValueError("invalid seed timestamp")
+            self.target = decode_pose(self.seed["map_from_imu"])
+        self.base = deque(maxlen=40)
+        self.ywl = deque(maxlen=40)
+        self.result = self.status = None
+        self.world_from_camera = None
+        self.engine_identity = None
+        self.pub = rospy.Publisher("/ywl/initial_transform", TransformStamped, queue_size=1, latch=True)
+        self.subs = []
+        if not self.capture:
+            self.subs += [
+                rospy.Subscriber("/ywl/bootstrap_odom", Odometry, self.on_odom, callback_args=True, queue_size=15),
+                rospy.Subscriber("/ywl/status", DiagnosticArray, self.on_diagnostic, queue_size=1),
+            ]
+        if not self.seed:
+            self.subs += [
+                rospy.Subscriber("/Odometry", Odometry, self.on_odom, callback_args=False, queue_size=15),
+                rospy.Subscriber("/tf_static", TFMessage, self.on_tf, queue_size=10),
+                rospy.Subscriber("/drone_reloc/result", String, self.on_json, callback_args="result", queue_size=4),
+                rospy.Subscriber("/drone_reloc/status", String, self.on_json, callback_args="status", queue_size=4),
+            ]
+
+    def reject(self, reason):
+        self.invalid = True
+        rospy.logerr("YWL initialization rejected: %s", reason)
+
+    def on_odom(self, msg, bootstrap):
+        with self.lock:
+            if self.done or self.invalid:
+                return
+            expected = ("ywl_odom", "ywl_imu") if bootstrap else ("camera_init", "body")
+            history = self.ywl if bootstrap else self.base
+            stamp = msg.header.stamp.to_nsec()
+            if (msg.header.frame_id.strip("/"), msg.child_frame_id.strip("/")) != expected or stamp <= 0:
+                self.reject("odometry frame or stamp mismatch")
+                return
+            if history and stamp <= history[-1][0]:
+                self.reject("odometry repeated or reversed")
+                return
+            try:
+                transform = ros_pose(msg.pose.pose.position, msg.pose.pose.orientation)
+                history.append((stamp, transform, time.monotonic()))
+            except ValueError as exc:
+                self.reject(exc)
+
+    def on_tf(self, msg):
+        with self.lock:
+            if self.done or self.invalid:
+                return
+            for tr in msg.transforms:
+                if init_edge(tr.header.frame_id, tr.child_frame_id) != ODOM_EDGE:
+                    continue
+                try:
+                    transform = ros_pose(tr.transform.translation, tr.transform.rotation)
+                    if self.world_from_camera is not None and not np.allclose(
+                            transform, self.world_from_camera, atol=1e-9, rtol=0):
+                        raise ValueError("baseline gravity transform changed")
+                    self.world_from_camera = transform
+                except ValueError as exc:
+                    self.reject(exc)
+
+    def on_json(self, msg, key):
+        with self.lock:
+            if self.done or self.invalid:
+                return
+            try:
+                value = json.loads(msg.data)
+                if not isinstance(value, dict):
+                    raise ValueError("expected relocalization JSON object")
+                setattr(self, key, (value, time.monotonic()))
+            except ValueError as exc:
+                self.reject(exc)
+
+    def on_diagnostic(self, msg):
+        with self.lock:
+            if self.done or self.invalid:
+                return
+            for status in msg.status:
+                if status.name == "ywl_localization":
+                    values = {v.key: v.value for v in status.values}
+                    self.engine_identity = {
+                        "map_world.pcd": values.get("map_pcd_sha256"),
+                        "meta.json": values.get("map_meta_sha256"),
+                    }
+                    if status.message in ("STALE", "FAILED"):
+                        self.reject(values.get("reason", status.message))
+
+    def live_target(self):
+        if not self.result or not self.status or self.world_from_camera is None or not self.base:
+            return None
+        result, result_wall = self.result
+        status, status_wall = self.status
+        if not confirmed(result, status, self.settings) or time.monotonic() - status_wall > FRESH:
+            return None
+        now = rospy.Time.now().to_sec()
+        if now - status["stamp"] > FRESH or result["stamp"] - now > 0.01:
+            return None
+        if time.monotonic() - result_wall > FRESH and self.capture:
+            return None
+        base_end = self.base[-1][0]
+        anchor = base_end if self.capture else next((t for t, _, _ in reversed(self.ywl) if t <= base_end), 0)
+        # ROS bag time can lag the scan-end header by a few milliseconds.
+        if now - anchor / NS > FRESH or anchor / NS < result["stamp"] - FRESH:
+            return None
+        source = Path(result["map"]).resolve(strict=True)
+        if source != self.map_dir and map_identity(source) != self.identity:
+            raise ValueError("relocalizer confirmed a different prior map")
+        if not stationary(self.base, anchor, self.settings):
+            return None
+        point = at_stamp(self.base, anchor)
+        return (anchor, decode_pose(result["transform"]) @ self.world_from_camera @ point, result, status)
+
+    def step(self):
+        with self.lock:
+            if self.done or self.invalid:
+                return
+            try:
+                self.try_initialize()
+            except (ValueError, TypeError, KeyError, OSError) as exc:
+                self.reject(exc)
+
+    def try_initialize(self):
+        if not self.capture and self.engine_identity != self.identity:
+            if self.engine_identity and all(self.engine_identity.values()):
+                raise ValueError("YWL engine and adapter map identities differ")
+            return
+        if self.seed:
+            anchor, target = self.seed["anchor_ns"], self.target
+            if not self.ywl or self.ywl[-1][0] < anchor:
+                return
+            if self.ywl[-1][0] - anchor > int(FRESH * NS):
+                raise ValueError("seed anchor expired before a stationary timestamp pair was available")
+        else:
+            live = self.live_target()
+            if live is None:
+                return
+            anchor, target, result, status = live
+            if self.capture:
+                if map_identity(self.map_dir) != self.identity:
+                    raise ValueError("map changed during initialization")
+                seed = {"schema_version": 1, "anchor_ns": anchor, "map_sha256": self.identity,
+                        "map_from_imu": encode_pose(target),
+                        "map_from_camera": encode_pose(decode_pose(result["transform"]) @ self.world_from_camera),
+                        "result": result, "status": status}
+                with Path(self.capture).open("x") as stream:
+                    json.dump(seed, stream, indent=2, allow_nan=False)
+                self.done = True
+                rospy.loginfo("Captured confirmed initialization at %d", anchor)
+                return
+        if self.pub.get_num_connections() == 0 or not stationary(self.ywl, anchor, self.settings):
+            return
+        if map_identity(self.map_dir) != self.identity:
+            raise ValueError("map changed during initialization")
+        local = at_stamp(self.ywl, anchor)
+        alignment = encode_pose(target @ np.linalg.inv(local))
+        msg = TransformStamped()
+        msg.header.stamp = rospy.Time(anchor // NS, anchor % NS)
+        msg.header.frame_id = "drone_map"
+        msg.child_frame_id = "ywl_odom"
+        msg.transform.translation.x, msg.transform.translation.y, msg.transform.translation.z = alignment["translation"]
+        (msg.transform.rotation.x, msg.transform.rotation.y,
+         msg.transform.rotation.z, msg.transform.rotation.w) = alignment["q_xyzw"]
+        self.pub.publish(msg)
+        self.done = True
+        rospy.loginfo("Sent confirmed YWL initialization at %d", anchor)
+
+
+def main():
+    rospy.init_node("ywl_init_adapter")
+    try:
+        adapter = Adapter()
+    except (ValueError, KeyError, OSError) as exc:
+        rospy.logfatal("YWL initialization cannot start: %s", exc)
+        return 2
+    while not rospy.is_shutdown():
+        adapter.step()
+        time.sleep(0.02)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

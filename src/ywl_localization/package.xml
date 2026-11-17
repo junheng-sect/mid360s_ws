@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>ywl_localization</name>
+  <version>0.1.0</version>
+  <description>Isolated MID360S fixed-map LiDAR-inertial localization experiment.</description>
+  <maintainer email="maintainers@example.com">mid360s_ws maintainers</maintainer>
+  <license>GPL-2.0</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>roscpp</depend>
+  <depend>rospy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>pcl_conversions</depend>
+  <depend>livox_ros_driver2</depend>
+  <build_depend>eigen</build_depend>
+  <build_depend>libpcl-all-dev</build_depend>
+  <build_depend>libssl-dev</build_depend>
+  <exec_depend>drone_relocalization</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
+  <exec_depend>rosbag</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+</package>

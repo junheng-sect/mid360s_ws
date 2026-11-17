@@ -1,0 +1,15 @@
+<launch>
+  <arg name="map_dir" />
+  <arg name="seed_file" default="" />
+  <arg name="calibration" default="$(find ywl_localization)/config/mid360s.yaml" />
+  <arg name="publish_cloud" default="false" />
+  <node pkg="ywl_localization" type="ywl_localization_node" name="ywl_localization" output="screen">
+    <rosparam command="load" file="$(arg calibration)" />
+    <param name="map_dir" type="string" value="$(arg map_dir)" />
+    <param name="publish_cloud" type="bool" value="$(arg publish_cloud)" />
+  </node>
+  <node pkg="ywl_localization" type="ywl_init_adapter" name="ywl_init_adapter" output="screen">
+    <param name="map_dir" type="string" value="$(arg map_dir)" />
+    <param name="seed_file" type="string" value="$(arg seed_file)" />
+  </node>
+</launch>

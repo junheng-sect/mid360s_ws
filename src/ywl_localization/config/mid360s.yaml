@@ -1,0 +1,14 @@
+# Initial comparison settings from FAST_LIO/config/mid360s.yaml and mapping_mid360s.launch.
+blind: 0.5
+scan_lines: 4
+point_filter_num: 3
+max_iterations: 3
+filter_size_surf: 0.5
+filter_size_bootstrap: 0.5
+extrinsic_T: [-0.011, -0.02329, 0.04412]
+extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+time_offset_lidar_to_imu: 0.0
+acc_cov: 0.1
+gyr_cov: 0.1
+b_acc_cov: 0.0001
+b_gyr_cov: 0.0001
