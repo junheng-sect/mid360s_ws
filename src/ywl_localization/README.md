@@ -77,3 +77,15 @@ rosrun ywl_localization ywl_replay ywl --map "$map" --bag "$bag" \
 python3 src/ywl_localization/test/compare_replay.py --seed "$out/seed/seed.json" \
   --baseline "$out/baseline" --ywl "$out/ywl" --out "$out/comparison.json"
 ```
+
+The replay comparison reports matched trajectory separation, end-to-end listener latency,
+processing time, queue depth, output coverage, and process CPU/RSS. It uses the same confirmation
+for both trajectories. Without independently surveyed reference points, separation and endpoint
+displacement measure consistency.
+
+Run the ROS fault and interface checks after the full YWL replay:
+
+```bash
+python3 src/ywl_localization/test/test_ros_faults.py --bag "$bag" --map "$map" \
+  --ywl "$out/ywl" --seed "$out/seed/seed.json" --out "$out/faults" --port 11582
+```

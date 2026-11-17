@@ -43,7 +43,8 @@ def summarize(folder, anchor):
     resource_wall = resources["wall_s"]
     cpu_total = resources["cpu_s"][-1] - resources["cpu_s"][0]
     result = dict(
-        raw_scans=len(sensor_stamps), odom_count=len(output_stamps),
+        raw_scans=len(sensor_stamps),
+        publication_stamp_monotonic=bool(np.all(np.diff(output_stamps) > 0)), odom_count=len(output_stamps),
         expected_scans_after_anchor=expected,
         published_scans_after_anchor=len(np.unique(idx[keep & (sensor_stamps[idx] >= anchor)])),
         first_valid_s=float((output_stamps[0] - sensor_stamps[0]) / 1e9) if len(output_stamps) else None,
@@ -58,6 +59,8 @@ def summarize(folder, anchor):
             observed_tracking_scans=len(frames),
             scan_processing_ms=quantile([float(d["processing_ms"]) for d in frames]),
             queue_to_process_ms=quantile([float(d["receive_to_process_ms"]) for d in frames]),
+            callback_to_publish_ms=quantile([float(d["receive_to_process_ms"]) + float(d["processing_ms"])
+                                             for d in frames]),
             lidar_interval_ms=quantile([float(d["lidar_interval_ms"]) for d in frames]),
             residual_m=quantile([float(d["residual_mean_m"]) for d in frames]),
             match_fraction=quantile([float(d["match_fraction"]) for d in frames]),
