@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Drive the native rosbag recorder from the board's Channel 6 policy."""
 from datetime import datetime
+import json
 from pathlib import Path
 import signal
 import subprocess
@@ -10,6 +11,7 @@ import time
 
 import rospy
 from mavros_msgs.msg import RCIn
+from std_msgs.msg import String
 
 TOPICS = (
     "/livox/lidar", "/livox/imu", "/Odometry", "/fastlio/gravity_init", "/fastlio/odom_world",
@@ -131,7 +133,25 @@ def main():
     if tuple(options) not in optional:
         raise SystemExit("请选择 --dll 或 --ywl")
     topics = TOPICS + optional[tuple(options)]
-    return OutdoorRecorder(Path(directory), session, stopped, topics).run()
+    if tuple(options) != ("--dll",):
+        return OutdoorRecorder(Path(directory), session, stopped, topics).run()
+
+    publisher = rospy.Publisher("/test12/observer", String, queue_size=1, latch=True)
+    note_path = Path(directory)/"dll_unavailable.txt"
+
+    def announce(_event=None):
+        try:
+            note = note_path.read_text().strip()
+        except OSError:
+            note = ""
+        publisher.publish(String(data=json.dumps(dict(mode="dll", run=directory, note=note), ensure_ascii=False)))
+
+    announce()
+    timer = rospy.Timer(rospy.Duration(1), announce)
+    try:
+        return OutdoorRecorder(Path(directory), session, stopped, topics + ("/test12/observer",)).run()
+    finally:
+        timer.shutdown()
 
 
 if __name__ == "__main__":

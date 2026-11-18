@@ -45,6 +45,8 @@ def fixture(args):
     for directory in (source_map, source_map.with_name(source_map.name + "_screenshot_roi")):
         directory.mkdir(parents=True)
         for filename in ("map_world.pcd", "meta.json", "manifest.json"):
+            if args.mode == "dll-missing" and directory != source_map and filename == "map_world.pcd":
+                continue
             (directory / filename).write_text("test fixture only\n")
     config = workspace / "src/drone_relocalization/config"
     config.mkdir(parents=True)
@@ -148,7 +150,7 @@ def main():
     parser.add_argument("--devel", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--port", type=int, required=True, choices=range(11600, 11700), metavar="116xx")
-    parser.add_argument("--mode", choices=("ywl", "dll", "original"), default="ywl")
+    parser.add_argument("--mode", choices=("ywl", "dll", "dll-missing", "original"), default="ywl")
     args = parser.parse_args()
     supervisor, fixtures, home, bins, source_map = fixture(args)
     os.environ.update(ROS_MASTER_URI=f"http://127.0.0.1:{args.port}", ROS_HOSTNAME="127.0.0.1",
@@ -171,7 +173,7 @@ def main():
         env = dict(os.environ, HOME=str(home), FIXTURE=str(fixtures), PATH=f"{bins}:{os.environ['PATH']}",
                    WAREHOUSE_TASK_ID="1" * 32, TMUX="fixture")
         with output.open("w") as stream:
-            flags = {"ywl": ["--ywl"], "dll": [], "original": ["--no-dll"]}[args.mode]
+            flags = {"ywl": ["--ywl"], "dll": [], "dll-missing": [], "original": ["--no-dll"]}[args.mode]
             runner = subprocess.Popen([str(supervisor), *flags], env=env, start_new_session=True,
                                       stdout=stream, stderr=subprocess.STDOUT)
         contains = lambda text: text in output.read_text()
@@ -185,6 +187,9 @@ def main():
             probe = supervisor.parent / "nav_test/test12_state.py"
             result = subprocess.run(["python3", "-B", str(probe), "ywl"], timeout=8)
             assert result.returncode == 1 and runner.poll() is None and list(home.rglob("*.bag.active"))
+        if args.mode == "dll-missing":
+            wait(lambda: contains("DLL 进程已退出"), "missing observer did not report its failure")
+            assert runner.poll() is None and list(home.rglob("*.bag.active"))
         telemetry.armed = True
         time.sleep(.35)
         runner.send_signal(signal.SIGTERM)

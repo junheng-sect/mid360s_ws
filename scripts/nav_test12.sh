@@ -57,7 +57,7 @@ if (( DRY_RUN )); then
     "启动：Channel 6 录包待命 → fusion.sh --no-record --no-camera --no-winch --ev-mode $EV_MODE → 室外重定位" \
     "录包目录：$HOME/test_data/nav_test/<时间>_test12/"
   if (( USE_DLL )); then
-    printf '%s\n' "DLL 裁图：$DLL_MAP（10 cm，1280 MiB）"
+    printf '%s\n' "DLL 旁路对照，主定位 FAST-LIO2。DLL 裁图：$DLL_MAP（10 cm，1280 MiB）"
   elif (( USE_YWL )); then
     printf '%s\n' "YWL 裁图：$YWL_MAP" 'YWL 启动里程计就绪 → 室外重定位 → YWL TRACKING'
   else
@@ -87,15 +87,7 @@ for file in "$WS_SETUP" "$DIR/fusion.sh" "$DIR/ros_net.sh" "$PROBE" \
 done
 [[ -x "$RECORDER" ]] || { echo "找不到内部录包器：$RECORDER" >&2; exit 1; }
 source "$ROS_SETUP" && source "$WS_SETUP" || exit 1
-if (( USE_DLL )); then
-  [[ -r "$ORANGE_SETUP" ]] || { echo '缺少 Orange 构建，请先部署 DLL 或使用 --no-dll' >&2; exit 1; }
-  source "$ORANGE_SETUP" --extend || exit 1
-  DLL_PACKAGE=$(rospack find fastlio_dll) || exit 1
-  DLL_CONFIG="$DLL_PACKAGE/config/outdoor_large_field.yaml"
-  for file in "$DLL_CONFIG" "$DLL_MAP/map_world.pcd" "$DLL_MAP/meta.json" "$DLL_MAP/manifest.json"; do
-    [[ -r "$file" ]] || { echo "缺少 $file" >&2; exit 1; }
-  done
-elif (( USE_YWL )); then
+if (( USE_YWL )); then
   YWL_PACKAGE=$(rospack find ywl_localization) || { echo '缺少 YWL 构建，请先部署' >&2; exit 1; }
   YWL_CONFIG="$YWL_PACKAGE/config/mid360s.yaml"
   for file in "$YWL_CONFIG" "$YWL_MAP/map_world.pcd" "$YWL_MAP/meta.json" "$YWL_MAP/manifest.json"; do
@@ -217,8 +209,6 @@ bringup12() {
   sha256sum "$MAP/map_world.pcd" "$MAP/meta.json" "$RELOC_CONFIG" >"$OUT/map.sha256" || return 1
   local record_args=("$OUT")
   if (( USE_DLL )); then
-    sha256sum "$DLL_MAP/map_world.pcd" "$DLL_MAP/meta.json" "$DLL_MAP/manifest.json" "$DLL_CONFIG" >>"$OUT/map.sha256" || return 1
-    cp -- "$DLL_CONFIG" "$OUT/dll_config.yaml" && cp -- "$DLL_MAP/manifest.json" "$OUT/dll_map_manifest.json" || return 1
     record_args+=(--dll)
   elif (( USE_YWL )); then
     sha256sum "$YWL_MAP/map_world.pcd" "$YWL_MAP/meta.json" "$YWL_MAP/manifest.json" "$YWL_CONFIG" >>"$OUT/map.sha256" || return 1
@@ -258,20 +248,10 @@ bringup12() {
     reloc_cmd=(env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 "${reloc_cmd[@]}")
   fi
   start_child "$PF_RELOC" "$OUT/reloc.log" "${reloc_cmd[@]}"
-  if (( USE_DLL )); then
-    log 'DLL 正在建立距离场并等待本次重定位确认'
-    start_child "$PF_DLL" "$OUT/dll.log" roslaunch fastlio_dll observe.launch \
-      "map_dir:=$DLL_MAP" "legacy_map_dir:=$MAP" "config:=$DLL_CONFIG"
-    setsid tail -n +1 -F --pid="$$" "$OUT/dll.log" &
-    tail_pids+=("$!")
-  fi
   wait_stage reloc 150 "$PF_RECORD" "$PF_FUSION" "$PF_RELOC" || { err '室外重定位未确认，查看 reloc.log'; return 1; }
   local ready='室外重定位已确认'
   if (( USE_DLL )); then
-    wait_stage dll 150 "$PF_RECORD" "$PF_FUSION" "$PF_RELOC" "$PF_DLL" ||
-      { err 'DLL 未进入 TRACKING，查看 dll.log；可用 --no-dll 重新启动手飞录包'; return 1; }
-    timeout 5 rosparam dump "$OUT/dll_params.yaml" /fastlio_dll || return 1
-    ready+='，DLL TRACKING'
+    ready+='，FAST-LIO2 主定位就绪，DLL 旁路分析'
   elif (( USE_YWL )); then
     wait_stage ywl 15 "$PF_RECORD" "$PF_FUSION" "$PF_RELOC" "$PF_YWL" ||
       { err 'YWL 未进入 TRACKING，查看 ywl.log'; return 1; }
@@ -280,6 +260,22 @@ bringup12() {
   fi
   check_ground || return 1
   ok "$ready。拨 Channel 6 开包，保持静止录够 20 秒，再按原流程手飞"
+  if (( USE_DLL )); then
+    log 'DLL 正在建立距离场，旁路差值就绪后自动显示'
+    # Load the optional overlay and fingerprint its inputs in its own child.
+    start_child "$PF_DLL" "$OUT/dll.log" bash -c '
+      set -e
+      source "$1" --extend
+      pkg=$(rospack find fastlio_dll)
+      config="$pkg/config/outdoor_large_field.yaml"
+      sha256sum "$2/map_world.pcd" "$2/meta.json" "$2/manifest.json" "$config" >> "$4/map.sha256"
+      cp -- "$config" "$4/dll_config.yaml"
+      cp -- "$2/manifest.json" "$4/dll_map_manifest.json"
+      exec roslaunch fastlio_dll observe.launch "map_dir:=$2" "legacy_map_dir:=$3" "config:=$config"
+    ' _ "$ORANGE_SETUP" "$DLL_MAP" "$MAP" "$OUT"
+    setsid tail -n +1 -F --pid="$$" "$OUT/dll.log" &
+    tail_pids+=("$!")
+  fi
   log '落地静止后拨回 Channel 6 封包。上锁后 Ctrl+C 收尾'
 }
 
@@ -295,6 +291,9 @@ while :; do
     file_var="PF_$stage"
     pidfile="${!file_var}"
     if [[ -s "$pidfile" ]] && ! child_pid "$pidfile" >/dev/null && [[ "$reported" != *" $stage "* ]]; then
+      if [[ "$stage" == DLL ]]; then
+        printf '%s\n' 'DLL 进程已退出，请查看 dll.log' > "$OUT/dll_unavailable.txt"
+      fi
       warn "$stage 进程已退出，查看 $OUT 下的日志。其余组件保持运行"
       reported="$reported$stage "
     fi
