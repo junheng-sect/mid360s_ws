@@ -23,17 +23,47 @@ from drone_relocalization.settings import load
 NS = 10**9
 FRESH = 0.5
 MAX_BRACKET_NS = 150_000_000
+RELOC_STATUS_FRESH = 2.5
+MAP_FILES = ("map_world.pcd", "meta.json")
 
 
 def map_identity(path):
     result = {}
-    for name in ("map_world.pcd", "meta.json"):
+    for name in MAP_FILES:
         digest = hashlib.sha256()
         with (Path(path) / name).open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
         result[name] = digest.hexdigest()
     return result
+
+
+def map_version(path):
+    versions = []
+    for name in MAP_FILES:
+        info = (path / name).stat()
+        versions.append((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+    return tuple(versions)
+
+
+def verify_maps(prior, source):
+    """Accept the original map or a verified crop in the same drone_map frame."""
+    folders = {prior, source}
+    versions = {folder: map_version(folder) for folder in folders}
+    identities = {folder: map_identity(folder) for folder in folders}
+    if prior != source:
+        manifest_path = prior / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        legacy = manifest["source"]
+        if (manifest["map_frame"] != "drone_map" or Path(legacy["map_dir"]).resolve() != source
+                or Path(manifest["map_dir"]).resolve() != prior
+                or any(manifest["sha256"][name] != identities[prior][name] for name in MAP_FILES)
+                or legacy["map_sha256"] != identities[source]["map_world.pcd"]
+                or legacy["meta_sha256"] != identities[source]["meta.json"]):
+            raise ValueError("YWL prior crop does not match the original drone_map")
+    if any(map_version(folder) != version for folder, version in versions.items()):
+        raise ValueError("map changed during verification")
+    return identities[prior], versions
 
 
 def pose(translation, quaternion):
@@ -107,13 +137,21 @@ def stationary(history, anchor_ns, settings):
     return True
 
 
-def confirmed(result, status, settings):
+def confirmed(result, status, settings, max_status_delay=FRESH):
     required = max(2, settings["confirmations"])
+    stamps = (result.get("stamp"), status.get("stamp"))
+    if not all(type(value) in (int, float) and math.isfinite(value) and value > 0 for value in stamps):
+        return False
     return (result.get("schema_version") == status.get("schema_version") == 2
             and result.get("confirmed") is True and result.get("ok") is True
             and status.get("valid") is True and status.get("state") == "LOCALIZED"
             and status.get("confirmations", 0) >= required and
-            0 <= status["stamp"] - result["stamp"] <= FRESH)
+            status["stamp"] >= result["stamp"]
+            and (max_status_delay is None or status["stamp"] - result["stamp"] <= max_status_delay))
+
+
+def publisher(message):
+    return (getattr(message, "_connection_header", None) or {}).get("callerid")
 
 
 class Adapter:
@@ -121,15 +159,19 @@ class Adapter:
         self.lock = threading.Lock()
         self.done = False
         self.invalid = False
+        self.started_ns = rospy.Time.now().to_nsec()
         self.map_dir = Path(rospy.get_param("~map_dir")).resolve(strict=True)
-        self.identity = map_identity(self.map_dir)
+        legacy_map = rospy.get_param("~legacy_map_dir", "")
+        self.source_dir = Path(legacy_map).resolve(strict=True) if legacy_map else self.map_dir
+        self.identity, self.map_versions = verify_maps(self.map_dir, self.source_dir)
         self.settings = load(rospy.get_param("~reloc_config", None))
         seed_path = rospy.get_param("~seed_file", "")
         self.capture = rospy.get_param("~capture_seed", "")
         self.seed = None
         if seed_path:
             self.seed = json.loads(Path(seed_path).read_text())
-            if self.capture or self.seed["schema_version"] != 1 or self.seed["map_sha256"] != self.identity:
+            if (self.capture or legacy_map or self.seed["schema_version"] != 1
+                    or self.seed["map_sha256"] != self.identity):
                 raise ValueError("seed mode or map identity mismatch")
             if not confirmed(self.seed["result"], self.seed["status"], self.settings):
                 raise ValueError("seed was not confirmed")
@@ -140,6 +182,9 @@ class Adapter:
         self.ywl = deque(maxlen=40)
         self.result = self.status = None
         self.world_from_camera = None
+        self.gravity_stamp = 0
+        self.first_bootstrap_stamp = 0
+        self.map_tf = None
         self.engine_identity = None
         self.pub = rospy.Publisher("/ywl/initial_transform", TransformStamped, queue_size=1, latch=True)
         self.subs = []
@@ -152,6 +197,7 @@ class Adapter:
             self.subs += [
                 rospy.Subscriber("/Odometry", Odometry, self.on_odom, callback_args=False, queue_size=15),
                 rospy.Subscriber("/tf_static", TFMessage, self.on_tf, queue_size=10),
+                rospy.Subscriber("/tf", TFMessage, self.on_map_tf, queue_size=10),
                 rospy.Subscriber("/drone_reloc/result", String, self.on_json, callback_args="result", queue_size=4),
                 rospy.Subscriber("/drone_reloc/status", String, self.on_json, callback_args="status", queue_size=4),
             ]
@@ -176,6 +222,8 @@ class Adapter:
             try:
                 transform = ros_pose(msg.pose.pose.position, msg.pose.pose.orientation)
                 history.append((stamp, transform, time.monotonic()))
+                if bootstrap and not self.first_bootstrap_stamp:
+                    self.first_bootstrap_stamp = stamp
             except ValueError as exc:
                 self.reject(exc)
 
@@ -188,12 +236,29 @@ class Adapter:
                     continue
                 try:
                     transform = ros_pose(tr.transform.translation, tr.transform.rotation)
-                    if self.world_from_camera is not None and not np.allclose(
-                            transform, self.world_from_camera, atol=1e-9, rtol=0):
+                    stamp = tr.header.stamp.to_nsec()
+                    if self.world_from_camera is not None and (
+                            stamp != self.gravity_stamp or not np.allclose(
+                                transform, self.world_from_camera, atol=1e-9, rtol=0)):
                         raise ValueError("baseline gravity transform changed")
                     self.world_from_camera = transform
+                    self.gravity_stamp = stamp
                 except ValueError as exc:
                     self.reject(exc)
+
+    def on_map_tf(self, msg):
+        with self.lock:
+            if self.done or self.invalid:
+                return
+            for tr in msg.transforms:
+                if (tr.header.frame_id, tr.child_frame_id) != ("drone_map", "drone_odom"):
+                    continue
+                try:
+                    transform = ros_pose(tr.transform.translation, tr.transform.rotation)
+                except ValueError:
+                    self.map_tf = None
+                    return
+                self.map_tf = (transform, tr.header.stamp.to_nsec(), time.monotonic(), publisher(msg))
 
     def on_json(self, msg, key):
         with self.lock:
@@ -203,7 +268,7 @@ class Adapter:
                 value = json.loads(msg.data)
                 if not isinstance(value, dict):
                     raise ValueError("expected relocalization JSON object")
-                setattr(self, key, (value, time.monotonic()))
+                setattr(self, key, (value, time.monotonic(), publisher(msg)))
             except ValueError as exc:
                 self.reject(exc)
 
@@ -222,29 +287,36 @@ class Adapter:
                         self.reject(values.get("reason", status.message))
 
     def live_target(self):
-        if not self.result or not self.status or self.world_from_camera is None or not self.base:
+        if not self.result or not self.status or self.world_from_camera is None or not self.base or not self.map_tf:
             return None
-        result, result_wall = self.result
-        status, status_wall = self.status
-        if not confirmed(result, status, self.settings) or time.monotonic() - status_wall > FRESH:
+        result, _, result_publisher = self.result
+        status, status_wall, status_publisher = self.status
+        map_from_world, tf_stamp, tf_wall, tf_publisher = self.map_tf
+        now_wall = time.monotonic()
+        if (not result_publisher or result_publisher != status_publisher or result_publisher != tf_publisher
+                or not confirmed(result, status, self.settings, max_status_delay=None)
+                or now_wall - status_wall > RELOC_STATUS_FRESH or now_wall - tf_wall > FRESH):
             return None
-        now = rospy.Time.now().to_sec()
-        if now - status["stamp"] > FRESH or result["stamp"] - now > 0.01:
+        now = rospy.Time.now().to_nsec()
+        result_stamp = round(result["stamp"] * NS)
+        epoch = max(self.started_ns, self.gravity_stamp, self.first_bootstrap_stamp)
+        if (result_stamp < epoch or tf_stamp < epoch or not -0.05 <= now / NS - status["stamp"] <= RELOC_STATUS_FRESH
+                or now < result_stamp - int(0.05 * NS) or not -0.05 <= (now - tf_stamp) / NS <= FRESH):
             return None
-        if time.monotonic() - result_wall > FRESH and self.capture:
+        if not np.allclose(map_from_world, decode_pose(result["transform"]), atol=1e-4, rtol=0):
             return None
         base_end = self.base[-1][0]
         anchor = base_end if self.capture else next((t for t, _, _ in reversed(self.ywl) if t <= base_end), 0)
         # ROS bag time can lag the scan-end header by a few milliseconds.
-        if now - anchor / NS > FRESH or anchor / NS < result["stamp"] - FRESH:
+        if (now - anchor) / NS > FRESH or (result_stamp - anchor) / NS > FRESH:
             return None
         source = Path(result["map"]).resolve(strict=True)
-        if source != self.map_dir and map_identity(source) != self.identity:
+        if source != self.source_dir:
             raise ValueError("relocalizer confirmed a different prior map")
         if not stationary(self.base, anchor, self.settings):
             return None
         point = at_stamp(self.base, anchor)
-        return (anchor, decode_pose(result["transform"]) @ self.world_from_camera @ point, result, status)
+        return (anchor, map_from_world @ self.world_from_camera @ point, result, status)
 
     def step(self):
         with self.lock:
@@ -272,7 +344,7 @@ class Adapter:
                 return
             anchor, target, result, status = live
             if self.capture:
-                if map_identity(self.map_dir) != self.identity:
+                if any(map_version(folder) != version for folder, version in self.map_versions.items()):
                     raise ValueError("map changed during initialization")
                 seed = {"schema_version": 1, "anchor_ns": anchor, "map_sha256": self.identity,
                         "map_from_imu": encode_pose(target),
@@ -285,7 +357,7 @@ class Adapter:
                 return
         if self.pub.get_num_connections() == 0 or not stationary(self.ywl, anchor, self.settings):
             return
-        if map_identity(self.map_dir) != self.identity:
+        if any(map_version(folder) != version for folder, version in self.map_versions.items()):
             raise ValueError("map changed during initialization")
         local = at_stamp(self.ywl, anchor)
         alignment = encode_pose(target @ np.linalg.inv(local))
@@ -305,7 +377,7 @@ def main():
     rospy.init_node("ywl_init_adapter")
     try:
         adapter = Adapter()
-    except (ValueError, KeyError, OSError) as exc:
+    except (ValueError, TypeError, KeyError, OSError) as exc:
         rospy.logfatal("YWL initialization cannot start: %s", exc)
         return 2
     while not rospy.is_shutdown():

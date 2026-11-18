@@ -19,6 +19,8 @@ TOPICS = (
 RECORDER = "/opt/ros/noetic/lib/rosbag/record"
 DLL_TOPICS = ("/drone_reloc/pose", "/dll_localization/pose", "/dll_localization/correction",
               "/dll_localization/status")
+YWL_TOPICS = ("/drone_reloc/pose", "/fastlio/velocity", "/ywl/bootstrap_odom",
+              "/ywl/initial_transform", "/ywl/odom", "/ywl/velocity", "/ywl/status")
 CHANNEL_INDEX = 5
 THRESHOLD_US = 1650
 
@@ -125,7 +127,10 @@ def main():
         signal.signal(sig, lambda *_: stopped.set())
     rospy.loginfo("等待 Channel 6：先拨到关闭位，再拨到录制位。输出目录 %s", directory)
     session = RcRecordSession(confirm_samples=3, release_tail_s=1.0)
-    topics = TOPICS + DLL_TOPICS if options == ["--dll"] else TOPICS
+    optional = {(): (), ("--dll",): DLL_TOPICS, ("--ywl",): YWL_TOPICS}
+    if tuple(options) not in optional:
+        raise SystemExit("请选择 --dll 或 --ywl")
+    topics = TOPICS + optional[tuple(options)]
     return OutdoorRecorder(Path(directory), session, stopped, topics).run()
 
 

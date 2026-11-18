@@ -7,7 +7,7 @@ import sys
 import time
 
 from diagnostic_msgs.msg import DiagnosticArray
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped, Vector3Stamped
 from mavros_msgs.msg import ExtendedState, State
 from nav_msgs.msg import Odometry
 import rosgraph
@@ -55,6 +55,26 @@ def dll_ready(samples):
     return False
 
 
+def ywl_ready(samples, bootstrap=False):
+    topic = "/ywl/bootstrap_odom" if bootstrap else "/ywl/odom"
+    odom = samples.get(topic)
+    diagnostics = samples.get("/ywl/status")
+    if not (fresh(odom, .5) and fresh(diagnostics, .5)
+            and odom.header.frame_id == ("ywl_odom" if bootstrap else "drone_map")
+            and odom.child_frame_id == "ywl_imu" and valid_pose(odom.pose.pose)
+            and odom.header.stamp == diagnostics.header.stamp):
+        return False
+    if not bootstrap:
+        velocity = samples.get("/ywl/velocity")
+        if not (fresh(velocity, .5) and velocity.header.frame_id == "drone_map"
+                and velocity.header.stamp == odom.header.stamp
+                and all(map(math.isfinite, (velocity.vector.x, velocity.vector.y, velocity.vector.z)))):
+            return False
+    return any(status.name == "ywl_localization"
+               and status.message == ("WAITING_INIT" if bootstrap else "TRACKING")
+               and status.level == (1 if bootstrap else 0) for status in diagnostics.status)
+
+
 def check(stage, map_dir):
     if stage == "recorder":
         master = rosgraph.Master("/test12_recorder_probe")
@@ -72,6 +92,8 @@ def check(stage, map_dir):
         "fastlio": [("/fastlio/odom_world", Odometry)],
         "dll": [("/dll_localization/pose", PoseStamped), ("/dll_localization/correction", TransformStamped),
                 ("/dll_localization/status", DiagnosticArray)],
+        "ywl-bootstrap": [("/ywl/bootstrap_odom", Odometry), ("/ywl/status", DiagnosticArray)],
+        "ywl": [("/ywl/odom", Odometry), ("/ywl/velocity", Vector3Stamped), ("/ywl/status", DiagnosticArray)],
         "reloc": [("/drone_reloc/result", String), ("/drone_reloc/status", String),
                   ("/drone_reloc/pose", PoseStamped)],
     }[stage]
@@ -90,6 +112,8 @@ def check(stage, map_dir):
                     and odom.child_frame_id == "drone_base" and valid_pose(odom.pose.pose))
         if stage == "dll":
             return dll_ready(samples)
+        if stage in ("ywl", "ywl-bootstrap"):
+            return ywl_ready(samples, bootstrap=stage == "ywl-bootstrap")
         result = decode(samples.get("/drone_reloc/result"))
         status = decode(samples.get("/drone_reloc/status"))
         pose = samples.get("/drone_reloc/pose")
@@ -114,7 +138,7 @@ def check(stage, map_dir):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("ground", "fastlio", "reloc", "recorder", "dll"))
+    parser.add_argument("stage", choices=("ground", "fastlio", "reloc", "recorder", "dll", "ywl", "ywl-bootstrap"))
     parser.add_argument("map_dir", nargs="?")
     args = parser.parse_args()
     if not check(args.stage, args.map_dir):

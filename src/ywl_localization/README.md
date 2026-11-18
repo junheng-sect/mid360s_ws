@@ -53,6 +53,29 @@ The fixed tree receives no additions or deletions. Take velocity from the separa
 `TRACKING` means the filter produced a finite update with valid point-to-plane observations.
 `STALE` and `FAILED` stop valid output and require a fresh process with a new initialization.
 
+## Outdoor test12 manual flight
+
+On the board, run `~/mid360s_ws/scripts/nav_test12.sh --ywl` or select **test12 · YWL**
+under the outdoor map in the warehouse monitor. Keep the aircraft still at the takeoff point
+until YWL reports TRACKING. Flip Channel 6 to record, confirm recording, and leave 20 seconds of
+stationary data before the pilot takes off. Once grounded and disarmed, flip Channel 6 back and
+wait for the bag to seal before ending the task. The plain test12 command selects DLL.
+
+FAST-LIO2 and the existing gravity bridge supply PX4. YWL tracks against the verified
+`20261105_114605_outdoor_screenshot_roi` crop after the original map relocalizer confirms.
+The adapter checks the live result, status and map TF against the current session. The
+monitor displays the YWL map pose and falls back to the valid FAST-LIO2 map pose if YWL fails.
+Test12 saves the YWL topics along with the raw sensors, the flight telemetry, map digests,
+parameters and versions under `~/test_data/nav_test/<timestamp>_test12/`.
+
+Use the board workspace's existing catkin configuration and build `ywl_localization` before
+launching test12. The joint replay entry is `scripts/nav_test/tests/test12_ywl_replay.py`.
+For the archived `outdoor_dll_ywl_20261117_164338.bag`, pass `--airborne 22.175 202.179`
+and `--preload-relocalizer` to load the original map before the 1× playback starts.
+The first attempt that loaded the original map after bootstrap reached the second window
+near the end of the short recorded stillness period and failed the original 2D score threshold.
+The replay with preload accepted both windows online with the original thresholds.
+
 ## Isolated replay
 
 The runner uses its own ROS master and publishes only the raw LiDAR and IMU topics from the bag.

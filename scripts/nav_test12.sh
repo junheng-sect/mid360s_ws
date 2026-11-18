@@ -7,18 +7,22 @@ source "$(dirname -- "$SELF")/nav_test/common.sh" || exit 1
 MAP="$MAP_ROOT/20261105_114605_outdoor"
 RELOC_CONFIG="$WS/src/drone_relocalization/config/outdoor.yaml"
 DLL_MAP="${MAP}_screenshot_roi"
+YWL_MAP="${MAP}_screenshot_roi"
 RECORDER="$DIR/rc_record/record_outdoor_dll_ywl"
 PROBE="$NT_DIR/test12_state.py"
 TASK_ID=${WAREHOUSE_TASK_ID:-}
 EV_MODE=pose
 USE_DLL=1
+USE_YWL=0
+NO_DLL=0
 DRY_RUN=0
 args=("$@")
 
 usage() {
   cat <<'HELP'
-用法：nav_test12.sh [--ev-mode pose|odom] [--no-dll] [--dry-run]
+用法：nav_test12.sh [--ev-mode pose|odom] [--ywl|--no-dll] [--dry-run]
 室外 test12：启动 FAST-LIO2、室外重定位、DLL 和 Channel 6 录包，人工遥控飞行。
+--ywl 选择 YWL 地图定位，FAST-LIO2 继续给飞控供数。
 --no-dll 按原手飞流程录包。
 默认 pose。--dry-run 仅显示启动配置。
 SSH 断开后用 tmux attach -t nav12 接回。
@@ -32,13 +36,16 @@ while (( $# > 0 )); do
       EV_MODE=$2
       shift
       ;;
-    --no-dll) USE_DLL=0 ;;
+    --ywl) USE_YWL=1 ;;
+    --no-dll) NO_DLL=1 ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+if (( USE_YWL && NO_DLL )); then usage >&2; exit 2; fi
+if (( USE_YWL || NO_DLL )); then USE_DLL=0; fi
 
 if [[ -n "$TASK_ID" && ! "$TASK_ID" =~ ^[a-f0-9]{32}$ ]]; then
   echo '网页任务 ID 无效' >&2
@@ -51,6 +58,8 @@ if (( DRY_RUN )); then
     "录包目录：$HOME/test_data/nav_test/<时间>_test12/"
   if (( USE_DLL )); then
     printf '%s\n' "DLL 裁图：$DLL_MAP（10 cm，1280 MiB）"
+  elif (( USE_YWL )); then
+    printf '%s\n' "YWL 裁图：$YWL_MAP" 'YWL 启动里程计就绪 → 室外重定位 → YWL TRACKING'
   else
     printf '%s\n' 'DLL：关闭'
   fi
@@ -86,13 +95,19 @@ if (( USE_DLL )); then
   for file in "$DLL_CONFIG" "$DLL_MAP/map_world.pcd" "$DLL_MAP/meta.json" "$DLL_MAP/manifest.json"; do
     [[ -r "$file" ]] || { echo "缺少 $file" >&2; exit 1; }
   done
+elif (( USE_YWL )); then
+  YWL_PACKAGE=$(rospack find ywl_localization) || { echo '缺少 YWL 构建，请先部署' >&2; exit 1; }
+  YWL_CONFIG="$YWL_PACKAGE/config/mid360s.yaml"
+  for file in "$YWL_CONFIG" "$YWL_MAP/map_world.pcd" "$YWL_MAP/meta.json" "$YWL_MAP/manifest.json"; do
+    [[ -r "$file" ]] || { echo "缺少 $file" >&2; exit 1; }
+  done
 fi
 source "$DIR/ros_net.sh" || exit 1
 
 exec 199>"/tmp/mid360s-nav-test-$(id -u).lock"
 flock -n 199 || { echo '已有测试运行，请先收尾' >&2; exit 1; }
 nodes=$(timeout 5 rosnode list 2>/dev/null) || { echo '常驻 ROS master 不可达' >&2; exit 1; }
-conflicts=$(printf '%s\n' "$nodes" | awk '/^\/(laserMapping|gravity_bridge|drone_reloc|offboard_gateway|waypoint_manager|rc_bag_recorder|fastlio_dll|ywl_localization)$/ || /^\/outdoor_dll_ywl_record_/')
+conflicts=$(printf '%s\n' "$nodes" | awk '/^\/(laserMapping|gravity_bridge|drone_reloc|offboard_gateway|waypoint_manager|rc_bag_recorder|fastlio_dll|ywl_localization|ywl_init_adapter)$/ || /^\/outdoor_dll_ywl_record_/')
 if [[ -n "$conflicts" ]]; then
   printf '检测到已有定位、导航或录包节点，请先按原流程收尾：\n%s\n' "$conflicts" >&2
   exit 1
@@ -119,6 +134,7 @@ PF_FUSION="$RUN_DIR/fusion.pid"
 PF_RELOC="$RUN_DIR/reloc.pid"
 PF_RECORD="$RUN_DIR/record.pid"
 PF_DLL="$RUN_DIR/dll.pid"
+PF_YWL="$RUN_DIR/ywl.pid"
 tail_pids=()
 shutting_down=0
 
@@ -145,7 +161,8 @@ finish12() {
     shutting_down=0
     return 1
   fi
-  if ! stop_child "$PF_DLL" 'DLL 地图定位' INT 20 ||
+  if ! stop_child "$PF_YWL" 'YWL 地图定位' INT 20 ||
+     ! stop_child "$PF_DLL" 'DLL 地图定位' INT 20 ||
      ! stop_child "$PF_RELOC" '室外重定位' INT 12 ||
      ! stop_child "$PF_FUSION" 'fusion.sh' TERM 60; then
     shutting_down=0
@@ -169,7 +186,7 @@ finish12() {
     clean=0
   fi
   log "test12 已收尾，日志和 bag：$OUT"
-  rm -f -- "$PF_RECORD" "$PF_RELOC" "$PF_FUSION" "$PF_DLL"
+  rm -f -- "$PF_RECORD" "$PF_RELOC" "$PF_FUSION" "$PF_DLL" "$PF_YWL"
   rmdir -- "$RUN_DIR"
   if (( ! clean )); then exit 1; fi
   if [[ -n "$TASK_ID" && "$code" -eq 143 ]]; then
@@ -203,6 +220,14 @@ bringup12() {
     sha256sum "$DLL_MAP/map_world.pcd" "$DLL_MAP/meta.json" "$DLL_MAP/manifest.json" "$DLL_CONFIG" >>"$OUT/map.sha256" || return 1
     cp -- "$DLL_CONFIG" "$OUT/dll_config.yaml" && cp -- "$DLL_MAP/manifest.json" "$OUT/dll_map_manifest.json" || return 1
     record_args+=(--dll)
+  elif (( USE_YWL )); then
+    sha256sum "$YWL_MAP/map_world.pcd" "$YWL_MAP/meta.json" "$YWL_MAP/manifest.json" "$YWL_CONFIG" >>"$OUT/map.sha256" || return 1
+    cp -- "$YWL_CONFIG" "$OUT/ywl_config.yaml" &&
+      cp -- "$RELOC_CONFIG" "$OUT/reloc_config.yaml" &&
+      cp -- "$YWL_MAP/manifest.json" "$OUT/ywl_map_manifest.json" || return 1
+    { git -C "$WS" rev-parse HEAD && git -C "$WS" status --porcelain=v1 &&
+      sha256sum "$WS/devel/lib/ywl_localization/ywl_localization_node"; } >"$OUT/ywl_version.txt" || return 1
+    record_args+=(--ywl)
   fi
   start_child "$PF_RECORD" "$OUT/record.log" "$RECORDER" "${record_args[@]}"
   setsid tail -n +1 -F --pid="$$" "$OUT/record.log" &
@@ -218,8 +243,21 @@ bringup12() {
   start_child "$PF_FUSION" "$OUT/fusion.log" "$DIR/fusion.sh" "${fusion_args[@]}"
   wait_stage fastlio 180 "$PF_RECORD" "$PF_FUSION" || { err 'FAST-LIO 未就绪，查看 fusion.log'; return 1; }
   ok 'FAST-LIO2 和重力桥已输出'
-  start_child "$PF_RELOC" "$OUT/reloc.log" rosrun drone_relocalization relocalize \
-    --map "$MAP" --config "$RELOC_CONFIG" --save "$OUT"
+  if (( USE_YWL )); then
+    log 'YWL 正在校验地图并建立固定索引'
+    start_child "$PF_YWL" "$OUT/ywl.log" roslaunch ywl_localization ywl.launch \
+      "map_dir:=$YWL_MAP" "legacy_map_dir:=$MAP" "reloc_config:=$RELOC_CONFIG" "calibration:=$YWL_CONFIG"
+    setsid tail -n +1 -F --pid="$$" "$OUT/ywl.log" &
+    tail_pids+=("$!")
+    wait_stage ywl-bootstrap 150 "$PF_RECORD" "$PF_FUSION" "$PF_YWL" ||
+      { err 'YWL 启动里程计未就绪，查看 ywl.log'; return 1; }
+  fi
+  local reloc_cmd=(rosrun drone_relocalization relocalize --map "$MAP" --config "$RELOC_CONFIG" --save "$OUT")
+  if (( USE_YWL )); then
+    # Keep the startup solver from competing with both estimators for BLAS workers.
+    reloc_cmd=(env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 "${reloc_cmd[@]}")
+  fi
+  start_child "$PF_RELOC" "$OUT/reloc.log" "${reloc_cmd[@]}"
   if (( USE_DLL )); then
     log 'DLL 正在建立距离场并等待本次重定位确认'
     start_child "$PF_DLL" "$OUT/dll.log" roslaunch fastlio_dll observe.launch \
@@ -234,6 +272,11 @@ bringup12() {
       { err 'DLL 未进入 TRACKING，查看 dll.log；可用 --no-dll 重新启动手飞录包'; return 1; }
     timeout 5 rosparam dump "$OUT/dll_params.yaml" /fastlio_dll || return 1
     ready+='，DLL TRACKING'
+  elif (( USE_YWL )); then
+    wait_stage ywl 15 "$PF_RECORD" "$PF_FUSION" "$PF_RELOC" "$PF_YWL" ||
+      { err 'YWL 未进入 TRACKING，查看 ywl.log'; return 1; }
+    timeout 5 rosparam dump "$OUT/ywl_params.yaml" /ywl_localization || return 1
+    ready+='，YWL TRACKING'
   fi
   check_ground || return 1
   ok "$ready。拨 Channel 6 开包，保持静止录够 20 秒，再按原流程手飞"
@@ -248,7 +291,7 @@ fi
 reported=" "
 while :; do
   sleep 2
-  for stage in FUSION RELOC RECORD DLL; do
+  for stage in FUSION RELOC RECORD DLL YWL; do
     file_var="PF_$stage"
     pidfile="${!file_var}"
     if [[ -s "$pidfile" ]] && ! child_pid "$pidfile" >/dev/null && [[ "$reported" != *" $stage "* ]]; then
