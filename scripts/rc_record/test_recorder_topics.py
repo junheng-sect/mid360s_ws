@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check optional cloud subscriptions and standard types without opening a bag."""
 import builtins
+import os
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -43,6 +44,18 @@ class TopicTests(unittest.TestCase):
             c = yaml.safe_load(stream)['rc_bag_recorder']
         self.assertFalse(c['record_registered_cloud'])
         self.assertNotIn('/cloud_registered', c['topics'])
+
+    def test_dll_topics_are_opt_in_and_lightweight(self):
+        with patch.dict(os.environ, {'NAV_TEST_DLL_TASK': ''}):
+            _, before = self.recorder()
+        self.assertNotIn('/dll_localization/pose', before)
+        with patch.dict(os.environ, {'NAV_TEST_DLL_TASK': 'test_indoor3_1'}):
+            node, topics = self.recorder(topics=['/fastlio/odom_world', '/dll_localization/pose'])
+        for topic in ('/drone_reloc/pose', '/dll_localization/pose', '/dll_localization/status',
+                      '/dll_localization/correction', '/nav_test/observer'):
+            self.assertEqual(topics.count(topic), 1)
+        self.assertIn('/nav_test/observer', node._latched)
+        self.assertNotIn('/livox/lidar', topics)
 
     def test_cloud_enabled_adds_one_subscription(self):
         _, subscribed = self.recorder(cloud=True)

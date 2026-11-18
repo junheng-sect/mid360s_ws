@@ -28,6 +28,7 @@ offboard_bag_recorder 一致），不 fork rosbag record 进程；bag 名用六�
   topics, latched_topics, record_raw_cloud, record_registered_cloud, status_topic, bag_path_topic, status_rate
 """
 
+import json
 import os
 import sys
 import threading
@@ -36,6 +37,8 @@ import time
 import rosbag
 import rospy
 from std_msgs.msg import String
+from diagnostic_msgs.msg import DiagnosticArray
+from geometry_msgs.msg import TransformStamped
 from geometry_msgs.msg import (PoseStamped, PoseWithCovarianceStamped, TwistStamped,
                                Vector3Stamped)
 from nav_msgs.msg import Odometry, Path
@@ -69,6 +72,9 @@ DEFAULT_TOPICS = [
     '/mavros/setpoint_raw/local',
 ]
 # 只在变化时发布的 latch 话题：开包前收到的最新一条要在开包时补写，否则包里要等下一次变化才有。
+DLL_MODE = '/nav_test/observer'
+DLL_TOPICS = ('/drone_reloc/pose', '/dll_localization/pose', '/dll_localization/correction',
+              '/dll_localization/status', DLL_MODE)
 DEFAULT_LATCHED_TOPICS = ['/front_marker_control/control_mode']
 
 
@@ -93,6 +99,11 @@ def topic_type_registry():
         '/livox/imu': Imu,
         '/tf': TFMessage,
         '/tf_static': TFMessage,
+        '/drone_reloc/pose': PoseStamped,
+        '/dll_localization/pose': PoseStamped,
+        '/dll_localization/correction': TransformStamped,
+        '/dll_localization/status': DiagnosticArray,
+        DLL_MODE: String,
         # front_marker_control：状态机阶段（latch，只在变化时发布）、状态文本、视觉位置误差、实际 setpoint
         '/front_marker_control/control_mode': String,
         '/front_marker_control/status': String,
@@ -177,6 +188,11 @@ class RcBagRecorder(object):
 
         registry = topic_type_registry()
         wanted = list(rospy.get_param('~topics', DEFAULT_TOPICS))
+        self._dll_task = os.environ.get('NAV_TEST_DLL_TASK', '')
+        self._dll_publisher = None
+        if self._dll_task:
+            wanted.extend(topic for topic in DLL_TOPICS if topic not in wanted)
+            self._dll_publisher = rospy.Publisher(DLL_MODE, String, queue_size=1, latch=True)
         if bool(rospy.get_param('~record_raw_cloud', False)):
             if '/livox/lidar' in registry:
                 if '/livox/lidar' not in wanted:
@@ -200,6 +216,8 @@ class RcBagRecorder(object):
             return
         recorded = set(t for t, _ in self._topics)
         latched = list(rospy.get_param('~latched_topics', DEFAULT_LATCHED_TOPICS))
+        if self._dll_task and DLL_MODE not in latched:
+            latched.append(DLL_MODE)
         for topic in latched:
             if topic not in recorded:
                 rospy.logwarn('latched_topics 里的 %s 不在录制话题里，已忽略', topic)
@@ -374,6 +392,15 @@ class RcBagRecorder(object):
                 rospy.signal_shutdown('bag write failed')
 
     def _publish_status(self):
+        if self._dll_publisher is not None:
+            note = ''
+            try:
+                with open(os.path.join(self._bag_directory, 'dll_unavailable.txt')) as stream:
+                    note = stream.read(250).strip()
+            except OSError:
+                pass
+            self._dll_publisher.publish(String(data=json.dumps(dict(
+                mode='dll', task=self._dll_task, run=self._bag_directory, note=note), ensure_ascii=False)))
         state = 'REC' if self._session.recording() else 'IDLE'
         self._status_publisher.publish(String(data=(
             'state=%s bags=%d last=%s rc_valid=%s healthy=%s'

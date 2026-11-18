@@ -9,6 +9,9 @@
 #   --reloc-config F   重定位配置（各测试指定默认值；旧测试默认 outdoor.yaml）
 #   --map-frame F      world map 标定（各测试指定默认值；旧测试默认 map_frame_outdoor.yaml）
 #   --nav-config F     导航配置（各测试指定默认值；旧测试默认 outdoor_nav.yaml）
+#   --show-dll-config   只显示本次任务的旁路与录包配置，随后退出
+#   --no-dll            本次跳过 DLL 旁路对照
+#   --record-raw-lidar  本次额外录原始 /livox/lidar，供重新回放和静止 ICP
 #   --ev-mode MODE     转给 fusion.sh：外部定位送飞控的方式，pose（默认，只发位姿）/ odom（位姿 + 速度，
 #                      要 MAVROS 用 MAVLink2、飞控 EKF2_EV_CTRL 带速度位 bit2）。只能开机时选，测试中途不能换
 #   --live-grid-only   跳过先验栅格，仅用当前测试的实时观测
@@ -125,6 +128,7 @@ finish() { # finish <退出码> [force]：信号触发时飞机还解锁着就�
   fi
   stop_child "$PF_NAV" "导航" INT 20 || _cleanup_ok=0
   stop_child "$PF_CAR" "car_bridge" INT 10 || _cleanup_ok=0
+  if (( NT_DLL )); then stop_child "$PF_DLL" "DLL 旁路" INT 15 || _cleanup_ok=0; fi
   stop_child "$PF_RELOC" "重定位节点" INT 10 || _cleanup_ok=0
   stop_child "$PF_FUSION" "定位链路 fusion.sh（录包收尾、恢复对时）" TERM 60 || _cleanup_ok=0
   rm -rf "$RUN_DIR"
@@ -147,6 +151,15 @@ nt_check_chain() { # 每次发目标前确认链路还在
   child_pid "$PF_NAV" >/dev/null || { err "导航已退出，看 $OUT/nav.log"; return 1; }
 }
 
+# These deployed task IDs keep their original recording and process footprint.
+# New map-based tasks using nav_test_main inherit the optional DLL observer.
+nt_default_dll() {
+  case "$1" in
+    test[1-9]|test10|test11|test_indoor[1-4]) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 nav_test_main() {
   NT_SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   MAP="${DEFAULT_MAP:-$MAP_ROOT/20261105_114605_outdoor}"
@@ -156,11 +169,17 @@ nav_test_main() {
   PREVIEW_RADIUS="${DEFAULT_PREVIEW_RADIUS:-0.2}"
   PREVIEW_HALF_HEIGHT="${DEFAULT_PREVIEW_HALF_HEIGHT:-0.15}"
   PREVIEW=0; LIVE_GRID_ONLY=0; EV_MODE="${DEFAULT_EV_MODE:-pose}"; FUSION_ARGS=()
+  NT_DLL=0; NT_RAW_LIDAR=0
+  if nt_default_dll "$TEST_NAME"; then NT_DLL=1; fi
+  local _show_dll=0
   local _orig=("$@")
   while [ $# -gt 0 ]; do
     SHIFT=1
     case "$1" in
       --preview) PREVIEW=1 ;;
+      --no-dll) NT_DLL=0 ;;
+      --show-dll-config) _show_dll=1 ;;
+      --record-raw-lidar) NT_RAW_LIDAR=1 ;;
       --live-grid-only) LIVE_GRID_ONLY=1 ;;
       --map) MAP="${2:-}"; SHIFT=2 ;;
       --reloc-config) RELOC_CONFIG="${2:-}"; SHIFT=2 ;;
@@ -175,6 +194,14 @@ nav_test_main() {
     shift "$SHIFT"
   done
   case "$EV_MODE" in pose|odom) ;; *) echo "--ev-mode 只能是 pose 或 odom" >&2; exit 2 ;; esac
+
+  if (( _show_dll )); then
+    local _dll_text=关闭 _raw_text="沿用录包配置（默认关闭）"
+    if (( NT_DLL )); then _dll_text="开启（只作对照）"; fi
+    if (( NT_RAW_LIDAR )); then _raw_text="开启"; fi
+    printf '%s\n' "任务：$TEST_NAME" "主定位先验图：$MAP" "DLL 旁路：$_dll_text" "原始雷达：$_raw_text"
+    return 0
+  fi
 
   # ssh 断开不能把测试停在半路（飞机可能还在天上）：不在 tmux 里就开一个会话再跑自己
   if [ -z "${TMUX:-}" ] && [ -t 0 ] && command -v tmux >/dev/null 2>&1; then
@@ -197,6 +224,7 @@ nav_test_main() {
   LOG="$OUT/nav_test.log"
   RUN_DIR="$(mktemp -d /tmp/nav_test.XXXXXX)"
   PF_FUSION="$RUN_DIR/fusion.pid"; PF_RELOC="$RUN_DIR/reloc.pid"; PF_CAR="$RUN_DIR/car.pid"; PF_NAV="$RUN_DIR/nav.pid"
+  PF_DLL="$RUN_DIR/dll.pid"
   trap 'finish 130' INT
   if [ -n "${WAREHOUSE_TASK_ID:-}" ]; then
     trap 'finish 130' TERM
@@ -206,6 +234,11 @@ nav_test_main() {
   trap 'finish 129' HUP
 
   nt_bringup
+  if (( NT_DLL )); then
+    log "导航已就绪，异步启动 DLL 旁路（日志 $OUT/dll.log）"
+    start_child "$PF_DLL" "$OUT/dll.log" nice -n 10 env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+      "$NT_DIR/start_dll_observer.sh" "$MAP" "$RELOC_CONFIG" "$OUT" || warn "DLL 旁路未启动"
+  fi
   if [ -n "${WAREHOUSE_TASK_ID:-}" ]; then
     # The web supervisor signals only this shell. A separate job group lets
     # finish() check landed and disarmed before interrupting the flight runner.
@@ -313,7 +346,10 @@ print('地图 %d 点，载入 %.1f s，%s' % (len(m.P), m.load_s, '缓存命中'
 PY
 
   hr; log "步骤 2/4：启动定位链路 fusion.sh（位姿送飞控，通道 6 录包到本次目录）。飞机放好别动"
-  start_child "$PF_FUSION" "$OUT/fusion.log" "$DIR/fusion.sh" --no-camera --no-winch --bag-dir "$OUT" --bag-prefix "$TEST_NAME" --ev-mode "$EV_MODE" "${FUSION_ARGS[@]}"
+  local _record_env=("NAV_TEST_DLL_TASK=")
+  if (( NT_DLL )); then _record_env=("NAV_TEST_DLL_TASK=$TEST_NAME"); fi
+  if (( NT_RAW_LIDAR )); then _record_env+=("RC_RECORD_RAW_CLOUD=true"); fi
+  start_child "$PF_FUSION" "$OUT/fusion.log" env "${_record_env[@]}" "$DIR/fusion.sh" --no-camera --no-winch --bag-dir "$OUT" --bag-prefix "$TEST_NAME" --ev-mode "$EV_MODE" "${FUSION_ARGS[@]}"
   local _t=0
   until timeout 3 rostopic echo -n1 /fastlio/odom_world >/dev/null 2>&1; do
     child_pid "$PF_FUSION" >/dev/null || { err "fusion.sh 退出了，最后几行："; tail -n 8 "$OUT/fusion.log" | tee -a "$LOG"; finish 1 force; }

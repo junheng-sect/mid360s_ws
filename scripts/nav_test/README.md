@@ -367,3 +367,11 @@ ROS 服务单次等待上限 2 s，并受起飞/航段/降落阶段的剩余时�
 后续实飞20261113_164142表明，上一版“位置到地面下10 cm后速度归零并等2 s”仍未得到PX4着地确认。因此旧修复只作为历史验证，不再代表当前末段逻辑。现参考 [land_with_tracking_v2](https://github.com/junheng-sect/ROS2PUBLIC/blob/rasip_pi/src/land_with_tracking_v2/land_with_tracking_v2/land_with_tracking_v2_node.py) 的持续速度下压与普通disarm；本项目仍仅允许在新鲜PX4着地后请求上锁。
 
 真实网关专项隔离验证：`bash /home/orangepi/orange/src/drone_navigation/test/run_landing_isolated.sh /tmp/landing_validation`（仅模拟FCU与预览输出）。本次bag固定输入回归工具为同目录 `replay_landing.py`。14:00旧批次缺少原始着地/估计器话题；16:41新批次已具备这些原始输入。当前使用16:41批次的真实着地/估计器/模式/位置记录验证：不误报TOUCHED、不在空中请求上锁，并能进入Z速度下压。固定历史输入不会响应新控制，不能证明实机会落地。当前完整证据见 `/home/orangepi/test_data/nav10_validation/20261113_velocity_press_fix/`；旧版验证留作历史。
+
+### 新建带图任务的 DLL 旁路
+
+新脚本使用唯一的 `TEST_NAME`，载入 `nav_test/common.sh` 并调用 `nav_test_main "$@"`，即可继承通道 6 的轻量对照录包和 DLL 旁路。室内 test3_1 已走这个入口。已有 test1–11、室内 test1–4 保留各自原有配置；室外 test12 继续走专用入口。
+
+用 `--show-dll-config` 可以在启动前核对当前任务的默认策略；命令只打印配置。导航就绪后，任务用本次重定位地图启动 DLL。已知大室外图选用经同源哈希校验的裁图。网页同时保留原导航主位姿与 DLL 对照栏。目录中的 `dll.log`、`dll_observer.json` 和配置副本用于复盘。对照量是同一扫描时刻的 DLL 减 FAST-LIO2，不写入生产 TF。
+
+默认按原有设置录包，并增加两路地图位姿、校正、状态与会话信息。需要雷达原始数据以便重跑或静止检查点 ICP 时，在本次命令末尾加 `--record-raw-lidar`；只用原定位可加 `--no-dll`。通用录包导出：`python3 ~/orange/tools/warehouse_monitor/export_dll_drift.py "$bag" "${bag%.bag}_drift"`（先 source 板端 mid360s_ws 环境）。四点观察的短停可以作同帧差值分析；ICP 工具只为满足其静止时长和几何质量条件的窗口出参考值。
