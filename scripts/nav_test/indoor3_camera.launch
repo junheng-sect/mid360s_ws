@@ -1,0 +1,5 @@
+<launch>
+  <node pkg="ov13855_cam" type="ov13855_cam_node" name="indoor3_full_cam" output="screen">
+    <rosparam command="load" file="$(find ov13855_cam)/config/ov13855_full.yaml" />
+  </node>
+</launch>

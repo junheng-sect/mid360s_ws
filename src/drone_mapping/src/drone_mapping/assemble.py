@@ -88,12 +88,10 @@ def to_world(xyz, T, traj, Rg):
     return (np.einsum('nij,nj->ni', R, xyz) + pos) @ Rg.T
 
 
-def gather(bag, traj, prm, Rg):
-    """逐帧解原始 CustomMsg（不经 rospy 反序列化），返回地图系的点、强度、时间（相对轨迹起点，s）、用到的雷达帧数"""
+def iter_scan_points(bag, traj, prm):
+    """Yield filtered lidar coordinates, intensities and acquisition times by scan."""
     import rosbag
     t_lo, t_hi = traj[0, 0], traj[-1, 0]
-    rot = not np.array_equal(prm['R'], np.eye(3))
-    pts, inten, tim, n_msg = [], [], [], 0
     with rosbag.Bag(bag) as b:
         for _, raw, _ in b.read_messages(topics=['/livox/lidar'], raw=True):
             d = raw[1]
@@ -101,26 +99,32 @@ def gather(bag, traj, prm, Rg):
             tb = secs + nsecs * 1e-9
             if tb + 0.11 < t_lo or tb > t_hi:
                 continue
-            off = 12 + 4 + struct.unpack_from('<I', d, 12)[0]      # header：seq、stamp、frame_id
-            off += 8 + 4 + 4                                       # timebase、point_num、lidar_id + rsvd[3]
+            off = 12 + 4 + struct.unpack_from('<I', d, 12)[0]      # header
+            off += 8 + 4 + 4                                       # timebase, point_num, lidar_id + rsvd
             n = struct.unpack_from('<I', d, off)[0]
-            off += 4
-            c = np.frombuffer(d, PT, count=n, offset=off)
+            c = np.frombuffer(d, PT, count=n, offset=off + 4)
             tg = c['tag'] & 0x30
             c = c[(tg == 0x00) | (tg == 0x10)][::prm['every']]
             xyz = np.stack([c['x'], c['y'], c['z']], 1).astype(np.float64)
-            T = tb + c['t'] * 1e-9
-            k = (np.einsum('ij,ij->i', xyz, xyz) > prm['blind'] ** 2) & (T >= t_lo) & (T <= t_hi)
-            if not k.any():
-                continue
-            xyz = xyz[k] @ prm['R'].T if rot else xyz[k]
-            pts.append(to_world(xyz + prm['T'], T[k], traj, Rg).astype(np.float32))
-            inten.append(c['r'][k].astype(np.float32))
-            tim.append((T[k] - t_lo).astype(np.float32))
-            n_msg += 1
+            times = tb + c['t'] * 1e-9
+            keep = ((np.einsum('ij,ij->i', xyz, xyz) > prm['blind'] ** 2)
+                    & np.isfinite(xyz).all(axis=1) & (times >= t_lo) & (times <= t_hi))
+            if keep.any():
+                yield xyz[keep], c['r'][keep], times[keep]
+
+
+def gather(bag, traj, prm, Rg):
+    """Return world points, intensities, relative times and the number of scans."""
+    rot = not np.array_equal(prm['R'], np.eye(3))
+    pts, inten, tim = [], [], []
+    for xyz, intensity, times in iter_scan_points(bag, traj, prm):
+        xyz = xyz @ prm['R'].T if rot else xyz
+        pts.append(to_world(xyz + prm['T'], times, traj, Rg).astype(np.float32))
+        inten.append(intensity.astype(np.float32))
+        tim.append((times - traj[0, 0]).astype(np.float32))
     if not pts:
         raise RuntimeError('%s 里没有落在轨迹时间段内的雷达点' % bag)
-    return np.concatenate(pts), np.concatenate(inten), np.concatenate(tim), n_msg
+    return np.concatenate(pts), np.concatenate(inten), np.concatenate(tim), len(pts)
 
 
 def path_samples(tw, step):

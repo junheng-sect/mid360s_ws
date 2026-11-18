@@ -1,0 +1,23 @@
+# 11-14 室内飞扫图，室内 test1 / test2 共用。
+# 同一架飞机，沿用 outdoor_nav.yaml 中已核对的机体尺寸和外参。
+config:
+  deployment_verified: true
+  map_id: /home/orangepi/test_data/mapping/20261114_101654_indoor_fly_raw_000001
+  # 雷达 IMU -> PX4 控制参考点，FLU；传感器安装改变后需重新核对。
+  lever_body: [-0.016, -0.021, -0.053]
+  sensor_offset_imu: [-0.011, -0.02329, 0.04412]
+  body_half_extent: [0.27, 0.27, 0.15]
+  # EGO 膨胀 0.4 / 0.3 m；预览和实飞相同，不缩小包络。
+  clearance: 0.13
+  allow_unknown_above: false
+  goal_boundary_margin: 0.30
+  # drone_odom 控制参考点坐标，不是离地测距；0.10 下界 + 0.30 余量，允许起点高度 0.40～2.20 m。
+  bounds_min: [-3.0, -3.0, 0.1]
+  bounds_max: [3.0, 3.0, 2.5]
+  # 网关/执行器按三维模长限制，EGO 单轴上限除以 sqrt(3)，约 0.289。
+  max_vel: 0.5
+  max_acc: 0.5
+  # 沿用当前竖直限制，EGO 会再取与单轴上限的较小值；本测试目标高度不变。
+  max_vel_z: 0.3
+  max_acc_z: 0.3
+  yaw_rate_deg: 30

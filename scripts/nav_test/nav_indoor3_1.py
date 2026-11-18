@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Observe shelf AprilTags at the four indoor photo stops."""
+import argparse
+import csv
+from collections import defaultdict, deque
+from pathlib import Path
+import threading
+import time
+
+import numpy as np
+import rospy
+from nav_msgs.msg import Odometry
+from ov13855_apriltag_vision.msg import TagSurveyFrame
+from tf.transformations import quaternion_from_matrix, quaternion_multiply
+from front_marker_control.localization import LocalPoseBuffer
+
+from indoor3_runner import Frame, Indoor3Runner, probe_photo, save_photo, serve_route, wait_for_frame
+from nav_forward import say
+from nav_indoor3 import load_route
+from nav_square import Stopped
+
+
+TOPIC = '/ov13855_apriltag_vision/survey'
+FRAME = 'ov13855_optical_frame'
+FAMILY = 'tag36h11'
+EXPECTED = set(range(6))
+WINDOW_S = 2.
+# The configured stream is 15 Hz. Count empty arrays as live frames.
+MAX_FRAME_GAP_NS = 500_000_000
+FIELDS = ('waypoint', 'waypoint_name', 'family', 'id', 'first_stamp_ns', 'last_stamp_ns',
+          'seen_frames', 'window_frames', 'representative_stamp_ns', 'pose_status', 'tag_pose_status',
+          'reprojection_rms_px', 'photo_file', 'photo_stamp_ns')
+COMPONENTS = ('x_m', 'y_m', 'z_m', 'qx', 'qy', 'qz', 'qw')
+POSE_FIELDS = tuple(prefix + '_' + field for prefix in ('tag_camera', 'drone_odom', 'drone_map')
+                    for field in COMPONENTS)
+
+
+def valid_frame(msg):
+    return (msg.header.frame_id == FRAME and msg.family == FAMILY and msg.header.stamp.to_nsec() > 0
+            and -.02 <= (rospy.Time.now() - msg.header.stamp).to_sec() <= .5)
+
+
+def pose_values(pose):
+    p, q = pose.position, pose.orientation
+    return (p.x, p.y, p.z, q.x, q.y, q.z, q.w)
+
+
+def waypoint_rows(frames, waypoint, name, photo, pose_at, reference):
+    samples = defaultdict(dict)
+    for stamp, msg in sorted(frames.items()):
+        poses = {tag.id: tag for tag in msg.tags}
+        for tag_id in set(msg.ids):
+            samples[tag_id][stamp] = poses.get(tag_id)
+    rotation, translation = reference
+    transform = np.eye(4)
+    transform[:3, :3] = rotation
+    map_quat = quaternion_from_matrix(transform)
+    rows = []
+    for tag_id, observations in sorted(samples.items()):
+        first = min(observations)
+        row = dict(waypoint=waypoint, waypoint_name=name, family=FAMILY, id=tag_id,
+                   first_stamp_ns=first, last_stamp_ns=max(observations),
+                   seen_frames=len(observations), window_frames=len(frames),
+                   photo_file=photo['file'], photo_stamp_ns=photo['stamp_ns'],
+                   pose_status='no_synchronized_odometry')
+        stamp = first
+        for candidate in observations:
+            nav = pose_at(candidate)
+            if nav is not None:
+                stamp = candidate
+                xyz = rotation @ nav.position + translation
+                q = quaternion_multiply(map_quat, nav.quaternion)
+                for prefix, values in (('drone_odom', (*nav.position, *nav.quaternion)),
+                                       ('drone_map', (*xyz, *q))):
+                    row.update(zip((prefix + '_' + f for f in COMPONENTS), map(float, values)))
+                row['pose_status'] = 'aligned'
+                break
+        tag = observations[stamp]
+        row.update(representative_stamp_ns=stamp, tag_pose_status='unavailable' if tag is None else 'solved')
+        if tag is not None:
+            row['reprojection_rms_px'] = float(tag.reprojection_rms_px)
+            row.update(zip(('tag_camera_' + f for f in COMPONENTS), pose_values(tag.pose)))
+        rows.append(row)
+    return rows
+
+
+def coverage(rows):
+    ids = {row['id'] for row in rows}
+    seen = sorted(EXPECTED & ids)
+    return dict(seen=seen, missing=sorted(EXPECTED - ids), extra=sorted(ids - EXPECTED),
+                count=len(seen), expected=sorted(EXPECTED))
+
+
+class SurveyRunner(Indoor3Runner):
+    test_name = record_prefix = 'test_indoor3_1'
+    route_name = '室内 test3_1 四点 AprilTag 识别'
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.lock = threading.Lock()
+        self.frames = deque(maxlen=150)
+        self.poses = LocalPoseBuffer(500)
+        self.detections = rospy.Subscriber(TOPIC, TagSurveyFrame, self.on_frame, queue_size=64)
+        self.odometry = rospy.Subscriber('/drone_nav/odom', Odometry, self.on_odom, queue_size=50)
+        self.csv_path = Path(self.a.out) / 'apriltag_observations.csv'
+
+    def on_frame(self, msg):
+        if valid_frame(msg):
+            with self.lock:
+                self.frames.append(msg)
+
+    def on_odom(self, msg):
+        with self.lock:
+            if msg.header.frame_id != 'drone_odom' or msg.child_frame_id != 'drone_nav_base':
+                self.poses.clear()
+                return
+            p = pose_values(msg.pose.pose)
+            self.poses.accept(msg.header.stamp.to_sec(), msg.header.frame_id, p[:3], p[3:])
+
+    def freeze(self):
+        if self.csv_path.exists():
+            raise Stopped('任务目录中已有 ' + self.csv_path.name)
+        goals = super().freeze()
+        with self.lock:
+            if not self.frames or not valid_frame(self.frames[-1]):
+                raise Stopped('AprilTag 检测流尚未就绪')
+        self.record.update(csv_file=self.csv_path.name, coverage=coverage([]),
+                           map_sha256=self.a.route['map_sha256'], observations=[])
+        self.write_results()
+        return goals
+
+    def write_results(self):
+        rows = self.record['observations']
+        self.record['coverage'] = coverage(rows)
+        self.save()
+        temp = self.csv_path.with_suffix('.tmp.csv')
+        try:
+            with temp.open('w', newline='', encoding='utf-8') as stream:
+                writer = csv.DictWriter(stream, fieldnames=FIELDS + POSE_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+            temp.replace(self.csv_path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def hold_at_point(self, i, leg, seconds):
+        name = self.a.route['points'][i]['name']
+        path = self.csv_path.parent / ('%02d_%s.png' % (i + 1, name))
+        if path.exists():
+            raise Stopped('照片文件已存在：' + path.name)
+        observation = leg['observation'] = dict(status='settling')
+        frame = Frame()
+        try:
+            self.pause(1., stopped=True)
+            start = rospy.Time.now()
+            end = start + rospy.Duration(WINDOW_S)
+            observation.update(status='sampling', start_ns=start.to_nsec(), end_ns=end.to_nsec())
+            deadline = time.monotonic() + WINDOW_S
+            msg = wait_for_frame(frame, start, deadline, self.hold_guard)
+            frame.close()
+            if msg.header.stamp >= end:
+                raise Stopped('观察窗口内没有全分辨率新帧')
+            # Allow in-flight detections and bracketing odometry to arrive, but
+            # only accept source stamps inside the original two-second window.
+            self.pause(max(0., deadline - time.monotonic()) + .5, stopped=True)
+            photo = dict(file=path.name, stamp_ns=msg.header.stamp.to_nsec(), frame_id=FRAME)
+            with self.lock:
+                frames = {m.header.stamp.to_nsec(): m for m in self.frames if start <= m.header.stamp < end}
+                rows = waypoint_rows(frames, i + 1, name, photo,
+                                     lambda ns: self.poses.lookup(ns / 1e9, .20), self.reference)
+            stamps = [start.to_nsec(), *sorted(frames), end.to_nsec()]
+            gap = max(b - a for a, b in zip(stamps, stamps[1:]))
+            save_photo(msg, path, self.hold_guard)
+            leg['photo'] = photo
+            observation.update(status='complete' if gap <= MAX_FRAME_GAP_NS else 'stream_fault',
+                               frames=len(frames), max_gap_ns=gap, ids=[row['id'] for row in rows])
+            self.record['observations'].extend(rows)
+            self.write_results()
+            if gap > MAX_FRAME_GAP_NS:
+                raise Stopped('%s AprilTag 检测断流，最大帧间隔 %.3f s' % (name, gap / 1e9))
+            result = self.record['coverage']
+            say('AprilTag 观察 %d/4 %s %s｜已见 %d/6 %s｜缺失 %s｜额外 %s' %
+                (i + 1, name, observation['ids'], result['count'], result['seen'], result['missing'], result['extra']))
+        except BaseException as error:
+            if observation['status'] != 'stream_fault':
+                observation['status'] = 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed'
+            observation['reason'] = str(error) or type(error).__name__
+            raise
+        finally:
+            frame.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--out', required=True, type=Path)
+    parser.add_argument('--preview', action='store_true')
+    parser.add_argument('--probe-camera', action='store_true')
+    args = parser.parse_args()
+    if args.probe_camera:
+        rospy.init_node('indoor3_1_camera_probe', anonymous=True)
+        probe_photo(args.out)
+        deadline = time.monotonic() + 6.
+        while time.monotonic() < deadline:
+            msg = rospy.wait_for_message(TOPIC, TagSurveyFrame, timeout=max(.01, deadline - time.monotonic()))
+            if valid_frame(msg):
+                say('test3_1 相机就绪：全分辨率原图与 AprilTag 检测流')
+                return 0
+        raise Stopped('AprilTag 检测流尚未就绪')
+    return serve_route('nav_indoor3_1', args, load_route(), SurveyRunner)
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except (Stopped, rospy.ROSException) as error:
+        say(str(error))
+        raise SystemExit(1)

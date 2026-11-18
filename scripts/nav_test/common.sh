@@ -11,6 +11,7 @@
 #   --nav-config F     导航配置（各测试指定默认值；旧测试默认 outdoor_nav.yaml）
 #   --ev-mode MODE     转给 fusion.sh：外部定位送飞控的方式，pose（默认，只发位姿）/ odom（位姿 + 速度，
 #                      要 MAVROS 用 MAVLink2、飞控 EKF2_EV_CTRL 带速度位 bit2）。只能开机时选，测试中途不能换
+#   --live-grid-only   跳过先验栅格，仅用当前测试的实时观测
 #   --allow-unsynced-clock  转给 fusion.sh：不等对时（没外网时用）
 #   -h|--help          帮助
 #
@@ -68,7 +69,7 @@ start_child() { # start_child <pidfile> <logfile> <命令...>
     _s="$(cat /proc/$$/stat 2>/dev/null)"; _s="${_s##*)}"; set -- $_s
     printf "%s %s\n" "$$" "${20:-}" >"$_pf"
     exec "${_cmd[@]}"
-  ' _ "$_pf" "$@" </dev/null >"$_lf" 2>&1 &
+  ' _ "$_pf" "$@" 199>&- </dev/null >"$_lf" 2>&1 &
   local _i=0
   while [ "$_i" -lt 50 ] && [ ! -s "$_pf" ]; do sleep 0.1; _i=$((_i + 1)); done
 }
@@ -92,16 +93,40 @@ SHUTTING_DOWN=0
 finish() { # finish <退出码> [force]：信号触发时飞机还解锁着就不收尾；启动失败、链路掉了用 force
   local _code="$1"
   [ "$SHUTTING_DOWN" -eq 1 ] && return
-  if [ "${2:-}" != force ] && fc_armed; then
+  if [ "${2:-}" != force ] && [ -n "${WAREHOUSE_TASK_ID:-}" ]; then
+    local _fcu _ext
+    _fcu="$(timeout 3 rostopic echo -n1 /mavros/state 2>/dev/null)"
+    _ext="$(timeout 3 rostopic echo -n1 /mavros/extended_state 2>/dev/null)"
+    if ! grep -qx 'connected: True' <<<"$_fcu" || ! grep -qx 'armed: False' <<<"$_fcu" \
+        || grep -qE '^mode: .*OFFBOARD' <<<"$_fcu" || ! grep -qx 'landed_state: 1' <<<"$_ext"; then
+      warn "收尾被拒：等待飞控确认已着地并上锁"
+      return
+    fi
+  elif [ "${2:-}" != force ] && fc_armed; then
     echo; warn "飞机还在解锁状态，不收尾（停链路会断飞控的外部定位）。降落上锁后再 Ctrl+C"
     return
   fi
   SHUTTING_DOWN=1
+  if [ -n "${WAREHOUSE_RUNNER_PID:-}" ]; then
+    kill -INT -- "-$WAREHOUSE_RUNNER_PID" 2>/dev/null || true
+    local _waited=0
+    while kill -0 -- "-$WAREHOUSE_RUNNER_PID" 2>/dev/null && [ "$_waited" -lt 30 ]; do
+      sleep 0.2
+      _waited=$((_waited + 1))
+    done
+    if kill -0 -- "-$WAREHOUSE_RUNNER_PID" 2>/dev/null; then
+      kill -TERM -- "-$WAREHOUSE_RUNNER_PID" 2>/dev/null || true
+    fi
+  fi
   hr; log "收尾（只停本次启动的进程，常驻 roscore / MAVROS 不动）"
-  stop_child "$PF_NAV" "导航" INT 20
-  stop_child "$PF_CAR" "car_bridge" INT 10
-  stop_child "$PF_RELOC" "重定位节点" INT 10
-  stop_child "$PF_FUSION" "定位链路 fusion.sh（录包收尾、恢复对时）" TERM 60
+  local _cleanup_ok=1
+  if declare -F test_cleanup >/dev/null; then
+    test_cleanup || _cleanup_ok=0
+  fi
+  stop_child "$PF_NAV" "导航" INT 20 || _cleanup_ok=0
+  stop_child "$PF_CAR" "car_bridge" INT 10 || _cleanup_ok=0
+  stop_child "$PF_RELOC" "重定位节点" INT 10 || _cleanup_ok=0
+  stop_child "$PF_FUSION" "定位链路 fusion.sh（录包收尾、恢复对时）" TERM 60 || _cleanup_ok=0
   rm -rf "$RUN_DIR"
   # 测完常直接断电：包的索引还在页缓存里就会丢
   log "写盘（sync）……"; sync
@@ -109,6 +134,9 @@ finish() { # finish <退出码> [force]：信号触发时飞机还解锁着就�
   local _b; for _b in "$OUT"/*.bag; do [ -f "$_b" ] && log "包：$_b（$(du -h "$_b" | cut -f1)）"; done
   for _b in "$OUT"/goal_*.json; do [ -f "$_b" ] && log "目标记录：$_b"; done
   log "全部记录：$OUT"
+  if [ -n "${WAREHOUSE_TASK_ID:-}" ] && [ "$_cleanup_ok" -eq 1 ] && [ "$_code" -eq 130 ]; then
+    ok "网页任务已收尾"
+  fi
   if [ "${NAV_TEST_IN_TMUX:-0}" = 1 ]; then read -r -p "按回车关闭这个 tmux 会话 " _ </dev/tty; fi
   exit "$_code"
 }
@@ -127,12 +155,13 @@ nav_test_main() {
   NAV_CONFIG="${DEFAULT_NAV_CONFIG:-$NT_DIR/outdoor_nav.yaml}"
   PREVIEW_RADIUS="${DEFAULT_PREVIEW_RADIUS:-0.2}"
   PREVIEW_HALF_HEIGHT="${DEFAULT_PREVIEW_HALF_HEIGHT:-0.15}"
-  PREVIEW=0; EV_MODE=pose; FUSION_ARGS=()
+  PREVIEW=0; LIVE_GRID_ONLY=0; EV_MODE="${DEFAULT_EV_MODE:-pose}"; FUSION_ARGS=()
   local _orig=("$@")
   while [ $# -gt 0 ]; do
     SHIFT=1
     case "$1" in
       --preview) PREVIEW=1 ;;
+      --live-grid-only) LIVE_GRID_ONLY=1 ;;
       --map) MAP="${2:-}"; SHIFT=2 ;;
       --reloc-config) RELOC_CONFIG="${2:-}"; SHIFT=2 ;;
       --map-frame) MAP_FRAME="${2:-}"; SHIFT=2 ;;
@@ -157,17 +186,40 @@ nav_test_main() {
   fi
 
   MAP="$(cd "$MAP" 2>/dev/null && pwd)" || { echo "地图目录不存在" >&2; exit 2; }
+  if declare -F test_preflight >/dev/null; then
+    test_preflight || exit 2
+  fi
+  exec 199>"/tmp/mid360s-nav-test-$(id -u).lock"
+  flock -n 199 || { echo "已有导航测试运行，请先收尾" >&2; exit 1; }
   OUT="$HOME/test_data/nav_test/$(date +%Y%m%d_%H%M%S)_$TEST_NAME"
+  if [ -n "${WAREHOUSE_TASK_ID:-}" ]; then OUT="$OUT-${WAREHOUSE_TASK_ID:0:8}"; fi
   mkdir -p "$OUT"
   LOG="$OUT/nav_test.log"
   RUN_DIR="$(mktemp -d /tmp/nav_test.XXXXXX)"
   PF_FUSION="$RUN_DIR/fusion.pid"; PF_RELOC="$RUN_DIR/reloc.pid"; PF_CAR="$RUN_DIR/car.pid"; PF_NAV="$RUN_DIR/nav.pid"
   trap 'finish 130' INT
-  trap 'finish 143' TERM
+  if [ -n "${WAREHOUSE_TASK_ID:-}" ]; then
+    trap 'finish 130' TERM
+  else
+    trap 'finish 143' TERM
+  fi
   trap 'finish 129' HUP
 
   nt_bringup
-  run_test
+  if [ -n "${WAREHOUSE_TASK_ID:-}" ]; then
+    # The web supervisor signals only this shell. A separate job group lets
+    # finish() check landed and disarmed before interrupting the flight runner.
+    set -m
+    (run_test) 199>&- </dev/null &
+    WAREHOUSE_RUNNER_PID=$!
+    set +m
+    while kill -0 "$WAREHOUSE_RUNNER_PID" 2>/dev/null; do
+      wait "$WAREHOUSE_RUNNER_PID"
+    done
+    unset WAREHOUSE_RUNNER_PID
+  else
+    run_test
+  fi
   hr; log "测试动作结束。链路继续运行（飞控仍在收外部定位）：切回定点、降落、上锁后 Ctrl+C 收尾"
   local _nav_gone=0
   while :; do
@@ -189,6 +241,17 @@ nt_bringup() {
     [ -f "$_f" ] || { err "缺少 $_f"; finish 1 force; }
   done
   source "$ROS_SETUP"; source "$WS_SETUP"; source "$ORANGE_SETUP" --extend
+  local _prior_file="" _prior_map_sha=""
+  if [ "$LIVE_GRID_ONLY" -eq 0 ]; then
+    _prior_file="$MAP/prior_grid.bin"
+    if ! _prior_map_sha="$(python3 -B "$WS/src/drone_mapping/scripts/build_prior_grid" "$MAP" --verify 2>>"$LOG")"; then
+      err "先验栅格校验失败，确认 $_prior_file 对应当前地图。详情见 $LOG"
+      finish 1 force
+    fi
+    log "先验栅格 $_prior_file（地图 SHA-256 $_prior_map_sha）"
+  else
+    warn "本次仅使用实时栅格（--live-grid-only）"
+  fi
   source "$DIR/ros_net.sh" || { err "ROS 核心地址不在（nmcli con up ros-core）"; finish 1 force; }
   timeout 5 rosnode list >/dev/null 2>&1 || { err "常驻 roscore 不可达（systemctl status mid360s-roscore）"; finish 1 force; }
   local _n _nodes; _nodes="$(timeout 5 rosnode list 2>/dev/null)"
@@ -213,6 +276,10 @@ nt_bringup() {
       [ "$_i" -lt 7 ] && sleep 5
     done
     if [ -z "$_p" ]; then
+      if [ -n "${WAREHOUSE_TASK_ID:-}" ]; then
+        err "读不到飞控 EKF2_EV_CTRL，无法确认外部速度融合，未启动导航"
+        finish 1 force
+      fi
       warn "读不到飞控 EKF2_EV_CTRL，没法确认飞控会融合外部速度"
     elif [ $((_p & 4)) -eq 0 ]; then
       err "飞控 EKF2_EV_CTRL=$_p 没有速度位（bit2），odom 方式发的速度不会被融合；改成带 bit2（如 15）或用 --ev-mode pose"
@@ -254,6 +321,10 @@ PY
     sleep 1
   done
   ok "FAST-LIO 和重力桥已输出（/fastlio/odom_world）"
+
+  if declare -F test_after_fusion >/dev/null && ! test_after_fusion; then
+    err "定位启动后测试设备未就绪"; finish 1 force
+  fi
 
   hr; log "步骤 3/4：重定位 + world map（第一个窗口算 6～12 s，第二个窗口确认 1～3 s）。继续别动"
   start_child "$PF_RELOC" "$OUT/reloc.log" rosrun drone_relocalization relocalize --map "$MAP" --config "$RELOC_CONFIG" --save "$OUT"
@@ -316,19 +387,24 @@ PY
   hr; log "步骤 4/4：启动导航（EGO + 执行器 + 网关，$([ "$PREVIEW" -eq 1 ] && echo 只预览 || echo 真实输出)）"
   local _nav_args=(config:="$NAV_CONFIG" enable_output:=true max_vel:="$_max_vel" max_acc:="$_max_acc" max_vel_z:="$_max_vel_z" max_acc_z:="$_max_acc_z")
   [ "$PREVIEW" -eq 1 ] && _nav_args=(config:="$NAV_CONFIG" enable_output:=false radius:="$PREVIEW_RADIUS" half_height:="$PREVIEW_HALF_HEIGHT" max_vel:="$_max_vel" max_acc:="$_max_acc" max_vel_z:="$_max_vel_z" max_acc_z:="$_max_acc_z")
+  _nav_args+=(prior_grid_file:="$_prior_file" prior_map_sha256:="$_prior_map_sha")
   start_child "$PF_NAV" "$OUT/nav.log" roslaunch drone_navigation navigation.launch "${_nav_args[@]}"
   cat >"$RUN_DIR/wait_nav.py" <<'PY'
 import json, os, sys, time
 import rospy
-from std_msgs.msg import String
-pid, preview, logf = int(sys.argv[1]), sys.argv[2] == '1', open(sys.argv[3], 'a')
+from std_msgs.msg import Bool, String
+pid, preview, require_prior = int(sys.argv[1]), sys.argv[2] == '1', sys.argv[3] == '1'
 st = {}
+def prior_ready(message):
+    st['prior_ready'] = message.data
 def on(m, name):
     try:
         st[name] = json.loads(m.data)
     except ValueError:
         pass
 rospy.init_node('nav_test_wait_nav', anonymous=True, disable_signals=True)
+if require_prior:
+    rospy.Subscriber('/drone_nav/prior_grid_ready', Bool, prior_ready, queue_size=1)
 for name in ('input_status', 'gateway_status'):
     rospy.Subscriber('/drone_nav/' + name, String, on, callback_args=name, queue_size=5)
 t0 = time.monotonic()
@@ -336,7 +412,8 @@ try:
     while True:
         time.sleep(0.5)
         i, g = st.get('input_status', {}), st.get('gateway_status')
-        if i.get('state') == 'READY' and g is not None:
+        if (i.get('state') == 'READY' and g is not None
+                and (not require_prior or st.get('prior_ready') is True)):
             if g.get('real_output') is not (not preview):
                 print('网关 real_output=%s，和要求的%s不一致（部署检查没过？）' % (g.get('real_output'), '只预览' if preview else '真实输出'), flush=True)
                 sys.exit(3)
@@ -346,13 +423,13 @@ try:
         except OSError:
             sys.exit(1)
         if time.monotonic() - t0 > 60:
-            print('60 s 没就绪：输入 %s，网关 %s' % (i or '无消息', g or '无消息（网关节点没起来？）'), flush=True)
+            print('60 s 没就绪：输入 %s，网关 %s，先验就绪 %s' % (i or '无消息', g or '无消息', st.get('prior_ready', '无消息') if require_prior else '跳过'), flush=True)
             sys.exit(2)
 except KeyboardInterrupt:
     sys.exit(130)
 PY
   local _npid; _npid="$(child_pid "$PF_NAV")" || { err "导航没起来，看 $OUT/nav.log"; finish 1 force; }
-  if ! python3 "$RUN_DIR/wait_nav.py" "$_npid" "$PREVIEW" "$LOG" 2>&1 | tee -a "$LOG"; then
+  if ! python3 "$RUN_DIR/wait_nav.py" "$_npid" "$PREVIEW" "$((1 - LIVE_GRID_ONLY))" 2>&1 | tee -a "$LOG"; then
     err "导航没就绪，最后几行："; tail -n 8 "$OUT/nav.log" | tee -a "$LOG"; finish 1 force
   fi
   ok "导航就绪（输入 READY，网关 $([ "$PREVIEW" -eq 1 ] && echo 只预览 || echo 真实输出)）"

@@ -1,0 +1,6 @@
+# 新飞扫图以起飞方向为 +X，地面由 meta.json 的可信地面拟合确定。
+drone_map: 20261114_101654_indoor_fly_raw_000001
+car_map_id: null
+map_from_drone_map: {x: 0.0, y: 0.0, z: 0.156832916873914, yaw_deg: 0.0}
+map_from_car_map: null
+car_base_height: 0.20

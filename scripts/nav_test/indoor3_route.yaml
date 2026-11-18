@@ -1,0 +1,10 @@
+map_id: 20261114_101654_indoor_fly_raw_000001
+map_sha256: 6935f02bebc51734a2ffd9c47a9b114932528bfd911df162160b6baf8b914c52
+yaw_deg: -89.5
+hold_s: 3.0
+max_control_z: 1.43
+points:
+  - {name: 左下, xyz: [0.623, -0.039, 0.480]}
+  - {name: 左上, xyz: [0.624, -0.035, 1.230]}
+  - {name: 右上, xyz: [-0.276, -0.042, 1.230]}
+  - {name: 右下, xyz: [-0.277, -0.046, 0.480]}

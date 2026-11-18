@@ -120,6 +120,7 @@ class SquareRunner:
     side_m = 1.0
     hold_seconds = HOLD_SECONDS
     goals_in_map = False
+    repeat_laps = True
 
     def make_route(self, position, yaw):
         return square_points(position, yaw), np.full(4, yaw), DIRECTIONS
@@ -135,6 +136,9 @@ class SquareRunner:
     def hold_for(self, i):
         """第 i 段到点后保持多少秒。默认每段都一样，子类可按段类型区分（如原地转向不保持）。"""
         return self.hold_seconds
+
+    def hold_at_point(self, i, leg, seconds):
+        self.pause(seconds, stopped=True)
 
     def __init__(self, args, cfg, state, buf, prepare, check, client):
         self.a, self.cfg, self.s, self.buf = args, cfg, state, buf
@@ -320,9 +324,17 @@ class SquareRunner:
             state = self.client.get_state()
             # 正常 cancel 状态可能比 action result 先到，最多等 0.5 s 接收成功结果。
             self.guard(stopped=True)
-            if state in (2, 3, 4, 5, 8, 9):
+            if state == 9:
                 break
-            if self.s.get('gateway_status', 'reason') == STOP_REASON:
+            if state in (2, 3, 4, 5, 8):
+                # Actionlib can receive the terminal status before the result
+                # on a different topic. Keep guarding while waiting for it.
+                if self.client.get_result() is not None:
+                    break
+                stop_at = stop_at or time.monotonic()
+                if time.monotonic() - stop_at > 1.:
+                    raise Stopped('收到任务结束状态，但未收到动作结果')
+            elif self.s.get('gateway_status', 'reason') == STOP_REASON:
                 stop_at = stop_at or time.monotonic()
                 if time.monotonic() - stop_at > .5:
                     raise Stopped('网关已停止，但未收到单点成功结果')
@@ -351,7 +363,7 @@ class SquareRunner:
         self.save()
         hold_at = time.monotonic()
         try:
-            self.pause(hold, stopped=True)
+            self.hold_at_point(i, leg, hold)
         finally:
             leg['hold_elapsed_s'] = time.monotonic() - hold_at
             leg['hold_end_wall'] = time.time()
@@ -374,7 +386,8 @@ class SquareRunner:
                 self.send_leg(i, goals[i], goals_map[i], yaw_map[i])
                 sent += 1
             self.record['end'] = 'SUCCEEDED'
-            say('%s完成，终点已保持 %g s，继续悬停。切回定点再切 OFFBOARD 才重跑' % (self.route_name, self.hold_seconds))
+            again = '切回定点再切 OFFBOARD 才重跑' if self.repeat_laps else '请飞手接管降落'
+            say('%s完成，终点已保持 %g s，继续悬停。%s' % (self.route_name, self.hold_seconds, again))
             return True
         except BaseException as error:
             cancel_error = ''
@@ -392,7 +405,8 @@ class SquareRunner:
                 self.record.update(end='INTERRUPTED' if isinstance(error, KeyboardInterrupt) else 'ABORTED', reason=why)
                 if self.record['legs'] and self.record['legs'][-1]['end'] == 'RUNNING':
                     self.record['legs'][-1].update(end=self.record['end'], reason=why, end_wall=time.time())
-            say('本圈终止：%s。不会续飞剩余边；切回定点再切 OFFBOARD 才重跑' % why)
+            again = '切回定点再切 OFFBOARD 才重跑' if self.repeat_laps else '请飞手接管降落'
+            say('本圈终止：%s。不会续飞剩余边；%s' % (why, again))
             if not isinstance(error, Stopped):
                 raise
             return False
@@ -417,6 +431,8 @@ class SquareRunner:
                 seen = self.s.entries
                 if self.s.offboard():
                     self.run_lap()
+                    if not self.repeat_laps:
+                        return
                     # 飞行/取消期间发生的边沿属于本圈，不能在返回这里后意外触发新圈。
                     seen = self.s.entries
                     continue

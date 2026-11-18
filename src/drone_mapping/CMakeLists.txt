@@ -8,3 +8,8 @@ find_package(catkin REQUIRED)
 catkin_python_setup()
 catkin_package()
 # 单元测试不挂到 catkin：python3 -m unittest discover -s src/drone_mapping/test（见 README）
+
+add_executable(prior_grid_raycast src/prior_grid_raycast.cpp)
+set_property(TARGET prior_grid_raycast PROPERTY CXX_STANDARD 14)
+target_compile_options(prior_grid_raycast PRIVATE -O3)
+install(TARGETS prior_grid_raycast RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
