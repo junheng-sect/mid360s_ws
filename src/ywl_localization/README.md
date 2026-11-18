@@ -45,10 +45,11 @@ interpolation within a 150 ms bracket and never extrapolates. The baseline body 
 represents the LiDAR IMU. Only the static gravity transform and the confirmed map alignment are
 composed onto it.
 
-At the next scan the estimator destroys the bootstrap tree and builds a clean tree from
-`map_world.pcd`, transformed into `ywl_odom`. The IEKF origin, rotation, velocity, gravity and
-covariance are preserved. The prior tree is queried without any additions or deletions. Treat
-`/ywl/odom` twist as unspecified and take velocity from the separate topic.
+The estimator builds the fixed index in `drone_map` before subscribing to the raw sensors.
+At the handoff scan it replaces the bootstrap index with the prepared one. Search queries are
+transformed to the map frame and the returned neighbors are transformed back to `ywl_odom`.
+The local plane observations and IEKF keep the same origin, velocity, gravity and covariance.
+The fixed tree receives no additions or deletions. Take velocity from the separate topic.
 `TRACKING` means the filter produced a finite update with valid point-to-plane observations.
 `STALE` and `FAILED` stop valid output and require a fresh process with a new initialization.
 
@@ -56,8 +57,10 @@ covariance are preserved. The prior tree is queried without any additions or del
 
 The runner uses its own ROS master and publishes only the raw LiDAR and IMU topics from the bag.
 Seed mode first regenerates baseline odometry and static TF from raw input, then runs the existing
-two-window offline startup simulator with playback held during the solver. This applies the
-existing map, static and window gates in sensor time without measuring live initialization latency.
+two-window offline startup simulator with playback held during the solver. Pass
+`--reloc-config /absolute/path/outdoor.yaml` to use the outdoor search constraints in seed mode.
+This applies the existing map, static and window gates in sensor time without measuring live
+initialization latency.
 A confirmed seed contains the baseline map alignment and the baseline IMU pose at the handoff
 stamp, plus the map identity. Each YWL run computes a new alignment from its own bootstrap pose.
 

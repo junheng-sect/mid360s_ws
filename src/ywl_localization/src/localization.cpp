@@ -138,13 +138,16 @@ class Node {
         meta_sha_ = sha256(meta_);
         boost::property_tree::ptree metadata;
         boost::property_tree::read_json(meta_, metadata);
+        PointCloudXYZI prior;
         if (metadata.get<uint64_t>("points_world") < NUM_MATCH_POINTS ||
-            pcl::io::loadPCDFile(pcd_, prior_) == -1 || prior_.size() < NUM_MATCH_POINTS ||
-            prior_.size() != metadata.get<uint64_t>("points_world"))
+            pcl::io::loadPCDFile(pcd_, prior) == -1 || prior.size() < NUM_MATCH_POINTS ||
+            prior.size() != metadata.get<uint64_t>("points_world"))
             throw std::runtime_error("invalid or empty prior map");
-        for (const auto &point : prior_) {
+        for (const auto &point : prior) {
             if (!pcl::isFinite(point)) throw std::runtime_error("nonfinite prior point");
         }
+        fixed_tree_ = std::make_unique<KD_TREE<PointType>>();
+        fixed_tree_->Build(PointVector(prior.begin(), prior.end()));
         if (file_version(pcd_) != pcd_version_ || file_version(meta_) != meta_version_)
             throw std::runtime_error("map changed while loading");
         std::vector<double> translation, rotation;
@@ -303,26 +306,14 @@ class Node {
         }
         map_from_local_.linear() = q.normalized().toRotationMatrix();
         map_from_local_.translation() = V3D(t.x, t.y, t.z);
+        local_from_map_ = map_from_local_.inverse();
         pending_init_ = true;
     }
 
     void activate_prior() {
-        const Pose lidar_local_from_map = map_from_local_.inverse();
-        PointVector points;
-        points.reserve(prior_.size());
-        for (const auto &p : prior_) {
-            PointType point{};
-            point.getVector3fMap() = (lidar_local_from_map * p.getVector3fMap().cast<double>()).cast<float>();
-            if (!pcl::isFinite(point)) throw std::runtime_error("invalid transformed prior point");
-            point.intensity = p.intensity;
-            points.push_back(point);
-        }
-        // Do not move-assign KD_TREE: it owns a worker thread and mutexes.
-        auto fixed = std::make_unique<KD_TREE<PointType>>();
-        fixed->Build(std::move(points));
-        tree_ = std::move(fixed);
-        prior_.clear();
-        prior_.points.shrink_to_fit();
+        // The fixed tree is already built in drone_map. Switch the index at
+        // the scan boundary without changing the filter's bootstrap frame.
+        tree_ = std::move(fixed_tree_);
         neighbors_.clear();
         tracking_ = true;
         pending_init_ = false;
@@ -449,7 +440,20 @@ class Node {
             auto &near = self.neighbors_[i];
             if (data.converge || near.empty()) {
                 std::vector<float> distance;
-                self.tree_->Nearest_Search(world, NUM_MATCH_POINTS, near, distance);
+                auto query = world;
+                if (self.tracking_) {
+                    query.getVector3fMap() =
+                        (self.map_from_local_ * world.getVector3fMap().cast<double>()).cast<float>();
+                }
+                self.tree_->Nearest_Search(query, NUM_MATCH_POINTS, near, distance);
+                if (self.tracking_) {
+                    // Keep the existing local-frame point-to-plane residual
+                    // and Jacobian. A rigid transform preserves search distance.
+                    for (auto &neighbor : near) {
+                        const V3D local = self.local_from_map_ * neighbor.getVector3fMap().cast<double>();
+                        neighbor.getVector3fMap() = local.cast<float>();
+                    }
+                }
                 self.selected_[i] = near.size() >= NUM_MATCH_POINTS && distance[NUM_MATCH_POINTS - 1] <= 5;
             }
             if (!self.selected_[i]) continue;
@@ -662,16 +666,16 @@ class Node {
     double time_offset_ = 0, map_leaf_ = 0.5, mean_duration_ = 0, input_ms_ = 0;
     unsigned duration_samples_ = 0;
     bool configured_ = false, pending_init_ = false, tracking_ = false, publish_cloud_ = false;
-    Pose map_from_local_ = Pose::Identity();
+    Pose map_from_local_ = Pose::Identity(), local_from_map_ = Pose::Identity();
     V3D extrinsic_t_;
     M3D extrinsic_r_;
     Preprocess preprocess_;
     ImuProcess imu_;
     esekfom::esekf<state_ikfom, 12, input_ikfom> filter_;
     pcl::VoxelGrid<PointType> voxel_;
-    PointCloudXYZI prior_, features_;
+    PointCloudXYZI features_;
     PointCloudXYZI::Ptr undistorted_{new PointCloudXYZI};
-    std::unique_ptr<KD_TREE<PointType>> tree_;
+    std::unique_ptr<KD_TREE<PointType>> tree_, fixed_tree_;
     std::deque<Scan> scans_;
     std::deque<sensor_msgs::Imu::ConstPtr> imus_;
     std::vector<PointVector> neighbors_;
