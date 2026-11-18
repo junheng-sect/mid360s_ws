@@ -80,6 +80,20 @@ bash /home/orangepi/mid360s_ws/scripts/nav_test/tests/run_indoor2_isolated.sh
 现场结束时人工切回定点、降落、上锁，再 Ctrl+C。验证记录见 `INDOOR2_VALIDATION.md`。
 
 
+## 室内 test3_1 四点 AprilTag 识别
+
+板端使用本仓库和 `junheng-sect/Orange` 的 `main`，后者提供相机、视觉消息、规划器和仓库监控。两个工作空间按各自说明使用 catkin 构建。
+
+从本仓库根目录运行以下命令可复现合成四点测试。脚本使用独立 ROS master 和预览网关，自行生成图像、标签、占据观测及里程计。默认加载 `/home/orangepi/orange/devel/setup.bash`，验证其他检出时可用 `INDOOR_ORANGE_SETUP` 指定已构建的 Orange 环境。
+
+```bash
+./scripts/nav_test/tests/run_indoor3_1_isolated.sh
+```
+
+默认结果存入 `~/test_data/nav_indoor3_1_validation/<时间>/`。四点产生四张 PNG，样例 CSV 为八行，覆盖 ID 0–5，另列 ID 7。故障和回归模式分别为 `dropout`、`stop`、`photo`，例如 `./scripts/nav_test/tests/run_indoor3_1_isolated.sh "$(mktemp -d)" --mode dropout`。
+
+现场手持预览使用 `./scripts/nav_test_indoor3_1.sh --preview`，实飞入口为 `./scripts/nav_test_indoor3_1.sh`。两者都需要板端已归档的飞扫图 `20261114_101654_indoor_fly_raw_000001` 及匹配的 `prior_grid.bin`。任务复用 test3 的左下、左上、右上、右下四点，每点稳住 1 秒，采样 2 秒。任务目录中的 `apriltag_observations.csv` 按观察点和 ID 记录时间戳、帧数、同步位姿及照片。结束后右下悬停，飞手接管降落。
+
 ## test7：室外全局航点（drone_map 绝对坐标）
 
 ```bash
