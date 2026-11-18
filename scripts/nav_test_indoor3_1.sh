@@ -17,7 +17,7 @@ DEFAULT_PREVIEW_HALF_HEIGHT=0.3
 test_desc() { echo "货架四点拍照识别 AprilTag、写入 CSV、右下悬停"; }
 test_arg() { return 1; }
 test_preflight() {
-  [ "$EV_MODE" = odom ] && [ "$NAV_CONFIG" = "$DEFAULT_NAV_CONFIG" ] && [ "$MAP_FRAME" = "$DEFAULT_MAP_FRAME" ] ||
+  [ "$EV_MODE" = odom ] && [ "$NAV_CONFIG" -ef "$DEFAULT_NAV_CONFIG" ] && [ "$MAP_FRAME" -ef "$DEFAULT_MAP_FRAME" ] ||
     { echo "室内 test3_1 需要飞扫图的导航配置、地图标定和 odom 模式" >&2; return 1; }
   python3 -B "$INDOOR_SCRIPT_DIR/nav_test/nav_indoor3.py" --verify-map "$MAP"
 }
