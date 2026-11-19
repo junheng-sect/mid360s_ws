@@ -1,4 +1,5 @@
 """Shared camera and fixed shelf route for indoor test3 and test3_1."""
+from collections import deque
 import math
 import shutil
 import time
@@ -19,17 +20,27 @@ from drone_navigation.core import rotation
 width, height = 4224, 3136
 
 
+# Raw mono images from the two mounted cameras. Only the lower stream needs
+# a short history to bracket the selected full-resolution upper frame.
+PHOTO_STREAMS = {
+    'ov13855': ('/ov13855_full/image_raw', 'ov13855_optical_frame', width, height),
+    'ov9281': ('/usb_cam/image_raw', 'usb_camera_optical_frame', 1280, 800),
+}
+
+
 class Frame:
-    def __init__(self):
-        self.msg = None
-        self.subscription = rospy.Subscriber('/ov13855_full/image_raw', Image, self.receive,
-                                             queue_size=1, buff_size=2 * width * height)
+    def __init__(self, camera='ov13855'):
+        self.camera = camera
+        topic, self.frame_id, self.width, self.height = PHOTO_STREAMS[camera]
+        self.recent = deque(maxlen=16 if camera == 'ov9281' else 1)
+        self.subscription = rospy.Subscriber(topic, Image, self.receive, queue_size=1,
+                                             buff_size=2 * self.width * self.height)
 
     def receive(self, msg):
-        if (msg.width == width and msg.height == height and msg.encoding == 'mono8'
-                and msg.header.frame_id == 'ov13855_optical_frame' and msg.step >= width
-                and len(msg.data) == msg.step * height):
-            self.msg = msg
+        if (msg.width == self.width and msg.height == self.height and msg.encoding == 'mono8'
+                and msg.header.frame_id == self.frame_id and msg.step >= self.width
+                and len(msg.data) == msg.step * msg.height and msg.header.stamp.to_nsec() > 0):
+            self.recent.append(msg)
 
     def close(self):
         if self.subscription is not None:
@@ -40,7 +51,7 @@ class Frame:
 def wait_for_frame(frame, since, deadline, guard):
     while not rospy.is_shutdown():
         guard()
-        msg = frame.msg
+        msg = frame.recent[-1] if frame.recent else None
         if msg is not None and msg.header.stamp > since:
             age = (rospy.Time.now() - msg.header.stamp).to_sec()
             if -.02 <= age <= .25:
@@ -49,12 +60,35 @@ def wait_for_frame(frame, since, deadline, guard):
         if left <= 0:
             break
         time.sleep(min(.03, left))
-    raise Stopped('未收到带有效时间戳的 OV13855 全分辨率新帧')
+    raise Stopped('未收到带有效时间戳的 %s 新帧' % frame.camera.upper())
+
+
+def nearest_photo(frame, anchor, start, end, deadline, guard):
+    # The single USB publisher stamps images in acquisition order. Once we
+    # have crossed the anchor we have both neighbours (if both are in-window).
+    best = None
+    while not rospy.is_shutdown():
+        guard()
+        recent = frame.recent.copy()
+        for msg in recent:
+            stamp = msg.header.stamp
+            if start <= stamp < end and (best is None or
+                    abs((stamp - anchor).to_nsec()) < abs((best.header.stamp - anchor).to_nsec())):
+                best = msg
+        if recent and recent[-1].header.stamp >= anchor and best is not None:
+            return best
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        time.sleep(min(.01, left))
+    if best is None or rospy.is_shutdown():
+        raise Stopped('观察窗口内没有有效的 %s 照片帧' % frame.camera.upper())
+    return best
 
 
 def save_photo(msg, path, guard):
     temp = path.with_suffix('.tmp.png')
-    img = np.frombuffer(msg.data, dtype=np.uint8).reshape(height, msg.step)[:, :width]
+    img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.step)[:, :msg.width]
     try:
         if not cv2.imwrite(str(temp), img, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
             raise OSError('PNG 保存失败')
@@ -66,15 +100,18 @@ def save_photo(msg, path, guard):
         temp.unlink(missing_ok=True)
 
 
-def probe_photo(out):
-    frame = Frame()
-    try:
-        wait_for_frame(frame, rospy.Time.now(), time.monotonic() + 12., lambda: None)
-    finally:
-        frame.close()
-    if shutil.disk_usage(out).free < 4 * (width * height + 1024 * 1024):
-        raise Stopped('test3 磁盘空间不足以保存四张全分辨率 PNG')
-    say('test3 相机已就绪：OV13855 4224×3136 mono8')
+def probe_photo(out, cameras=('ov13855',)):
+    required = 0
+    for camera in cameras:
+        frame = Frame(camera)
+        try:
+            wait_for_frame(frame, rospy.Time.now(), time.monotonic() + 12., lambda: None)
+        finally:
+            frame.close()
+        required += 4 * (frame.width * frame.height + 1024 * 1024)
+        say('%s 照片流已就绪：%d×%d mono8' % (camera.upper(), frame.width, frame.height))
+    if shutil.disk_usage(out).free < required:
+        raise Stopped('磁盘空间不足以保存四个点位的 PNG')
     return 0
 
 

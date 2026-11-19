@@ -98,7 +98,7 @@ bash /home/orangepi/mid360s_ws/scripts/nav_test/tests/run_indoor2_isolated.sh
 
 在板端运行 `~/mid360s_ws/scripts/nav_test_indoor3_2.sh`，手持预览加 `--preview`。沿用上述四点、原图拍照与每点 2 秒观察窗口。上方 OV13855 用 1280×960、15 Hz 检测，下方 OV9281 用 USB MJPEG 1280×800、30 Hz 和对应内参。两路均检测 tag36h11。
 
-`apriltag_observations.csv` 每行对应一个点位、一台相机和一个 ID。按 `camera`、`waypoint`、`id` 对照，用 `seen_frames / window_frames` 比较各自的命中率。照片是同一窗口内的 OV13855 全图。任务 JSON 的 `legs[].observation.cameras` 也记录零命中点的帧数、ID 和最大帧间隔，`coverage` 给出各自的 0–5 覆盖情况。任何一路在窗口内出现超过 0.5 秒的间隙，都保存窗口统计并沿用任务断流处理。
+`apriltag_observations.csv` 每行对应一个点位、一台相机和一个 ID。按 `camera`、`waypoint`、`id` 对照，用 `seen_frames / window_frames` 比较各自的命中率。每点各保存一张原始灰度 PNG，包括零命中点。上相机示例为 `01_左下.png`（4224×3136），下相机为 `01_左下_ov9281.png`（1280×800）。以下相机在同窗内最接近上相机图像时间戳的一帧配对。`photo_file` 和 `photo_stamp_ns` 对应本行相机。JSON 的 `legs[].photos` 记录双方的文件、时间戳和坐标系，`photo_delta_ms` 为两个消息时间戳差的绝对值（毫秒）。任务 JSON 的 `legs[].observation.cameras` 也记录零命中点的帧数、ID 和最大帧间隔，`coverage` 给出各自的 0–5 覆盖情况。任何一路在窗口内出现超过 0.5 秒的间隙，都保存窗口统计并沿用任务断流处理。
 
 ## test7：室外全局航点（drone_map 绝对坐标）
 

@@ -2,6 +2,7 @@
 """Observe shelf AprilTags at the four indoor photo stops."""
 import argparse
 import csv
+from contextlib import ExitStack
 from collections import defaultdict, deque
 from pathlib import Path
 import threading
@@ -14,7 +15,7 @@ from ov13855_apriltag_vision.msg import TagSurveyFrame
 from tf.transformations import quaternion_from_matrix, quaternion_multiply
 from front_marker_control.localization import LocalPoseBuffer
 
-from indoor3_runner import Frame, Indoor3Runner, probe_photo, save_photo, serve_route, wait_for_frame
+from indoor3_runner import Frame, Indoor3Runner, nearest_photo, probe_photo, save_photo, serve_route, wait_for_frame
 from nav_forward import say
 from nav_indoor3 import load_route
 from nav_square import Stopped
@@ -163,30 +164,43 @@ class SurveyRunner(Indoor3Runner):
     def hold_at_point(self, i, leg, seconds):
         name = self.a.route['points'][i]['name']
         path = self.csv_path.parent / ('%02d_%s.png' % (i + 1, name))
-        if path.exists():
-            raise Stopped('照片文件已存在：' + path.name)
+        paths = {'ov13855': path}
+        if 'ov9281' in self.cameras:
+            paths['ov9281'] = path.with_name(path.stem + '_ov9281.png')
         observation = leg['observation'] = dict(status='settling')
-        frame = Frame()
         try:
-            self.pause(1., stopped=True)
-            start = rospy.Time.now()
-            end = start + rospy.Duration(WINDOW_S)
-            observation.update(status='sampling', start_ns=start.to_nsec(), end_ns=end.to_nsec())
-            deadline = time.monotonic() + WINDOW_S
-            msg = wait_for_frame(frame, start, deadline, self.hold_guard)
-            frame.close()
-            if msg.header.stamp >= end:
-                raise Stopped('观察窗口内没有全分辨率新帧')
+            for camera, target in paths.items():
+                if target.exists():
+                    raise Stopped('%s 照片已存在：%s' % (camera.upper(), target.name))
+            with ExitStack() as subscriptions:
+                streams = {}
+                for camera in paths:
+                    streams[camera] = Frame(camera)
+                    subscriptions.callback(streams[camera].close)
+                self.pause(1., stopped=True)
+                start = rospy.Time.now()
+                end = start + rospy.Duration(WINDOW_S)
+                observation.update(status='sampling', start_ns=start.to_nsec(), end_ns=end.to_nsec())
+                deadline = time.monotonic() + WINDOW_S
+                upper = wait_for_frame(streams['ov13855'], start, deadline, self.hold_guard)
+                streams['ov13855'].close()
+                if upper.header.stamp >= end:
+                    raise Stopped('观察窗口内没有 OV13855 全分辨率新帧')
+                images = {'ov13855': upper}
+                if 'ov9281' in streams:
+                    images['ov9281'] = nearest_photo(streams['ov9281'], upper.header.stamp,
+                                                     start, end, deadline, self.hold_guard)
             # Allow in-flight detections and bracketing odometry to arrive, but
             # only accept source stamps inside the original two-second window.
             self.pause(max(0., deadline - time.monotonic()) + .5, stopped=True)
-            photo = dict(file=path.name, stamp_ns=msg.header.stamp.to_nsec(), frame_id=FRAME)
+            photos = {camera: dict(file=paths[camera].name, stamp_ns=image.header.stamp.to_nsec(),
+                                  frame_id=image.header.frame_id) for camera, image in images.items()}
             stats = {}
             rows = []
             with self.lock:
                 for camera, messages in self.frames.items():
                     frames = {m.header.stamp.to_nsec(): m for m in messages if start <= m.header.stamp < end}
-                    hits = waypoint_rows(frames, i + 1, name, photo,
+                    hits = waypoint_rows(frames, i + 1, name, photos[camera],
                                          lambda ns: self.poses.lookup(ns / 1e9, .20), self.reference)
                     if 'camera' in self.csv_fields:
                         for row in hits:
@@ -195,8 +209,22 @@ class SurveyRunner(Indoor3Runner):
                     gap = max(b - a for a, b in zip(stamps, stamps[1:]))
                     stats[camera] = dict(frames=len(frames), max_gap_ns=gap, ids=[r['id'] for r in hits])
                     rows.extend(hits)
-            save_photo(msg, path, self.hold_guard)
-            leg['photo'] = photo
+            saved = []
+            try:
+                for camera, image in images.items():
+                    try:
+                        save_photo(image, paths[camera], self.hold_guard)
+                    except Stopped as error:
+                        raise Stopped('%s 拍照失败：%s' % (camera.upper(), error)) from error
+                    saved.append(paths[camera])
+            except BaseException:
+                for target in saved:
+                    target.unlink(missing_ok=True)
+                raise
+            leg['photo'] = photos['ov13855']
+            if 'ov9281' in photos:
+                leg['photos'] = photos
+                leg['photo_delta_ms'] = abs(photos['ov9281']['stamp_ns'] - photos['ov13855']['stamp_ns']) / 1e6
             self.store_window(observation, stats)
             faults = [camera for camera, item in stats.items() if item['max_gap_ns'] > MAX_FRAME_GAP_NS]
             observation['status'] = 'stream_fault' if faults else 'complete'
@@ -208,10 +236,10 @@ class SurveyRunner(Indoor3Runner):
         except BaseException as error:
             if observation['status'] != 'stream_fault':
                 observation['status'] = 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed'
-            observation['reason'] = str(error) or type(error).__name__
+            observation['reason'] = '%s：%s' % (name, str(error) or type(error).__name__)
+            if isinstance(error, Stopped):
+                raise Stopped(observation['reason']) from error
             raise
-        finally:
-            frame.close()
 
 
 class DualSurveyRunner(SurveyRunner):
@@ -242,7 +270,7 @@ def main():
     runner = DualSurveyRunner if args.dual_camera else SurveyRunner
     if args.probe_camera:
         rospy.init_node(runner.test_name + '_camera_probe', anonymous=True)
-        probe_photo(args.out)
+        probe_photo(args.out, runner.cameras)
         for camera, (topic, frame_id) in runner.cameras.items():
             deadline = time.monotonic() + 6.
             while time.monotonic() < deadline:

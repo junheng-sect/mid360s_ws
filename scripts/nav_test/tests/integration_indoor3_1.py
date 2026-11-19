@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the four-stop survey on a private master with synthetic flight and camera."""
 import argparse
+from collections import deque
 import csv
 import json
 import math
@@ -28,7 +29,7 @@ from drone_navigation.ros_common import path_of
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from integration_sequence import Fixture
-from indoor3_runner import Indoor3Runner
+from indoor3_runner import Indoor3Runner, nearest_photo
 from nav_indoor3 import load_route
 from nav_indoor3_1 import FRAME, FAMILY, TOPIC, DualSurveyRunner, SurveyRunner, coverage, waypoint_rows
 from nav_square import SquareState
@@ -61,6 +62,22 @@ def test_rows():
     print('PASS duplicate ID, one-frame hit, earliest aligned frame, missing odometry, map pose and partial coverage')
 
 
+def test_nearest_photo():
+    start = rospy.Time.from_sec(100.)
+    end = start + rospy.Duration(2.)
+    # With both neighbours published, choose either side of the upper timestamp.
+    # A closer frame outside the sampling window must never be selected.
+    for times, anchor, expected in [([-.001, .040, .080], .001, .040),
+                                    ([.010, .045, .080], .050, .045),
+                                    ([.010, .045, .080], .075, .080),
+                                    ([1.94, 2.00], 1.99, 1.94)]:
+        msgs = deque(Image(header=Header(stamp=start + rospy.Duration(t))) for t in times)
+        frame = SimpleNamespace(recent=msgs, camera='ov9281')
+        photo = nearest_photo(frame, start + rospy.Duration(anchor), start, end, time.monotonic(), lambda: None)
+        assert photo.header.stamp == start + rospy.Duration(expected)
+    print('PASS nearest in-window USB image on either side of the upper image')
+
+
 class Camera:
     def __init__(self, fixture, points, mode):
         self.fixture, self.points, self.mode = fixture, np.asarray([p['xyz'] for p in points]), mode
@@ -69,6 +86,9 @@ class Camera:
         if mode.startswith('dual'):
             topic, self.usb_frame = DualSurveyRunner.cameras['ov9281']
             self.usb = rospy.Publisher(topic, TagSurveyFrame, queue_size=5)
+            self.usb_images = rospy.Publisher('/usb_cam/image_raw', Image, queue_size=1)
+            # Padded rows exercise mono8 step handling and distinguish this stream.
+            self.usb_pixels = (bytes([101]) * 1280 + bytes(4)) * 800
         self.images = rospy.Publisher('/ov13855_full/image_raw', Image, queue_size=1)
         self.pixels = bytes(4224 * 3136)
         self.tag_timer = rospy.Timer(rospy.Duration(.08), self.publish_tags)
@@ -95,6 +115,11 @@ class Camera:
                                               family=FAMILY, ids=ids, tags=[tag(i) for i in ids]))
 
     def publish_image(self, _):
+        if self.usb and self.usb_images.get_num_connections():
+            missing = self.mode == 'dual_missing_photo' and np.linalg.norm(self.points[1] - self.fixture.p) < .04
+            if not missing:
+                self.usb_images.publish(Image(header=Header(frame_id=self.usb_frame, stamp=rospy.Time.now()),
+                                              width=1280, height=800, step=1284, encoding='mono8', data=self.usb_pixels))
         if self.images.get_num_connections():
             self.images.publish(Image(header=Header(frame_id=FRAME, stamp=rospy.Time.now()),
                                       width=4224, height=3136, step=4224, encoding='mono8', data=self.pixels))
@@ -143,9 +168,23 @@ def verify_dual(out, record, mode):
     upper, lower = 'ov13855', 'ov9281'
     for i, leg in enumerate(record['legs'], 1):
         obs = leg['observation']
+        if mode == 'dual_missing_photo' and i == 2:
+            assert obs['status'] == 'failed' and 'OV9281' in obs['reason'] and '左上' in record['reason']
+            assert 'photos' not in leg and not list(out.glob('02_*.png'))
+            continue
+        photos = leg['photos']
+        assert photos[upper] == leg['photo'] and photos[lower]['file'] == Path(photos[upper]['file']).stem + '_ov9281.png'
+        assert leg['photo_delta_ms'] == abs(photos[lower]['stamp_ns'] - photos[upper]['stamp_ns']) / 1e6
+        for camera, shape, pixel in ((upper, (3136, 4224), 0), (lower, (800, 1280), 101)):
+            assert obs['start_ns'] <= photos[camera]['stamp_ns'] < obs['end_ns']
+            assert photos[camera]['frame_id'] == DualSurveyRunner.cameras[camera][1]
+            png = cv2.imread(str(out / photos[camera]['file']), cv2.IMREAD_UNCHANGED)
+            assert png.shape == shape and png.dtype == np.uint8 and np.all(png == pixel)
         stats = obs['cameras']
         assert obs['end_ns'] - obs['start_ns'] == 2_000_000_000
         for r in (r for r in rows if int(r['waypoint']) == i):
+            photo = photos[r['camera']]
+            assert r['photo_file'] == photo['file'] and int(r['photo_stamp_ns']) == photo['stamp_ns']
             item = stats[r['camera']]
             assert int(r['window_frames']) == item['frames'] and 0 < int(r['seen_frames']) <= item['frames']
             assert obs['start_ns'] <= int(r['first_stamp_ns']) <= int(r['last_stamp_ns']) < obs['end_ns']
@@ -154,11 +193,13 @@ def verify_dual(out, record, mode):
     assert record['legs'][0]['observation']['cameras'][upper]['ids'] == [0, 1, 5]
     assert record['legs'][0]['observation']['cameras'][lower]['ids'] == [1, 8]
     if mode == 'dual':
-        assert record['end'] == 'SUCCEEDED' and len(record['legs']) == 4 and len(rows) == 12
+        assert record['end'] == 'SUCCEEDED' and len(record['legs']) == 4 and len(rows) == 12 and len(list(out.glob('*.png'))) == 8
         assert record['coverage'][upper]['count'] == 6 and record['coverage'][upper]['extra'] == [7]
         assert record['coverage'][lower]['seen'] == [0, 1, 4] and record['coverage'][lower]['extra'] == [8]
         empty = record['legs'][1]['observation']['cameras'][lower]
         assert empty['frames'] > 0 and empty['ids'] == []
+    elif mode == 'dual_missing_photo':
+        assert record['end'] == 'ABORTED' and len(record['legs']) == 2 and len(list(out.glob('*.png'))) == 2
     else:
         assert record['end'] == 'ABORTED' and len(record['legs']) == 2
         assert obs['status'] == 'stream_fault' and stats[lower]['frames'] == 0 and stats[upper]['frames'] > 0
@@ -170,10 +211,11 @@ def main():
     assert os.environ.get('ROS_MASTER_URI') == 'http://127.0.0.1:11447'
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', required=True, type=Path)
-    parser.add_argument('--mode', choices=('full', 'dropout', 'stop', 'photo', 'dual', 'dual_dropout'), default='full')
+    parser.add_argument('--mode', choices=('full', 'dropout', 'stop', 'photo', 'dual', 'dual_dropout', 'dual_missing_photo'), default='full')
     args = parser.parse_args()
     test_rows()
     rospy.init_node('indoor3_1_isolated')
+    test_nearest_photo()
     route = load_route()
     route['map_id'] = 'synthetic'
     flight = Fixture(args.out)
