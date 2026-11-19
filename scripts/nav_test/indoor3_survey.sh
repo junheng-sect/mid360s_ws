@@ -5,7 +5,6 @@ CAMERA_ARGS=()
 SURVEY_RUNNER=nav_indoor3_1.py
 SURVEY_LAUNCH="${SURVEY_VARIANT}_camera.launch"
 if [[ "$SURVEY_VARIANT" == indoor3_3 ]]; then
-  CAMERA_ARGS+=(upper_detection:=false)
   SURVEY_RUNNER=nav_indoor3_3.py
   SURVEY_LAUNCH=indoor3_2_camera.launch
 fi
@@ -20,7 +19,7 @@ DEFAULT_PREVIEW_HALF_HEIGHT=0.3
 
 test_desc() {
   if [[ "$SURVEY_VARIANT" == indoor3_3 ]]; then
-    echo "Tag 1 前方 0.8 m 双相机扫码"
+    echo "OV13855 光心距 Tag 1 0.62 m，双相机按同帧 Tag 位姿扫码"
   else
     echo "货架四点拍照识别 AprilTag、写入 CSV、右下悬停"
   fi

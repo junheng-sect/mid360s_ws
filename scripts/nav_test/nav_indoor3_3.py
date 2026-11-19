@@ -8,6 +8,7 @@ from pathlib import Path
 import threading
 import time
 from collections import deque
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,8 +21,8 @@ from drone_navigation.core import finite, heading, rotation
 from front_marker_control.localization import LocalPoseBuffer
 
 from indoor3_runner import probe_photo, PHOTO_STREAMS
-from indoor3_3_geometry import consolidate, fixed_scan_goal, map_tag
-from indoor3_3_qr import paired_scan
+from indoor3_3_geometry import UPPER_STANDOFF_M, consolidate, fixed_scan_goal, map_tag
+from indoor3_3_qr import open_streams, paired_scan
 from nav_forward import say
 from nav_global import serve
 from nav_indoor3 import load_route
@@ -46,6 +47,10 @@ def settings():
     cfg['camera_rotation_xyzw'] = tf['rotation_quaternion']
     finite(cfg['camera_translation'])
     rotation(cfg['camera_rotation_xyzw'])
+    upper = yaml.safe_load(tf_path.with_name('ov13855_camera_tf.yaml').read_text())
+    if (upper['base_frame'], upper['camera_frame']) != ('drone_base', PHOTO_STREAMS['ov13855'][1]):
+        raise ValueError('OV13855 mounting frame mismatch')
+    cfg['upper_translation'] = finite(upper['translation']).tolist()
     return cfg
 
 
@@ -58,9 +63,10 @@ def write_json(path, data):
 def write_summary(out):
     records = [json.loads(p.read_text()) for p in sorted(out.glob('round_*/round.json'))]
     fields = ['round','status','expected_text','text_confirmed','goal_yaw_map_deg','arrival_yaw_map_deg']
+    scan_fields = ('status', 'reason', 'attempts', 'first_match_ms', 'strategy', 'range_m', 'depth_m')
     score = {c:0 for c in PHOTO_STREAMS}
     for camera in score:
-        fields += [camera+'_'+s for s in ('status','attempts','first_match_ms','texts','photo')]
+        fields += [camera+'_'+s for s in (*scan_fields, 'texts', 'photo')]
     total = 0
     tmp = out/'rounds.tmp'
     with tmp.open('w', newline='', encoding='utf-8') as stream:
@@ -74,7 +80,7 @@ def write_summary(out):
             total += int(complete)
             for cam, s in cameras.items():
                 score[cam] += int(complete and s['status'] == 'success')
-                for k in ('status','attempts','first_match_ms'):
+                for k in scan_fields:
                     row[cam+'_'+k] = s.get(k)
                 row[cam+'_texts'] = json.dumps(sorted({v for a in s['reads'] for v in a['texts']}), ensure_ascii=False)
                 if s.get('photo'):
@@ -185,14 +191,14 @@ class Runner(SquareRunner):
                               reason='5 秒内没有稳定锁定 Tag 1' if live else 'OV9281 Tag 数据流中断')
             raise Stopped(self.trial['reason'])
         tag, axes, stamps = observed
-        goal, camera = fixed_scan_goal(tag, axes, self.reference, self.translation-self.lever, YAW)
+        goal, camera = fixed_scan_goal(tag, axes, self.reference, finite(self.config['upper_translation'])-self.lever, YAW)
         if not np.isfinite(goal).all() or goal[2] > self.route['max_control_z']:
             raise Stopped('扫码目标无效或超过室内高度上限')
         self.trial.update(tag_center_map=tag.tolist(), normal_map=axes[:,2].tolist(), tag_stamps_ns=stamps,
                           camera_goal_map=camera.tolist(), control_goal_map=goal.tolist(),
-                          goal_yaw_map_deg=-89.5, standoff_m=.8)
+                          goal_yaw_map_deg=-89.5, standoff_camera="ov13855", standoff_m=UPPER_STANDOFF_M)
         write_json(self.folder/'round.json', self.trial)
-        return np.array([goal]), np.array([YAW]), ('Tag 1 前方 0.8 m',)
+        return np.array([goal]), np.array([YAW]), ('OV13855 距 Tag 1 %.2f m' % UPPER_STANDOFF_M,)
 
     def freeze(self):
         try:
@@ -253,13 +259,16 @@ def main():
         rospy.init_node('indoor3_3_probe',anonymous=True)
         cfg = settings()
         probe_photo(args.out, PHOTO_STREAMS)
-        until = time.monotonic()+6.
-        while time.monotonic()<until:
-            m = rospy.wait_for_message(TOPIC, TagSurveyFrame, timeout=max(.01,until-time.monotonic()))
-            if valid_frame(m, FRAME):
-                say('OV9281 Tag 流就绪，目标 QR '+cfg['expected_text'])
-                return 0
-        raise Stopped('OV9281 Tag 流未就绪')
+        with ExitStack() as resources:
+            streams = open_streams(resources)
+            until = time.monotonic() + 8.
+            while time.monotonic() < until:
+                if all(s.ready() for s in streams.values()):
+                    say('双路图像、标定和 Tag 检测流就绪，目标 QR '+cfg['expected_text'])
+                    return 0
+                time.sleep(.025)
+            missing = [s.camera + ' ' + s.calibration_error for s in streams.values() if not s.ready()]
+            raise Stopped('相机或 Tag 流未就绪：' + ', '.join(missing))
     return serve('nav_indoor3_3', SimpleNamespace(out=str(args.out), preview=args.preview, delay=3.), Runner)
 
 

@@ -29,10 +29,10 @@ PHOTO_STREAMS = {
 
 
 class Frame:
-    def __init__(self, camera='ov13855'):
+    def __init__(self, camera='ov13855', history=None):
         self.camera = camera
         topic, self.frame_id, self.width, self.height = PHOTO_STREAMS[camera]
-        self.recent = deque(maxlen=16 if camera == 'ov9281' else 1)
+        self.recent = deque(maxlen=history or (16 if camera == 'ov9281' else 1))
         self.subscription = rospy.Subscriber(topic, Image, self.receive, queue_size=1,
                                              buff_size=2 * self.width * self.height)
 

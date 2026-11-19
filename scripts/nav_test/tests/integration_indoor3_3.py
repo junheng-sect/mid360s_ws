@@ -19,7 +19,7 @@ import rospy
 import tf2_ros
 from geometry_msgs.msg import Point, Pose, Quaternion
 from ov13855_apriltag_vision.msg import TagObservation, TagSurveyFrame
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Header
 from std_srvs.srv import Trigger
 from tf.transformations import quaternion_from_matrix
@@ -31,37 +31,45 @@ from drone_navigation.ros_common import path_of
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from integration_sequence import Fixture
 from indoor3_runner import PHOTO_STREAMS
-from nav_indoor3_3 import FRAME, TOPIC, Runner, YAW, fixed_scan_goal, settings
+from nav_indoor3_3 import Runner, YAW, fixed_scan_goal, settings
 from nav_square import SquareState, Stopped
 from indoor3_3_qr import paired_scan
 from mavros_msgs.msg import State as FCUState
 import threading
 
 
-def image_data(w,h,text):
-    png = subprocess.check_output(['qrencode','-s','9','-m','4','-o','-',text])
-    qr = cv2.imdecode(np.frombuffer(png,np.uint8),cv2.IMREAD_GRAYSCALE)
-    img = np.full((h,w),255,np.uint8)
-    img[100:100+qr.shape[0],100:100+qr.shape[1]] = qr
-    return img.tobytes()
+def qr_patch(text, size):
+    png = subprocess.check_output(['qrencode', '-s', '4', '-m', '4', '-o', '-', text])
+    qr = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_GRAYSCALE)
+    return cv2.resize(qr, (size, size), interpolation=cv2.INTER_NEAREST)
 
 
 class Camera:
     def __init__(self, flight, lever):
         self.flight = flight
         cfg = settings()
-        self.offset = np.array(cfg['camera_translation'])-lever
+        self.offsets = {'ov9281': np.array(cfg['camera_translation']) - lever,
+                        'ov13855': np.array(cfg['upper_translation']) - lever}
         self.rot = rotation(cfg['camera_rotation_xyzw'])
         self.tag = np.array([.61,-1.15,.5])
         self.axes = np.array([[-1.,0,0],[0,0,1.],[0,1.,0]])
-        self.visible = False
-        self.miss = False
-        self.drop = False
-        self.pubs = {c:rospy.Publisher(s[0],Image,queue_size=1) for c,s in PHOTO_STREAMS.items()}
-        self.pixels = {(c,t): image_data(s[2],s[3],t) for c,s in PHOTO_STREAMS.items()
-                       for t in ('BOX-99','BOX-01')}
-        self.start = {c:None for c in self.pubs}
-        self.tags = rospy.Publisher(TOPIC,TagSurveyFrame,queue_size=4)
+        self.visible = self.miss = self.drop = self.skew = self.hide_upper = False
+        self.pubs = {}
+        self.infos = {}
+        self.tags = {}
+        self.patches = {}
+        self.rasters = {}
+        self.start = {}
+        for c, (topic, frame, w, h) in PHOTO_STREAMS.items():
+            self.pubs[c] = rospy.Publisher(topic, Image, queue_size=1)
+            self.tags[c] = rospy.Publisher('/%s_apriltag_vision/survey' % c, TagSurveyFrame, queue_size=4)
+            info = rospy.Publisher(topic.replace('image_raw', 'camera_info'), CameraInfo, queue_size=1, latch=True)
+            focal = 1500. if c == 'ov9281' else 3200.
+            self.infos[c] = info, focal
+            info.publish(CameraInfo(header=Header(stamp=rospy.Time.now(), frame_id=frame), width=w, height=h,
+                                    distortion_model='plumb_bob', K=[focal,0,w/2,0,focal,h/2,0,0,1], D=[0]*5))
+            self.patches[c] = {t: qr_patch(t, int(focal*.044/.64)) for t in ('BOX-99','BOX-01')}
+            self.start[c] = None
         self.clock = rospy.Timer(rospy.Duration(.075),self.tick)
 
     def tick(self,_):
@@ -69,13 +77,17 @@ class Camera:
         view = body @ self.rot
         matrix = np.eye(4)
         matrix[:3,:3] = view.T @ self.axes
-        pos = view.T @ (self.tag-self.flight.p-body@self.offset)
-        tag_id = 1 if self.visible else 2
-        tag = TagObservation(id=tag_id, pose=Pose(Point(*pos),Quaternion(*quaternion_from_matrix(matrix))),
-                             reprojection_rms_px=.3)
-        self.tags.publish(TagSurveyFrame(header=Header(stamp=rospy.Time.now(),frame_id=FRAME),
-                                         family='tag36h11',ids=[tag_id],tags=[tag]))
-        for camera,pub in self.pubs.items():
+        for camera, pub in self.pubs.items():
+            _,frame,w,h = PHOTO_STREAMS[camera]
+            stamp = rospy.Time.now()
+            pos = view.T @ (self.tag-self.flight.p-body@self.offsets[camera])
+            visible = self.visible and not (camera=='ov13855' and self.hide_upper)
+            tag_id = 1 if visible else 2
+            pose = Pose(Point(*pos), Quaternion(*quaternion_from_matrix(matrix)))
+            tag = TagObservation(id=tag_id, pose=pose, reprojection_rms_px=.3)
+            skew = (.029 if self.skew else .00002) if camera == 'ov13855' else 0.
+            self.tags[camera].publish(TagSurveyFrame(header=Header(stamp=stamp-rospy.Duration(skew),frame_id=frame),
+                                                     family='tag36h11',ids=[tag_id],tags=[tag]))
             if not pub.get_num_connections():
                 self.start[camera] = None
                 continue
@@ -84,10 +96,23 @@ class Camera:
             if self.start[camera] is None:
                 self.start[camera] = time.monotonic()
             allow = not (self.miss and camera=='ov13855')
-            text = 'BOX-01' if allow and time.monotonic()-self.start[camera]>.65 else 'BOX-99'
-            _,frame,w,h = PHOTO_STREAMS[camera]
-            pub.publish(Image(header=Header(stamp=rospy.Time.now(),frame_id=frame),width=w,height=h,
-                              step=w,encoding='mono8',data=self.pixels[camera,text]))
+            text = 'BOX-01' if allow and time.monotonic()-self.start[camera]>.70 else 'BOX-99'
+            patch = self.patches[camera][text]
+            qr = pos + matrix[:3,1]*.063
+            focal = self.infos[camera][1]
+            x = int(round(w/2+focal*qr[0]/max(.01, qr[2])))-patch.shape[1]//2
+            y = int(round(h/2+focal*qr[1]/max(.01, qr[2])))-patch.shape[0]//2
+            # Reuse the raster during a hover so the fixture can also publish its 50 Hz odometry.
+            key = (camera, text)
+            if self.rasters.get(key, ())[:2] != (x,y):
+                img = np.full((h,w),255,np.uint8)
+                if qr[2] > 0 and 0<=x<=w-patch.shape[1] and 0<=y<=h-patch.shape[0]:
+                    img[y:y+patch.shape[0],x:x+patch.shape[1]] = patch
+                neighbour = self.patches[camera]['BOX-01']
+                img[:neighbour.shape[0], :neighbour.shape[1]] = neighbour
+                self.rasters[key] = x, y, img.tobytes()
+            pub.publish(Image(header=Header(stamp=stamp,frame_id=frame), width=w,height=h,
+                              step=w,encoding='mono8',data=self.rasters[key][2]))
 
 
 def test_geometry(cam):
@@ -95,13 +120,13 @@ def test_geometry(cam):
     goals=[]
     for angle in (-.3,.3):
         axes=rz(angle)@cam.axes
-        goal,center=fixed_scan_goal(cam.tag,axes,ref,cam.offset,YAW)
-        expected=cam.tag+.8*axes[:,2]
+        goal,center=fixed_scan_goal(cam.tag,axes,ref,cam.offsets["ov13855"],YAW)
+        expected=cam.tag+.62*axes[:,2]
         np.testing.assert_allclose(center,expected)
-        measured=goal+ref[0]@rz(heading(ref[0].T,YAW))@cam.offset
+        measured=goal+ref[0]@rz(heading(ref[0].T,YAW))@cam.offsets["ov13855"]
         np.testing.assert_allclose(measured,expected)
         goals.append(goal)
-    assert np.linalg.norm(goals[1]-goals[0])>.4
+    assert np.linalg.norm(goals[1]-goals[0])>.35
     print('PASS nonidentity map transform and angled normals change standoff position')
 
 
@@ -196,7 +221,7 @@ def main():
         client=actionlib.SimpleActionClient('/drone_nav/execute_route',ExecuteRouteAction)
         assert client.wait_for_server(rospy.Duration(20))
         runner=Runner(SimpleNamespace(preview=True,out=str(args.out),delay=3.),cfg,state,buf,prepare,check,client)
-        goal,_=fixed_scan_goal(cam.tag,cam.axes,(np.eye(3),np.zeros(3)),cam.offset,YAW)
+        goal,_=fixed_scan_goal(cam.tag,cam.axes,(np.eye(3),np.zeros(3)),cam.offsets["ov13855"],YAW)
         until=time.monotonic()+30
         while runner.inputs_problem() or not prepare().success or not check(path_of([f.p,goal])).valid:
             assert time.monotonic()<until,'navigation not ready'
@@ -212,6 +237,9 @@ def main():
         assert outcomes['ov9281']['status']=='success' and outcomes['ov13855']['status']=='timeout', outcomes
         assert any('BOX-99' in attempt['texts'] for attempt in outcomes['ov9281']['reads'])
         assert all((runner.folder/s['photo']).is_file() for s in outcomes.values())
+        assert outcomes['ov13855']['reason'] == 'roi_no_target'
+        assert outcomes['ov9281']['strategy'] and outcomes['ov9281']['depth_m'] > 0.
+        assert a['standoff_camera'] == 'ov13855' and a['standoff_m'] == .62
         cam.miss=False
         cam.axes=rz(.08)@cam.axes
         assert runner.preview(),runner.trial
@@ -219,19 +247,30 @@ def main():
         assert np.linalg.norm(np.array(a['control_goal_map'])-runner.trial['control_goal_map'])>.04
         assert all(s['status']=='success' for s in runner.trial['scan']['cameras'].values()),runner.trial
         assert np.linalg.norm(np.array(runner.record['start_odom'])-runner.record['goals_odom'][0])<.2
+        reads = runner.trial['scan']['cameras']
+        for camera, distance in [('ov13855', .62), ('ov9281', .65)]:
+            assert abs(reads[camera]['range_m'] - distance) < .12, reads[camera]['range_m']
+            assert 0 < reads[camera]['depth_m'] <= reads[camera]['range_m']
+        for flag, reason in [('skew', 'no_matched_pose'), ('hide_upper', 'no_tag')]:
+            setattr(cam, flag, True)
+            assert runner.preview(), runner.trial
+            scan = runner.trial['scan']['cameras']
+            assert scan['ov13855']['reason'] == reason and scan['ov13855']['attempts'] == 0, scan
+            assert scan['ov9281']['status'] == 'success'
+            setattr(cam, flag, False)
         cam.drop=True
         assert not runner.preview() and runner.trial['status']=='stream_fault',runner.trial
         summary=json.loads((args.out/'success_rates.json').read_text())
-        assert summary['completed']==2 and summary['cameras']['ov13855']['rate']==.5
+        assert summary['completed']==4 and summary['cameras']['ov13855']['rate']==.25
         assert summary['cameras']['ov9281']['rate']==1.
         cam.drop=False
         edge_dir=args.out/'edge'
         edge_dir.mkdir()
         check_offboard_edges(edge_dir)
         with (args.out/'rounds.csv').open() as file:
-            assert len(list(csv.DictReader(file)))==4
+            assert len(list(csv.DictReader(file)))==6
         assert not any(t=='/mavros/setpoint_raw/local' for t,_ in rosgraph.Master(rospy.get_name()).getSystemState()[0])
-        print('PASS four rounds: no ID1, neighbour then target, independent timeout, both successes, short goal, stream loss excluded')
+        print('PASS six rounds: no lock, paired ROI decode, neighbour then target, skew, missing tag, stream fault excluded')
     finally:
         cam.clock.shutdown()
         f.close()
