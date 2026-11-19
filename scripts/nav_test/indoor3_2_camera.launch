@@ -1,6 +1,8 @@
 <launch>
   <arg name="layout_file" default="$(find barcode_reader_camera)/config/layouts/qr_top_tag_bottom.yaml"/>
-  <include file="$(dirname)/indoor3_1_camera.launch">
+  <arg name="upper_detection" default="true"/>
+  <include unless="$(arg upper_detection)" file="$(find ov13855_cam)/launch/ov13855.launch"/>
+  <include if="$(arg upper_detection)" file="$(dirname)/indoor3_1_camera.launch">
     <arg name="layout_file" value="$(arg layout_file)"/>
   </include>
 

@@ -1,0 +1,5 @@
+# QR decoded from the physical Tag 1 label photo.
+expected_text: "BOX-01"
+text_confirmed: true
+# drone_base FLU metres, user-selected lower camera mounting offset.
+camera_translation: [0.15, 0.0, 0.0]

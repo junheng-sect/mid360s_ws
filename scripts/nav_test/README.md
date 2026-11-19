@@ -100,6 +100,12 @@ bash /home/orangepi/mid360s_ws/scripts/nav_test/tests/run_indoor2_isolated.sh
 
 `apriltag_observations.csv` 每行对应一个点位、一台相机和一个 ID。按 `camera`、`waypoint`、`id` 对照，用 `seen_frames / window_frames` 比较各自的命中率。每点各保存一张原始灰度 PNG，包括零命中点。上相机示例为 `01_左下.png`（4224×3136），下相机为 `01_左下_ov9281.png`（1280×800）。以下相机在同窗内最接近上相机图像时间戳的一帧配对。`photo_file` 和 `photo_stamp_ns` 对应本行相机。JSON 的 `legs[].photos` 记录双方的文件、时间戳和坐标系，`photo_delta_ms` 为两个消息时间戳差的绝对值（毫秒）。任务 JSON 的 `legs[].observation.cameras` 也记录零命中点的帧数、ID 和最大帧间隔，`coverage` 给出各自的 0–5 覆盖情况。任何一路在窗口内出现超过 0.5 秒的间隙，都保存窗口统计并沿用任务断流处理。
 
+### test3_3 · Tag 1 双相机读 QR
+
+板端执行 `~/mid360s_ws/scripts/nav_test_indoor3_3.sh`，手持预览加 `--preview`。人工起飞，在 OV9281 视野内对准 Tag 1 后切 OFFBOARD，每次上升沿一轮。等候悬停后 5 秒内收集新鲜且对时的同 ID 位姿，以至少三个时间戳估计标签中心和朝外法线。目标为下相机光心位于 Tag 中心外侧 0.8 m，固定地图航向 −89.5°。下相机光心在机体 FLU 的配置位置为 [0.15, 0, 0] m，光轴方向沿用前相机标定。抵达或本轮未锁定后悬停；切出再切入重新取样。
+
+到位后两路原始灰度图各自搜索所有 QR，独立读到 `BOX-01` 即停止。正文和安装偏移在同目录 `indoor3_3.yaml` 配置。每轮共用 2 秒截止时间；图像时间戳和解码完成时间都须在窗口内。任务目录下 `round_NNN/round.json` 保存目标、实测航向、逐帧结果与各相机的成功或最后尝试帧，`rounds.csv` 汇总轮次，`success_rates.json` 按完整轮次计算成功率。导航失败、中断、数据流断开单列；健康图像流的读码超时计为本轮未命中。
+
 ## test7：室外全局航点（drone_map 绝对坐标）
 
 ```bash
