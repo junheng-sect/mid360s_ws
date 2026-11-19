@@ -35,8 +35,8 @@ POSE_FIELDS = tuple(prefix + '_' + field for prefix in ('tag_camera', 'drone_odo
                     for field in COMPONENTS)
 
 
-def valid_frame(msg):
-    return (msg.header.frame_id == FRAME and msg.family == FAMILY and msg.header.stamp.to_nsec() > 0
+def valid_frame(msg, frame_id=FRAME):
+    return (msg.header.frame_id == frame_id and msg.family == FAMILY and msg.header.stamp.to_nsec() > 0
             and -.02 <= (rospy.Time.now() - msg.header.stamp).to_sec() <= .5)
 
 
@@ -95,19 +95,24 @@ class SurveyRunner(Indoor3Runner):
     test_name = record_prefix = 'test_indoor3_1'
     route_name = '室内 test3_1 四点 AprilTag 识别'
 
+    cameras = {'ov13855': (TOPIC, FRAME)}
+    csv_fields = FIELDS + POSE_FIELDS
+
     def __init__(self, *args):
         super().__init__(*args)
         self.lock = threading.Lock()
-        self.frames = deque(maxlen=150)
+        self.frames = {name: deque(maxlen=150) for name in self.cameras}
         self.poses = LocalPoseBuffer(500)
-        self.detections = rospy.Subscriber(TOPIC, TagSurveyFrame, self.on_frame, queue_size=64)
+        self.detections = [
+            rospy.Subscriber(topic, TagSurveyFrame, self.on_frame, callback_args=name, queue_size=64)
+            for name, (topic, _) in self.cameras.items()]
         self.odometry = rospy.Subscriber('/drone_nav/odom', Odometry, self.on_odom, queue_size=50)
         self.csv_path = Path(self.a.out) / 'apriltag_observations.csv'
 
-    def on_frame(self, msg):
-        if valid_frame(msg):
+    def on_frame(self, msg, name):
+        if valid_frame(msg, self.cameras[name][1]):
             with self.lock:
-                self.frames.append(msg)
+                self.frames[name].append(msg)
 
     def on_odom(self, msg):
         with self.lock:
@@ -122,21 +127,33 @@ class SurveyRunner(Indoor3Runner):
             raise Stopped('任务目录中已有 ' + self.csv_path.name)
         goals = super().freeze()
         with self.lock:
-            if not self.frames or not valid_frame(self.frames[-1]):
-                raise Stopped('AprilTag 检测流尚未就绪')
-        self.record.update(csv_file=self.csv_path.name, coverage=coverage([]),
+            for name, (_, frame_id) in self.cameras.items():
+                if not self.frames[name] or not valid_frame(self.frames[name][-1], frame_id):
+                    raise Stopped(name + ' AprilTag 检测流尚未就绪')
+        self.record.update(csv_file=self.csv_path.name,
                            map_sha256=self.a.route['map_sha256'], observations=[])
         self.write_results()
         return goals
 
+    def total_coverage(self, rows):
+        return coverage(rows)
+
+    def store_window(self, observation, stats):
+        observation.update(stats['ov13855'])
+
+    def progress_text(self, stats):
+        result = self.record['coverage']
+        return '%s｜已见 %d/6 %s｜缺失 %s｜额外 %s' % (
+            stats['ov13855']['ids'], result['count'], result['seen'], result['missing'], result['extra'])
+
     def write_results(self):
         rows = self.record['observations']
-        self.record['coverage'] = coverage(rows)
+        self.record['coverage'] = self.total_coverage(rows)
         self.save()
         temp = self.csv_path.with_suffix('.tmp.csv')
         try:
             with temp.open('w', newline='', encoding='utf-8') as stream:
-                writer = csv.DictWriter(stream, fieldnames=FIELDS + POSE_FIELDS)
+                writer = csv.DictWriter(stream, fieldnames=self.csv_fields)
                 writer.writeheader()
                 writer.writerows(rows)
             temp.replace(self.csv_path)
@@ -164,23 +181,30 @@ class SurveyRunner(Indoor3Runner):
             # only accept source stamps inside the original two-second window.
             self.pause(max(0., deadline - time.monotonic()) + .5, stopped=True)
             photo = dict(file=path.name, stamp_ns=msg.header.stamp.to_nsec(), frame_id=FRAME)
+            stats = {}
+            rows = []
             with self.lock:
-                frames = {m.header.stamp.to_nsec(): m for m in self.frames if start <= m.header.stamp < end}
-                rows = waypoint_rows(frames, i + 1, name, photo,
-                                     lambda ns: self.poses.lookup(ns / 1e9, .20), self.reference)
-            stamps = [start.to_nsec(), *sorted(frames), end.to_nsec()]
-            gap = max(b - a for a, b in zip(stamps, stamps[1:]))
+                for camera, messages in self.frames.items():
+                    frames = {m.header.stamp.to_nsec(): m for m in messages if start <= m.header.stamp < end}
+                    hits = waypoint_rows(frames, i + 1, name, photo,
+                                         lambda ns: self.poses.lookup(ns / 1e9, .20), self.reference)
+                    if 'camera' in self.csv_fields:
+                        for row in hits:
+                            row['camera'] = camera
+                    stamps = [start.to_nsec(), *sorted(frames), end.to_nsec()]
+                    gap = max(b - a for a, b in zip(stamps, stamps[1:]))
+                    stats[camera] = dict(frames=len(frames), max_gap_ns=gap, ids=[r['id'] for r in hits])
+                    rows.extend(hits)
             save_photo(msg, path, self.hold_guard)
             leg['photo'] = photo
-            observation.update(status='complete' if gap <= MAX_FRAME_GAP_NS else 'stream_fault',
-                               frames=len(frames), max_gap_ns=gap, ids=[row['id'] for row in rows])
+            self.store_window(observation, stats)
+            faults = [camera for camera, item in stats.items() if item['max_gap_ns'] > MAX_FRAME_GAP_NS]
+            observation['status'] = 'stream_fault' if faults else 'complete'
             self.record['observations'].extend(rows)
             self.write_results()
-            if gap > MAX_FRAME_GAP_NS:
-                raise Stopped('%s AprilTag 检测断流，最大帧间隔 %.3f s' % (name, gap / 1e9))
-            result = self.record['coverage']
-            say('AprilTag 观察 %d/4 %s %s｜已见 %d/6 %s｜缺失 %s｜额外 %s' %
-                (i + 1, name, observation['ids'], result['count'], result['seen'], result['missing'], result['extra']))
+            if faults:
+                raise Stopped('%s AprilTag 检测断流：%s' % (name, ', '.join(faults)))
+            say('AprilTag 观察 %d/4 %s %s' % (i + 1, name, self.progress_text(stats)))
         except BaseException as error:
             if observation['status'] != 'stream_fault':
                 observation['status'] = 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed'
@@ -190,23 +214,49 @@ class SurveyRunner(Indoor3Runner):
             frame.close()
 
 
+class DualSurveyRunner(SurveyRunner):
+    test_name = record_prefix = 'test_indoor3_2'
+    route_name = '室内 test3_2 四点双相机 AprilTag 识别'
+    cameras = dict(SurveyRunner.cameras, ov9281=('/ov9281_apriltag_vision/survey', 'usb_camera_optical_frame'))
+    csv_fields = ('camera',) + SurveyRunner.csv_fields
+
+    def total_coverage(self, rows):
+        return {camera: coverage(row for row in rows if row['camera'] == camera) for camera in self.cameras}
+
+    def store_window(self, observation, stats):
+        observation['cameras'] = stats
+
+    def progress_text(self, stats):
+        return '｜'.join('%s %s (%d 帧)，累计 %d/6，缺 %s' % (
+            camera.upper(), item['ids'], item['frames'], self.record['coverage'][camera]['count'],
+            self.record['coverage'][camera]['missing']) for camera, item in stats.items())
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--preview', action='store_true')
     parser.add_argument('--probe-camera', action='store_true')
+    parser.add_argument('--dual-camera', action='store_true')
     args = parser.parse_args()
+    runner = DualSurveyRunner if args.dual_camera else SurveyRunner
     if args.probe_camera:
-        rospy.init_node('indoor3_1_camera_probe', anonymous=True)
+        rospy.init_node(runner.test_name + '_camera_probe', anonymous=True)
         probe_photo(args.out)
-        deadline = time.monotonic() + 6.
-        while time.monotonic() < deadline:
-            msg = rospy.wait_for_message(TOPIC, TagSurveyFrame, timeout=max(.01, deadline - time.monotonic()))
-            if valid_frame(msg):
-                say('test3_1 相机就绪：全分辨率原图与 AprilTag 检测流')
-                return 0
-        raise Stopped('AprilTag 检测流尚未就绪')
-    return serve_route('nav_indoor3_1', args, load_route(), SurveyRunner)
+        for camera, (topic, frame_id) in runner.cameras.items():
+            deadline = time.monotonic() + 6.
+            while time.monotonic() < deadline:
+                try:
+                    msg = rospy.wait_for_message(topic, TagSurveyFrame, timeout=max(.01, deadline - time.monotonic()))
+                except rospy.ROSException as error:
+                    raise Stopped(camera + ' AprilTag 检测流尚未就绪') from error
+                if valid_frame(msg, frame_id):
+                    break
+            else:
+                raise Stopped(camera + ' AprilTag 检测流尚未就绪')
+            say(camera + ' AprilTag 检测流就绪')
+        return 0
+    return serve_route('nav_' + runner.test_name[len('test_'):], args, load_route(), runner)
 
 
 if __name__ == '__main__':

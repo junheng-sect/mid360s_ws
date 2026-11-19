@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from integration_sequence import Fixture
 from indoor3_runner import Indoor3Runner
 from nav_indoor3 import load_route
-from nav_indoor3_1 import FRAME, FAMILY, TOPIC, SurveyRunner, coverage, waypoint_rows
+from nav_indoor3_1 import FRAME, FAMILY, TOPIC, DualSurveyRunner, SurveyRunner, coverage, waypoint_rows
 from nav_square import SquareState
 
 
@@ -65,6 +65,10 @@ class Camera:
     def __init__(self, fixture, points, mode):
         self.fixture, self.points, self.mode = fixture, np.asarray([p['xyz'] for p in points]), mode
         self.tags = rospy.Publisher(TOPIC, TagSurveyFrame, queue_size=5)
+        self.usb = None
+        if mode.startswith('dual'):
+            topic, self.usb_frame = DualSurveyRunner.cameras['ov9281']
+            self.usb = rospy.Publisher(topic, TagSurveyFrame, queue_size=5)
         self.images = rospy.Publisher('/ov13855_full/image_raw', Image, queue_size=1)
         self.pixels = bytes(4224 * 3136)
         self.tag_timer = rospy.Timer(rospy.Duration(.08), self.publish_tags)
@@ -82,6 +86,11 @@ class Camera:
             if self.mode == 'stop' and self.runner and self.runner.record and not self.interrupted:
                 self.runner.s.stop('synthetic pilot interruption')
                 self.interrupted = True
+        if self.usb and not (self.mode == 'dual_dropout' and nearest == 1 and distance[nearest] < .04):
+            # Same ID on both cameras, USB-only ID, plus a live window with no hits.
+            usb_ids = ((1, 8), (), (4,), (0,))[nearest] if distance[nearest] < .04 else (99,)
+            self.usb.publish(TagSurveyFrame(header=Header(frame_id=self.usb_frame, stamp=rospy.Time.now()),
+                                            family=FAMILY, ids=usb_ids, tags=[tag(i) for i in usb_ids]))
         self.tags.publish(TagSurveyFrame(header=Header(frame_id=FRAME, stamp=rospy.Time.now()),
                                               family=FAMILY, ids=ids, tags=[tag(i) for i in ids]))
 
@@ -126,11 +135,42 @@ def verify(out, record, mode):
     print('PASS', mode, record['end'], 'rows', len(rows), record['coverage'], flush=True)
 
 
+def verify_dual(out, record, mode):
+    with (out / 'apriltag_observations.csv').open() as stream:
+        rows = list(csv.DictReader(stream))
+    assert record['test'] == 'test_indoor3_2' and len(rows) == len(record['observations'])
+    assert len(rows) == len({(r['waypoint'], r['camera'], r['id']) for r in rows})
+    upper, lower = 'ov13855', 'ov9281'
+    for i, leg in enumerate(record['legs'], 1):
+        obs = leg['observation']
+        stats = obs['cameras']
+        assert obs['end_ns'] - obs['start_ns'] == 2_000_000_000
+        for r in (r for r in rows if int(r['waypoint']) == i):
+            item = stats[r['camera']]
+            assert int(r['window_frames']) == item['frames'] and 0 < int(r['seen_frames']) <= item['frames']
+            assert obs['start_ns'] <= int(r['first_stamp_ns']) <= int(r['last_stamp_ns']) < obs['end_ns']
+            assert int(r['id']) in item['ids'] and r['pose_status'] == 'aligned'
+        assert (out / leg['photo']['file']).is_file()
+    assert record['legs'][0]['observation']['cameras'][upper]['ids'] == [0, 1, 5]
+    assert record['legs'][0]['observation']['cameras'][lower]['ids'] == [1, 8]
+    if mode == 'dual':
+        assert record['end'] == 'SUCCEEDED' and len(record['legs']) == 4 and len(rows) == 12
+        assert record['coverage'][upper]['count'] == 6 and record['coverage'][upper]['extra'] == [7]
+        assert record['coverage'][lower]['seen'] == [0, 1, 4] and record['coverage'][lower]['extra'] == [8]
+        empty = record['legs'][1]['observation']['cameras'][lower]
+        assert empty['frames'] > 0 and empty['ids'] == []
+    else:
+        assert record['end'] == 'ABORTED' and len(record['legs']) == 2
+        assert obs['status'] == 'stream_fault' and stats[lower]['frames'] == 0 and stats[upper]['frames'] > 0
+        assert lower in record['reason']
+    print('PASS', mode, record['end'], 'rows', len(rows), record['coverage'], flush=True)
+
+
 def main():
     assert os.environ.get('ROS_MASTER_URI') == 'http://127.0.0.1:11447'
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', required=True, type=Path)
-    parser.add_argument('--mode', choices=('full', 'dropout', 'stop', 'photo'), default='full')
+    parser.add_argument('--mode', choices=('full', 'dropout', 'stop', 'photo', 'dual', 'dual_dropout'), default='full')
     args = parser.parse_args()
     test_rows()
     rospy.init_node('indoor3_1_isolated')
@@ -152,6 +192,8 @@ def main():
                                    max_start_offset=math.inf, check_segments=True, hold=3., delay=3.,
                                    out=str(args.out), route=route)
         runner_class = Indoor3Runner if args.mode == 'photo' else SurveyRunner
+        if args.mode.startswith('dual'):
+            runner_class = DualSurveyRunner
         runner = runner_class(run_args, rospy.get_param('/drone_nav/config'), state, buf, prepare, check, client)
         camera.runner = runner
         deadline = time.monotonic() + 30
@@ -159,7 +201,7 @@ def main():
             assert time.monotonic() < deadline, 'inputs/observed free grid not ready'
             time.sleep(.1)
         ok = runner.preview()
-        assert ok == (args.mode in ('full', 'photo')), runner.record
+        assert ok == (args.mode in ('full', 'photo', 'dual')), runner.record
         record = json.loads(Path(runner.record_path).read_text())
         if args.mode == 'photo':
             assert record['test'] == 'test_indoor3' and record['end'] == 'SUCCEEDED'
@@ -167,6 +209,8 @@ def main():
             for leg in record['legs']:
                 assert leg['photo']['control_xyz_map'] and (args.out / leg['photo']['file']).is_file()
             print('PASS original indoor test3 saved four full-resolution photos and poses')
+        elif args.mode.startswith('dual'):
+            verify_dual(args.out, record, args.mode)
         else:
             verify(args.out, record, args.mode)
         assert not any(topic == '/mavros/setpoint_raw/local'

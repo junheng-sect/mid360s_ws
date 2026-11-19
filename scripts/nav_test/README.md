@@ -94,6 +94,12 @@ bash /home/orangepi/mid360s_ws/scripts/nav_test/tests/run_indoor2_isolated.sh
 
 现场手持预览使用 `./scripts/nav_test_indoor3_1.sh --preview`，实飞入口为 `./scripts/nav_test_indoor3_1.sh`。两者都需要板端已归档的飞扫图 `20261114_101654_indoor_fly_raw_000001` 及匹配的 `prior_grid.bin`。任务复用 test3 的左下、左上、右上、右下四点，每点稳住 1 秒，采样 2 秒。任务目录中的 `apriltag_observations.csv` 按观察点和 ID 记录时间戳、帧数、同步位姿及照片。结束后右下悬停，飞手接管降落。
 
+### 同架次双相机 test3_2
+
+在板端运行 `~/mid360s_ws/scripts/nav_test_indoor3_2.sh`，手持预览加 `--preview`。沿用上述四点、原图拍照与每点 2 秒观察窗口。上方 OV13855 用 1280×960、15 Hz 检测，下方 OV9281 用 USB MJPEG 1280×800、30 Hz 和对应内参。两路均检测 tag36h11。
+
+`apriltag_observations.csv` 每行对应一个点位、一台相机和一个 ID。按 `camera`、`waypoint`、`id` 对照，用 `seen_frames / window_frames` 比较各自的命中率。照片是同一窗口内的 OV13855 全图。任务 JSON 的 `legs[].observation.cameras` 也记录零命中点的帧数、ID 和最大帧间隔，`coverage` 给出各自的 0–5 覆盖情况。任何一路在窗口内出现超过 0.5 秒的间隙，都保存窗口统计并沿用任务断流处理。
+
 ## test7：室外全局航点（drone_map 绝对坐标）
 
 ```bash

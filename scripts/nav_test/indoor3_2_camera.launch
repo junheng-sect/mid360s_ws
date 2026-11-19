@@ -1,0 +1,32 @@
+<launch>
+  <arg name="layout_file" default="$(find barcode_reader_camera)/config/layouts/qr_top_tag_bottom.yaml"/>
+  <include file="$(dirname)/indoor3_1_camera.launch">
+    <arg name="layout_file" value="$(arg layout_file)"/>
+  </include>
+
+  <node pkg="ov9281_usb_cam" type="ov9281_usb_cam_node" name="usb_cam" output="log">
+    <rosparam command="load" file="$(find ov9281_usb_cam)/config/ov9281_common.yaml"/>
+    <rosparam command="load" file="$(find ov9281_usb_cam)/config/ov9281_mono8.yaml"/>
+    <param name="image_width" value="1280"/>
+    <param name="image_height" value="800"/>
+    <param name="camera_name" value="ov9281_1280x800"/>
+    <param name="camera_info_url" value="package://ov9281_usb_cam/config/ov9281_1280x800.yaml"/>
+    <param name="auto_white_balance" value="false"/>
+    <param name="white_balance" value="4600"/>
+  </node>
+  <node pkg="ov13855_apriltag_vision" type="ov13855_apriltag_vision_node"
+        name="ov9281_apriltag_vision" ns="/" output="log">
+    <rosparam command="load" file="$(find ov13855_apriltag_vision)/config/ov13855_apriltag_vision.yaml"/>
+    <rosparam command="load" file="$(arg layout_file)"/>
+    <param name="image_topic" value="/usb_cam/image_raw"/>
+    <param name="camera_info_topic" value="/usb_cam/camera_info"/>
+    <param name="publish_survey" value="true"/>
+    <param name="publish_marker_tf" value="false"/>
+    <param name="publish_annotated" value="false"/>
+    <param name="publish_preview" value="false"/>
+    <param name="pose_topic" value="/ov9281_apriltag_vision/pose"/>
+    <param name="transform_debug_topic" value="/ov9281_apriltag_vision/debug/homogeneous_transform"/>
+    <param name="processing_time_topic" value="/ov9281_apriltag_vision/debug/processing_time_ms"/>
+    <param name="status_topic" value="/ov9281_apriltag_vision/status"/>
+  </node>
+</launch>
