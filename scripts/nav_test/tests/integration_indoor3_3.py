@@ -227,12 +227,17 @@ def main():
             assert time.monotonic()<until,'navigation not ready'
             time.sleep(.1)
         assert not runner.preview() and runner.trial['status']=='unlocked' and runner.record is None
+        lock = runner.trial['lock']
+        assert lock['outcome'] == 'timeout' and lock['survey_frames'] > 0 and lock['tag1_frames'] == 0
         cam.visible=True
         cam.miss=True
         assert runner.preview(),runner.trial
         a=runner.trial
         np.testing.assert_allclose(a['control_goal_map'],goal,atol=.01)
         assert abs(a['arrival_yaw_map_deg']+89.5)<=5 and len(a['tag_stamps_ns'])>=3
+        lock = a['lock']
+        assert lock['outcome'] == 'locked' and lock['pose_frames'] >= 3
+        assert lock['windows'][-1]['stamps_ns'] == a['tag_stamps_ns']
         outcomes=a['scan']['cameras']
         assert outcomes['ov9281']['status']=='success' and outcomes['ov13855']['status']=='timeout', outcomes
         assert any('BOX-99' in attempt['texts'] for attempt in outcomes['ov9281']['reads'])
@@ -268,7 +273,9 @@ def main():
         edge_dir.mkdir()
         check_offboard_edges(edge_dir)
         with (args.out/'rounds.csv').open() as file:
-            assert len(list(csv.DictReader(file)))==6
+            rounds = list(csv.DictReader(file))
+            assert len(rounds) == 6 and rounds[0]['lock_tag1_frames'] == '0'
+            assert rounds[1]['lock_outcome'] == 'locked' and int(rounds[1]['lock_max_window_frames']) >= 3
         assert not any(t=='/mavros/setpoint_raw/local' for t,_ in rosgraph.Master(rospy.get_name()).getSystemState()[0])
         print('PASS six rounds: no lock, paired ROI decode, neighbour then target, skew, missing tag, stream fault excluded')
     finally:

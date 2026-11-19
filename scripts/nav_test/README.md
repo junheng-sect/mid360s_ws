@@ -108,6 +108,10 @@ bash /home/orangepi/mid360s_ws/scripts/nav_test/tests/run_indoor2_isolated.sh
 
 每轮 round_NNN/round.json 保留每次解码的图像与位姿时间戳、斜距 range_m、光轴深度 depth_m、正文和策略，PNG 是命中帧、最后尝试帧或没有有效配对时的最后原图。rounds.csv 的两路距离对应各自最后尝试帧。相机超时原因区分 no_tag（未见 ID 1）、no_matched_pose（未配到同帧有效位姿）和 roi_no_target（进入 ROI 但未命中）。success_rates.json 只统计完成到位且两路窗口有效的轮次，断流和人工切出单列。
 
+每轮的锁定诊断从 OV9281 搜索开始，到锁定、超时或中断结束。飞完先看任务目录的 `rounds.csv`：`lock_reason` 是本轮锁定结果的中文说明，`round_reason` 记录整轮停止原因。`lock_survey_frames`、`lock_tag1_frames`、`lock_pose_frames` 分别为有效检测帧、看到 ID 1 的帧和报告了其位姿的帧，均按图像源时间戳去重，包括等待悬停时收到的帧。`lock_candidate_frames` 是整轮通过单帧筛选的帧数，`lock_max_window_frames` 是同一个 0.5 s 判定窗口内的最高值，`lock_max_stable_s` 是最长连续低速时间。老记录没有锁定诊断的列留空。
+
+`round_NNN/round.json` 的 `lock.frames` 保留每帧的时间戳、可见性、位姿数、是否进入悬停判定窗口及最终筛选结果。`no_pose` 表示视觉节点识别出 ID 1 但没有发布该 ID 的位姿。逐帧结果还区分位姿重复、重投影误差、里程计对时、无效位姿、深度、朝向和纸面倾斜。`lock.windows` 逐次记录实际参与多帧判定的源时间戳，以及帧数不足、位置分散、法线分散或锁定结果；时间窗可重叠。位置离散的数值为相对中位数的最大偏移（m），法线离散为相对平均法线的最大角度（°）。`lock.dropped_messages` 单列坐标系、家族、时间戳等入口校验失败的消息。任务日志每轮打印一行锁定结论。
+
 ## test7：室外全局航点（drone_map 绝对坐标）
 
 ```bash

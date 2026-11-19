@@ -36,9 +36,23 @@ POSE_FIELDS = tuple(prefix + '_' + field for prefix in ('tag_camera', 'drone_odo
                     for field in COMPONENTS)
 
 
+def frame_problem(msg, frame_id):
+    if msg.header.frame_id != frame_id:
+        return 'wrong_frame'
+    if msg.family != FAMILY:
+        return 'wrong_family'
+    if msg.header.stamp.to_nsec() <= 0:
+        return 'zero_stamp'
+    age = (rospy.Time.now() - msg.header.stamp).to_sec()
+    if age < -.02:
+        return 'future_stamp'
+    if age > .5:
+        return 'stale_stamp'
+    return None
+
+
 def valid_frame(msg, frame_id=FRAME):
-    return (msg.header.frame_id == frame_id and msg.family == FAMILY and msg.header.stamp.to_nsec() > 0
-            and -.02 <= (rospy.Time.now() - msg.header.stamp).to_sec() <= .5)
+    return frame_problem(msg, frame_id) is None
 
 
 def pose_values(pose):
