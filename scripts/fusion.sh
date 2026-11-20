@@ -47,7 +47,7 @@
 #   roslaunch --screen scripts/launch/fusion_aux.launch
 #
 # 前台运行。每个 roslaunch 都放进独立会话，信号只由本脚本统一转发：Ctrl+C / SIGTERM
-# 按 相机 → 附属（录包节点先把 bag 收尾写索引）→ 核心 的顺序各发一次 SIGINT。
+# 按 附属（录包节点先把 bag 收尾写索引）→ 核心 的顺序各发一次 SIGINT。
 # 所有等待都是短轮询（≤ 3 s 一轮）并顺带检查核心是否还活着，所以启动/等首帧/稳态各阶段收到
 # 信号都能及时收尾。收尾后校验本次生成的 bag 索引是否读得出来，最后按信号返回 130 / 143；
 # 核心 roslaunch 自己退出时透传它的退出码，并在「没收到停止信号」时按异常返回 1（补掉 roslaunch
@@ -299,7 +299,7 @@ stop_leader() {
   return 1
 }
 
-# 收尾顺序：相机 → 附属（录包节点先把 bag 收尾写索引）→ 核心 → 监控。
+# 收尾顺序：附属（录包节点先把 bag 收尾写索引）→ 核心 → 监控。
 # roscore 和 MAVROS 是常驻服务，不停。
 stop_all() {
   stop_proc "附属 roslaunch（录包节点会先把 bag 收尾）" "$AUX_PIDFILE" "$STOP_TIMEOUT"
