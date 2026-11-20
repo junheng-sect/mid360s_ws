@@ -387,7 +387,9 @@ class SquareRunner:
                 sent += 1
             self.record['end'] = 'SUCCEEDED'
             again = '切回定点再切 OFFBOARD 才重跑' if self.repeat_laps else '请飞手接管降落'
-            say('%s完成，终点已保持 %g s，继续悬停。%s' % (self.route_name, self.hold_seconds, again))
+            last_leg = self.record['legs'][-1] if self.record['legs'] else {}
+            held = last_leg.get('hold_elapsed_s', self.hold_seconds)
+            say('%s完成，终点已保持 %.2f s，继续悬停。%s' % (self.route_name, held, again))
             return True
         except BaseException as error:
             cancel_error = ''

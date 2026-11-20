@@ -6,7 +6,7 @@ SURVEY_RUNNER=nav_indoor3_1.py
 SURVEY_LAUNCH="${SURVEY_VARIANT}_camera.launch"
 if [[ "$SURVEY_VARIANT" == indoor3_3 ]]; then
   SURVEY_RUNNER=nav_indoor3_3.py
-  SURVEY_LAUNCH=indoor3_2_camera.launch
+  SURVEY_LAUNCH=indoor3_1_camera.launch
 fi
 if [[ "$SURVEY_VARIANT" == indoor3_2 ]]; then SURVEY_FLAGS+=(--dual-camera); fi
 DEFAULT_MAP="$HOME/test_data/mapping/20261114_101654_indoor_fly_raw_000001"
@@ -19,7 +19,7 @@ DEFAULT_PREVIEW_HALF_HEIGHT=0.3
 
 test_desc() {
   if [[ "$SURVEY_VARIANT" == indoor3_3 ]]; then
-    echo "OV13855 光心距 Tag 1 0.62 m，双相机按同帧 Tag 位姿扫码"
+    echo "OV13855 锁定 Tag 1，光心距 Tag 中心 0.80 m，到位读 BOX-01 最多 2 s"
   else
     echo "货架四点拍照识别 AprilTag、写入 CSV、右下悬停"
   fi
@@ -34,7 +34,7 @@ test_preflight() {
 test_after_fusion() {
   local topics
   topics="$(timeout 5 rostopic list)" || return 1
-  if [[ "$SURVEY_VARIANT" != indoor3_1 ]] && grep -Eq '^(/usb_cam/(image_raw|camera_info)|/ov9281_apriltag_vision/survey)$' <<<"$topics"; then
+  if [[ "$SURVEY_VARIANT" == indoor3_2 ]] && grep -Eq '^(/usb_cam/(image_raw|camera_info)|/ov9281_apriltag_vision/survey)$' <<<"$topics"; then
     err "OV9281 相机或检测器已被占用"
     return 1
   fi

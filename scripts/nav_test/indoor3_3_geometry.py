@@ -45,12 +45,12 @@ def consolidate(samples):
     return center, np.column_stack((right, np.cross(normal, right), normal))
 
 
-UPPER_STANDOFF_M = 0.62
+STANDOFF_M = 0.80
 
 
 def fixed_scan_goal(tag_center, axes, reference, camera_lever, yaw_map):
     r, t = reference
-    camera_map = tag_center + UPPER_STANDOFF_M * axes[:, 2]
+    camera_map = tag_center + STANDOFF_M * axes[:, 2]
     yaw_odom = heading(r.T, yaw_map)
     control_odom = r.T @ (camera_map - t) - rz(yaw_odom) @ camera_lever
     return r @ control_odom + t, camera_map

@@ -100,15 +100,15 @@ bash /home/orangepi/mid360s_ws/scripts/nav_test/tests/run_indoor2_isolated.sh
 
 `apriltag_observations.csv` 每行对应一个点位、一台相机和一个 ID。按 `camera`、`waypoint`、`id` 对照，用 `seen_frames / window_frames` 比较各自的命中率。每点各保存一张原始灰度 PNG，包括零命中点。上相机示例为 `01_左下.png`（4224×3136），下相机为 `01_左下_ov9281.png`（1280×800）。以下相机在同窗内最接近上相机图像时间戳的一帧配对。`photo_file` 和 `photo_stamp_ns` 对应本行相机。JSON 的 `legs[].photos` 记录双方的文件、时间戳和坐标系，`photo_delta_ms` 为两个消息时间戳差的绝对值（毫秒）。任务 JSON 的 `legs[].observation.cameras` 也记录零命中点的帧数、ID 和最大帧间隔，`coverage` 给出各自的 0–5 覆盖情况。任何一路在窗口内出现超过 0.5 秒的间隙，都保存窗口统计并沿用任务断流处理。
 
-### test3_3 · Tag 1 双相机读 QR
+### test3_3 · OV13855 锁定 Tag 1 与扫码
 
-板端执行 `~/mid360s_ws/scripts/nav_test_indoor3_3.sh`，手持预览加 `--preview`。人工起飞，在 OV9281 视野内对准 Tag 1 后切 OFFBOARD，每次上升沿一轮。等候悬停后 5 秒内收集新鲜且对时的同 ID 位姿，以至少三个时间戳估计标签中心和朝外法线。目标为 OV13855 光心沿 Tag 中心外法线向外 0.62 m，地图航向固定 −89.5°。上相机前偏由 ov13855_camera_tf.yaml 读取（当前 0.18 m），下相机锁定用本任务的 0.15 m 前偏。正对货签时，预计机体到 Tag 约 0.80 m，下相机约 0.65 m。切出 OFFBOARD 取消当前轮，再切入重新锁定。
+板端执行 `~/mid360s_ws/scripts/nav_test_indoor3_3.sh`，手持预览加 `--preview`。人工起飞悬停，将 Tag 1 放入 OV13855 视野后切入 OFFBOARD。五秒搜索期内沿用原低速、多帧位姿及法线一致性检查；锁定后，目标为 OV13855 光心沿 Tag 1 中心外法线向外 0.80 m，地图航向 −89.5°。锁定与控制点换算共用 `ov13855_camera_tf.yaml` 中的平移和旋转。
 
-到位后两路同时在 2 秒内读 Tag 1 上方的 QR。OV13855 用 1280×960 检测和同曝光的 4224×3136 原图，时间戳允许相差 10 ms。OV9281 用 1280×800 原图和同时间戳位姿。每个新帧使用本机标定和十月的 qr_top_tag_bottom 版式，通过标签纸透视校正、局部增强和 ROI 策略解码，首次命中配置正文（默认 BOX-01）后该相机停止。
+稳定到位后只使用随后两秒内的新帧。1280×960 检测给出 Tag 1 位姿，4224×3136 灰度原图配对容差为 10 ms。按货签版式从 Tag 上方裁切 QR，首次读到配置正文（默认 `BOX-01`）立即结束；其他正文继续尝试，超时后悬停。切出 OFFBOARD 取消当前轮，切出后再切入才开始下一轮。
 
-每轮 round_NNN/round.json 保留每次解码的图像与位姿时间戳、斜距 range_m、光轴深度 depth_m、正文和策略，PNG 是命中帧、最后尝试帧或没有有效配对时的最后原图。rounds.csv 的两路距离对应各自最后尝试帧。相机超时原因区分 no_tag（未见 ID 1）、no_matched_pose（未配到同帧有效位姿）和 roi_no_target（进入 ROI 但未命中）。success_rates.json 只统计完成到位且两路窗口有效的轮次，断流和人工切出单列。
+每轮 `round_NNN/round.json` 保留相机外参、目标光心位置、锁定诊断、每次解码的双时间戳、斜距 `range_m`、光轴深度 `depth_m`、正文与策略。到位窗口内的首次有效 Tag 1 视觉测距另存为 `arrival_range_m` 和 `arrival_depth_m`，缺少有效观测时留空。PNG 对应命中帧、最后尝试帧或最后有效原图。`rounds.csv` 区分成功、超时、断流和中断，`success_rates.json` 按相机参与的有效扫描轮次统计。可以汇总旧双摄轮次。
 
-每轮的锁定诊断从 OV9281 搜索开始，到锁定、超时或中断结束。飞完先看任务目录的 `rounds.csv`：`lock_reason` 是本轮锁定结果的中文说明，`round_reason` 记录整轮停止原因。`lock_survey_frames`、`lock_tag1_frames`、`lock_pose_frames` 分别为有效检测帧、看到 ID 1 的帧和报告了其位姿的帧，均按图像源时间戳去重，包括等待悬停时收到的帧。`lock_candidate_frames` 是整轮通过单帧筛选的帧数，`lock_max_window_frames` 是同一个 0.5 s 判定窗口内的最高值，`lock_max_stable_s` 是最长连续低速时间。老记录没有锁定诊断的列留空。
+每轮的锁定诊断从 OV13855 搜索开始，到锁定、超时或中断结束。飞完先看任务目录的 `rounds.csv`：`lock_reason` 是本轮锁定结果的中文说明，`round_reason` 记录整轮停止原因。`lock_survey_frames`、`lock_tag1_frames`、`lock_pose_frames` 分别为有效检测帧、看到 ID 1 的帧和报告了其位姿的帧，均按图像源时间戳去重，包括等待悬停时收到的帧。`lock_candidate_frames` 是整轮通过单帧筛选的帧数，`lock_max_window_frames` 是同一个 0.5 s 判定窗口内的最高值，`lock_max_stable_s` 是最长连续低速时间。老记录没有锁定诊断的列留空。
 
 `round_NNN/round.json` 的 `lock.frames` 保留每帧的时间戳、可见性、位姿数、是否进入悬停判定窗口及最终筛选结果。`no_pose` 表示视觉节点识别出 ID 1 但没有发布该 ID 的位姿。逐帧结果还区分位姿重复、重投影误差、里程计对时、无效位姿、深度、朝向和纸面倾斜。`lock.windows` 逐次记录实际参与多帧判定的源时间戳，以及帧数不足、位置分散、法线分散或锁定结果；时间窗可重叠。位置离散的数值为相对中位数的最大偏移（m），法线离散为相对平均法线的最大角度（°）。`lock.dropped_messages` 单列坐标系、家族、时间戳等入口校验失败的消息。任务日志每轮打印一行锁定结论。
 

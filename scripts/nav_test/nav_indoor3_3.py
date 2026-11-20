@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One Tag 1 approach and paired QR scan per OFFBOARD rising edge."""
+"""One OV13855 Tag 1 approach and QR scan per OFFBOARD rising edge."""
 import argparse
 import csv
 import json
@@ -8,7 +8,7 @@ from pathlib import Path
 import threading
 import time
 from collections import deque
-from contextlib import ExitStack
+from contextlib import closing
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,21 +20,19 @@ from ov13855_apriltag_vision.msg import TagSurveyFrame
 from drone_navigation.core import finite, heading, rotation
 from front_marker_control.localization import LocalPoseBuffer
 
-from indoor3_runner import probe_photo, PHOTO_STREAMS
-from indoor3_3_geometry import UPPER_STANDOFF_M, consolidate, fixed_scan_goal, map_tag
+from indoor3_runner import probe_photo
+from indoor3_3_geometry import STANDOFF_M, consolidate, fixed_scan_goal, map_tag
 from indoor3_3_lock import (LockRejection, LockTrace, MAX_RMS_PX, MAX_SPEED_MPS,
                             ODOM_GAP_S, SEARCH_S, STABLE_S, WINDOW_S)
-from indoor3_3_qr import open_streams, paired_scan
+from indoor3_3_qr import ScanStream, scan_at_arrival
 from nav_forward import say
 from nav_global import serve
 from nav_indoor3 import load_route
-from nav_indoor3_1 import frame_problem, valid_frame, pose_values
+from nav_indoor3_1 import FRAME, TOPIC, frame_problem, valid_frame, pose_values
 from nav_square import SquareRunner, Stopped
 
 
 CONFIG = Path(__file__).with_name('indoor3_3.yaml')
-TOPIC = '/ov9281_apriltag_vision/survey'
-FRAME = 'usb_camera_optical_frame'
 YAW = math.radians(-89.5)
 
 
@@ -42,17 +40,13 @@ def settings():
     cfg = yaml.safe_load(CONFIG.read_text())
     if not isinstance(cfg['expected_text'], str) or not cfg['expected_text'] or type(cfg['text_confirmed']) is not bool:
         raise ValueError('检查 indoor3_3.yaml 的 expected_text 和 text_confirmed')
-    tf_path = Path(rospkg.RosPack().get_path('front_marker_control')) / 'config/front_camera_tf.yaml'
+    tf_path = Path(rospkg.RosPack().get_path('front_marker_control')) / 'config/ov13855_camera_tf.yaml'
     tf = yaml.safe_load(tf_path.read_text())
     if (tf['base_frame'], tf['camera_frame']) != ('drone_base', FRAME):
-        raise ValueError('OV9281 mounting frame mismatch')
-    cfg['camera_rotation_xyzw'] = tf['rotation_quaternion']
-    finite(cfg['camera_translation'])
-    rotation(cfg['camera_rotation_xyzw'])
-    upper = yaml.safe_load(tf_path.with_name('ov13855_camera_tf.yaml').read_text())
-    if (upper['base_frame'], upper['camera_frame']) != ('drone_base', PHOTO_STREAMS['ov13855'][1]):
         raise ValueError('OV13855 mounting frame mismatch')
-    cfg['upper_translation'] = finite(upper['translation']).tolist()
+    cfg['camera_rotation_xyzw'] = tf['rotation_quaternion']
+    cfg['camera_translation'] = finite(tf['translation']).tolist()
+    rotation(cfg['camera_rotation_xyzw'])
     return cfg
 
 
@@ -68,8 +62,15 @@ def write_summary(out):
     lock_fields = ('outcome', 'reason', 'survey_frames', 'tag1_frames', 'pose_frames', 'evaluated_frames',
                    'candidate_frames', 'max_window_frames', 'max_stable_s')
     fields += ['round_reason'] + ['lock_' + name for name in lock_fields]
-    scan_fields = ('status', 'reason', 'attempts', 'first_match_ms', 'strategy', 'range_m', 'depth_m')
-    score = {c:0 for c in PHOTO_STREAMS}
+    scan_fields = ('status', 'reason', 'attempts', 'first_match_ms', 'strategy', 'range_m', 'depth_m',
+                   'arrival_range_m', 'arrival_depth_m', 'arrival_pose_stamp_ns')
+    names = {'ov13855'}
+    for record in records:
+        names.update(record.get('scan', {}).get('cameras', {}))
+        if 'lock_camera' not in record:
+            names.add('ov9281')  # Pre-single-camera rounds used both cameras.
+    score = {name: 0 for name in sorted(names)}
+    eligible = dict.fromkeys(score, 0)
     for camera in score:
         fields += [camera+'_'+s for s in (*scan_fields, 'texts', 'photo')]
     total = 0
@@ -83,9 +84,10 @@ def write_summary(out):
             row['round_reason'] = r.get('reason')
             row.update(('lock_' + name, r.get('lock', {}).get(name)) for name in lock_fields)
             cameras = r.get('scan', {}).get('cameras', {})
-            complete = r['status'] == 'complete'
+            complete = r['status'] in ('success', 'timeout', 'complete')
             total += int(complete)
             for cam, s in cameras.items():
+                eligible[cam] += int(complete)
                 score[cam] += int(complete and s['status'] == 'success')
                 for k in scan_fields:
                     row[cam+'_'+k] = s.get(k)
@@ -95,12 +97,12 @@ def write_summary(out):
             writer.writerow(row)
     tmp.replace(out/'rounds.csv')
     write_json(out/'success_rates.json', dict(completed=total, cameras={
-        c:dict(successes=n, rate=n/total if total else None) for c,n in score.items()}))
+        c:dict(successes=n, completed=eligible[c], rate=n/eligible[c] if eligible[c] else None) for c,n in score.items()}))
 
 
 class Runner(SquareRunner):
     test_name = record_prefix = 'test_indoor3_3'
-    route_name = '室内 test3_3 Tag 1 双相机扫码'
+    route_name = '室内 test3_3 OV13855 锁定 Tag 1 扫码'
     goals_in_map = True
     side_m = None
     hold_seconds = 2.
@@ -268,14 +270,14 @@ class Runner(SquareRunner):
                 or (self.real and Path(self.cfg['map_id']).name != self.route['map_id'])):
             raise Stopped('test3_3 室内地图或导航配置不匹配')
         tag, axes, stamps = self.search_tag()
-        goal, camera = fixed_scan_goal(tag, axes, self.reference, finite(self.config['upper_translation'])-self.lever, YAW)
+        goal, camera = fixed_scan_goal(tag, axes, self.reference, self.translation-self.lever, YAW)
         if not np.isfinite(goal).all() or goal[2] > self.route['max_control_z']:
             raise Stopped('扫码目标无效或超过室内高度上限')
         self.trial.update(tag_center_map=tag.tolist(), normal_map=axes[:,2].tolist(), tag_stamps_ns=stamps,
                           camera_goal_map=camera.tolist(), control_goal_map=goal.tolist(),
-                          goal_yaw_map_deg=-89.5, standoff_camera="ov13855", standoff_m=UPPER_STANDOFF_M)
+                          goal_yaw_map_deg=-89.5, standoff_camera="ov13855", standoff_m=STANDOFF_M)
         write_json(self.folder/'round.json', self.trial)
-        return np.array([goal]), np.array([YAW]), ('OV13855 距 Tag 1 %.2f m' % UPPER_STANDOFF_M,)
+        return np.array([goal]), np.array([YAW]), ('OV13855 距 Tag 1 %.2f m' % STANDOFF_M,)
 
     def freeze(self):
         try:
@@ -292,26 +294,33 @@ class Runner(SquareRunner):
         self.guard(stopped=True)
         self.trial['arrival_yaw_map_deg'] = math.degrees(heading(self.reference[0], self.s.pose()[1]))
         self.trial['scan'] = {}
-        paired_scan(self.folder, self.config['expected_text'], lambda: self.guard(stopped=True), self.trial['scan'])
-        cameras = self.trial['scan']['cameras']
+        scan_at_arrival(self.scan_stream, self.folder, self.config['expected_text'],
+                        lambda: self.guard(stopped=True), self.trial['scan'])
+        result = self.trial['scan']['cameras']['ov13855']
         self.guard(stopped=True)
-        faults = [s['status'] for s in cameras.values() if s['status'] not in ('success','timeout')]
-        self.trial['status'] = faults[0] if faults else 'complete'
-        message = '，'.join(c.upper()+' '+s['status'] for c,s in cameras.items())
-        say('Tag 1 QR：'+message)
-        if faults:
-            raise Stopped('双相机比较无效：'+message)
+        self.trial['status'] = result['status']
+        if result['reason']:
+            self.trial['reason'] = result['reason']
+        outcome = result['reason'] or result['status']
+        if result['status'] == 'success':
+            outcome = '读出 %s，用时 %.0f ms' % (self.config['expected_text'], result['first_match_ms'])
+        elif result['status'] == 'timeout':
+            outcome = '2 s 超时（%s）' % outcome
+        say('OV13855 Tag 1 QR：%s，尝试 %d 帧' % (outcome, result['attempts']))
+        if result['status'] not in ('success', 'timeout'):
+            raise Stopped('OV13855 扫码异常：' + (result['reason'] or result['status']))
 
     def run_lap(self):
         number = max((int(p.name[6:]) for p in self.out.glob('round_*') if p.name[6:].isdigit()), default=0)+1
         self.folder = self.out/('round_%03d' % number)
         self.folder.mkdir()
-        self.trial = dict(round=number,status='running',config=self.config,tag_id=1,
+        self.trial = dict(round=number,status='running',config=self.config,tag_id=1,lock_camera='ov13855',
                           lock=dict(outcome='not_started', reason='尚未进入锁定阶段'),
                           goal_yaw_map_deg=-89.5, start_ns=rospy.Time.now().to_nsec())
         write_json(self.folder/'round.json', self.trial)
         try:
-            return super().run_lap()
+            with closing(ScanStream()) as self.scan_stream:
+                return super().run_lap()
         except KeyboardInterrupt:
             self.trial['status'] = 'interrupted'
             raise
@@ -336,17 +345,15 @@ def main():
     if args.probe_camera:
         rospy.init_node('indoor3_3_probe',anonymous=True)
         cfg = settings()
-        probe_photo(args.out, PHOTO_STREAMS)
-        with ExitStack() as resources:
-            streams = open_streams(resources)
+        probe_photo(args.out)
+        with closing(ScanStream()) as stream:
             until = time.monotonic() + 8.
             while time.monotonic() < until:
-                if all(s.ready() for s in streams.values()):
-                    say('双路图像、标定和 Tag 检测流就绪，目标 QR '+cfg['expected_text'])
+                if stream.ready():
+                    say('OV13855 原图、标定和 Tag 检测流就绪，目标 QR '+cfg['expected_text'])
                     return 0
                 time.sleep(.025)
-            missing = [s.camera + ' ' + s.calibration_error for s in streams.values() if not s.ready()]
-            raise Stopped('相机或 Tag 流未就绪：' + ', '.join(missing))
+            raise Stopped('OV13855 图像、标定或 Tag 流未就绪：'+stream.calibration_error)
     return serve('nav_indoor3_3', SimpleNamespace(out=str(args.out), preview=args.preview, delay=3.), Runner)
 
 

@@ -1,4 +1,4 @@
-"""Evidence collected by the OV9281 lock gate during one indoor3_3 search."""
+"""Evidence collected by the OV13855 lock gate during one indoor3_3 search."""
 from collections import Counter
 
 
@@ -76,7 +76,7 @@ class LockTrace:
         if outcome == 'locked':
             reason = '已锁定 Tag 1'
         elif outcome == 'stream_fault':
-            reason = '搜索结束时没有新鲜的 OV9281 检测帧'
+            reason = '搜索结束时没有新鲜的 OV13855 检测帧'
             if self.dropped:
                 reason += '（' + '、'.join(LABELS[k] for k in self.dropped) + '）'
         elif outcome != 'timeout':

@@ -33,7 +33,8 @@ from integration_sequence import Fixture
 from indoor3_runner import PHOTO_STREAMS
 from nav_indoor3_3 import Runner, YAW, fixed_scan_goal, settings
 from nav_square import SquareState, Stopped
-from indoor3_3_qr import paired_scan
+from indoor3_3_qr import ScanStream, scan_at_arrival
+from contextlib import closing
 from mavros_msgs.msg import State as FCUState
 import threading
 
@@ -48,28 +49,21 @@ class Camera:
     def __init__(self, flight, lever):
         self.flight = flight
         cfg = settings()
-        self.offsets = {'ov9281': np.array(cfg['camera_translation']) - lever,
-                        'ov13855': np.array(cfg['upper_translation']) - lever}
+        self.offset = np.array(cfg['camera_translation']) - lever
         self.rot = rotation(cfg['camera_rotation_xyzw'])
         self.tag = np.array([.61,-1.15,.5])
         self.axes = np.array([[-1.,0,0],[0,0,1.],[0,1.,0]])
-        self.visible = self.miss = self.drop = self.skew = self.hide_upper = False
-        self.pubs = {}
-        self.infos = {}
-        self.tags = {}
-        self.patches = {}
+        self.visible = self.miss = self.drop = self.skew = self.hide = False
+        self.arrival = None
+        topic,self.frame,w,h = PHOTO_STREAMS['ov13855']
+        self.pub = rospy.Publisher(topic, Image, queue_size=1)
+        self.survey = rospy.Publisher('/ov13855_apriltag_vision/survey', TagSurveyFrame, queue_size=4)
+        self.info = rospy.Publisher('/ov13855_full/camera_info', CameraInfo, queue_size=1, latch=True)
+        self.focal = 3200.
+        self.info.publish(CameraInfo(header=Header(stamp=rospy.Time.now(), frame_id=self.frame), width=w, height=h,
+                                     distortion_model='plumb_bob', K=[self.focal,0,w/2,0,self.focal,h/2,0,0,1], D=[0]*5))
+        self.patches = {t: qr_patch(t, round(self.focal*.044/.80)) for t in ('BOX-99','BOX-01')}
         self.rasters = {}
-        self.start = {}
-        for c, (topic, frame, w, h) in PHOTO_STREAMS.items():
-            self.pubs[c] = rospy.Publisher(topic, Image, queue_size=1)
-            self.tags[c] = rospy.Publisher('/%s_apriltag_vision/survey' % c, TagSurveyFrame, queue_size=4)
-            info = rospy.Publisher(topic.replace('image_raw', 'camera_info'), CameraInfo, queue_size=1, latch=True)
-            focal = 1500. if c == 'ov9281' else 3200.
-            self.infos[c] = info, focal
-            info.publish(CameraInfo(header=Header(stamp=rospy.Time.now(), frame_id=frame), width=w, height=h,
-                                    distortion_model='plumb_bob', K=[focal,0,w/2,0,focal,h/2,0,0,1], D=[0]*5))
-            self.patches[c] = {t: qr_patch(t, int(focal*.044/.64)) for t in ('BOX-99','BOX-01')}
-            self.start[c] = None
         self.clock = rospy.Timer(rospy.Duration(.075),self.tick)
 
     def tick(self,_):
@@ -77,42 +71,33 @@ class Camera:
         view = body @ self.rot
         matrix = np.eye(4)
         matrix[:3,:3] = view.T @ self.axes
-        for camera, pub in self.pubs.items():
-            _,frame,w,h = PHOTO_STREAMS[camera]
-            stamp = rospy.Time.now()
-            pos = view.T @ (self.tag-self.flight.p-body@self.offsets[camera])
-            visible = self.visible and not (camera=='ov13855' and self.hide_upper)
-            tag_id = 1 if visible else 2
-            pose = Pose(Point(*pos), Quaternion(*quaternion_from_matrix(matrix)))
-            tag = TagObservation(id=tag_id, pose=pose, reprojection_rms_px=.3)
-            skew = (.029 if self.skew else .00002) if camera == 'ov13855' else 0.
-            self.tags[camera].publish(TagSurveyFrame(header=Header(stamp=stamp-rospy.Duration(skew),frame_id=frame),
-                                                     family='tag36h11',ids=[tag_id],tags=[tag]))
-            if not pub.get_num_connections():
-                self.start[camera] = None
-                continue
-            if self.drop and camera=='ov9281':
-                continue
-            if self.start[camera] is None:
-                self.start[camera] = time.monotonic()
-            allow = not (self.miss and camera=='ov13855')
-            text = 'BOX-01' if allow and time.monotonic()-self.start[camera]>.70 else 'BOX-99'
-            patch = self.patches[camera][text]
-            qr = pos + matrix[:3,1]*.063
-            focal = self.infos[camera][1]
-            x = int(round(w/2+focal*qr[0]/max(.01, qr[2])))-patch.shape[1]//2
-            y = int(round(h/2+focal*qr[1]/max(.01, qr[2])))-patch.shape[0]//2
-            # Reuse the raster during a hover so the fixture can also publish its 50 Hz odometry.
-            key = (camera, text)
-            if self.rasters.get(key, ())[:2] != (x,y):
-                img = np.full((h,w),255,np.uint8)
-                if qr[2] > 0 and 0<=x<=w-patch.shape[1] and 0<=y<=h-patch.shape[0]:
-                    img[y:y+patch.shape[0],x:x+patch.shape[1]] = patch
-                neighbour = self.patches[camera]['BOX-01']
-                img[:neighbour.shape[0], :neighbour.shape[1]] = neighbour
-                self.rasters[key] = x, y, img.tobytes()
-            pub.publish(Image(header=Header(stamp=stamp,frame_id=frame), width=w,height=h,
-                              step=w,encoding='mono8',data=self.rasters[key][2]))
+        _,frame,w,h = PHOTO_STREAMS['ov13855']
+        stamp = rospy.Time.now()
+        pos = view.T @ (self.tag-self.flight.p-body@self.offset)
+        tag_id = 1 if self.visible and not (self.hide and self.arrival is not None) else 2
+        pose = Pose(Point(*pos), Quaternion(*quaternion_from_matrix(matrix)))
+        tag = TagObservation(id=tag_id, pose=pose, reprojection_rms_px=.3)
+        skew = .029 if self.skew else .00002
+        self.survey.publish(TagSurveyFrame(header=Header(stamp=stamp-rospy.Duration(skew),frame_id=frame),
+                                            family='tag36h11',ids=[tag_id],tags=[tag]))
+        if not self.pub.get_num_connections() or self.drop:
+            return
+        # A genuine target before arrival must never short-circuit this round.
+        correct = self.arrival is None or (not self.miss and time.monotonic()-self.arrival>.70)
+        text = 'BOX-01' if correct else 'BOX-99'
+        patch = self.patches[text]
+        qr = pos + matrix[:3,1]*.063
+        x = int(round(w/2+self.focal*qr[0]/max(.01, qr[2])))-patch.shape[1]//2
+        y = int(round(h/2+self.focal*qr[1]/max(.01, qr[2])))-patch.shape[0]//2
+        if self.rasters.get(text, ())[:2] != (x,y):
+            img = np.full((h,w),255,np.uint8)
+            if qr[2] > 0 and 0<=x<=w-patch.shape[1] and 0<=y<=h-patch.shape[0]:
+                img[y:y+patch.shape[0],x:x+patch.shape[0]] = patch
+            neighbour = self.patches['BOX-01']
+            img[:neighbour.shape[0], :neighbour.shape[1]] = neighbour
+            self.rasters[text] = x,y,img.tobytes()
+        self.pub.publish(Image(header=Header(stamp=stamp,frame_id=frame), width=w,height=h,
+                               step=w,encoding='mono8',data=self.rasters[text][2]))
 
 
 def test_geometry(cam):
@@ -120,10 +105,10 @@ def test_geometry(cam):
     goals=[]
     for angle in (-.3,.3):
         axes=rz(angle)@cam.axes
-        goal,center=fixed_scan_goal(cam.tag,axes,ref,cam.offsets["ov13855"],YAW)
-        expected=cam.tag+.62*axes[:,2]
+        goal,center=fixed_scan_goal(cam.tag,axes,ref,cam.offset,YAW)
+        expected=cam.tag+.80*axes[:,2]
         np.testing.assert_allclose(center,expected)
-        measured=goal+ref[0]@rz(heading(ref[0].T,YAW))@cam.offsets["ov13855"]
+        measured=goal+ref[0]@rz(heading(ref[0].T,YAW))@cam.offset
         np.testing.assert_allclose(measured,expected)
         goals.append(goal)
     assert np.linalg.norm(goals[1]-goals[0])>.35
@@ -166,7 +151,8 @@ def check_offboard_edges(folder):
             if state.issue:
                 raise Stopped(state.issue)
         try:
-            paired_scan(folder,'BOX-01',guard,evidence)
+            with closing(ScanStream()) as stream:
+                scan_at_arrival(stream, folder,'BOX-01',guard,evidence)
             raise AssertionError('scan survived OFFBOARD exit')
         except Stopped:
             assert 'OFFBOARD' in state.issue and scanning.is_set()
@@ -200,7 +186,7 @@ def check_offboard_edges(folder):
     assert done.wait(16), 'OFFBOARD exit/re-entry did not rearm'
     t.join(1)
     assert histories==[2,3], histories
-    print('PASS OFFBOARD duplicate ignored, exit cancels active paired scan, next rising edge starts a new round')
+    print('PASS OFFBOARD duplicate ignored, exit cancels active scan, next rising edge starts a new round')
 
 
 def main():
@@ -221,7 +207,15 @@ def main():
         client=actionlib.SimpleActionClient('/drone_nav/execute_route',ExecuteRouteAction)
         assert client.wait_for_server(rospy.Duration(20))
         runner=Runner(SimpleNamespace(preview=True,out=str(args.out),delay=3.),cfg,state,buf,prepare,check,client)
-        goal,_=fixed_scan_goal(cam.tag,cam.axes,(np.eye(3),np.zeros(3)),cam.offsets["ov13855"],YAW)
+        hold = runner.hold_at_point
+        def at_arrival(*args):
+            cam.arrival = time.monotonic()
+            try:
+                return hold(*args)
+            finally:
+                cam.arrival = None
+        runner.hold_at_point = at_arrival
+        goal,_=fixed_scan_goal(cam.tag,cam.axes,(np.eye(3),np.zeros(3)),cam.offset,YAW)
         until=time.monotonic()+30
         while runner.inputs_problem() or not prepare().success or not check(path_of([f.p,goal])).valid:
             assert time.monotonic()<until,'navigation not ready'
@@ -239,12 +233,14 @@ def main():
         assert lock['outcome'] == 'locked' and lock['pose_frames'] >= 3
         assert lock['windows'][-1]['stamps_ns'] == a['tag_stamps_ns']
         outcomes=a['scan']['cameras']
-        assert outcomes['ov9281']['status']=='success' and outcomes['ov13855']['status']=='timeout', outcomes
-        assert any('BOX-99' in attempt['texts'] for attempt in outcomes['ov9281']['reads'])
-        assert all((runner.folder/s['photo']).is_file() for s in outcomes.values())
-        assert outcomes['ov13855']['reason'] == 'roi_no_target'
-        assert outcomes['ov9281']['strategy'] and outcomes['ov9281']['depth_m'] > 0.
-        assert a['standoff_camera'] == 'ov13855' and a['standoff_m'] == .62
+        assert set(outcomes)=={'ov13855'} and a['status']=='timeout', a
+        missed=outcomes['ov13855']
+        assert missed['status']=='timeout' and missed['reason']=='roi_no_target'
+        assert any('BOX-99' in read['texts'] for read in missed['reads'])
+        assert (runner.folder/missed['photo']).is_file()
+        assert a['lock_camera']==a['standoff_camera']=='ov13855' and a['standoff_m']==.80
+        assert a['scan']['end_ns']-a['scan']['start_ns']==2_000_000_000
+        assert runner.record['legs'][0]['hold_elapsed_s'] >= 2.
         cam.miss=False
         cam.axes=rz(.08)@cam.axes
         assert runner.preview(),runner.trial
@@ -252,22 +248,28 @@ def main():
         assert np.linalg.norm(np.array(a['control_goal_map'])-runner.trial['control_goal_map'])>.04
         assert all(s['status']=='success' for s in runner.trial['scan']['cameras'].values()),runner.trial
         assert np.linalg.norm(np.array(runner.record['start_odom'])-runner.record['goals_odom'][0])<.2
-        reads = runner.trial['scan']['cameras']
-        for camera, distance in [('ov13855', .62), ('ov9281', .65)]:
-            assert abs(reads[camera]['range_m'] - distance) < .12, reads[camera]['range_m']
-            assert 0 < reads[camera]['depth_m'] <= reads[camera]['range_m']
-        for flag, reason in [('skew', 'no_matched_pose'), ('hide_upper', 'no_tag')]:
+        scan=runner.trial['scan']; result=scan['cameras']['ov13855']
+        assert runner.trial['status']=='success' and 0 < result['first_match_ms'] < 2000
+        assert any('BOX-99' in read['texts'] for read in result['reads'][:-1])
+        assert 'BOX-01' in result['reads'][-1]['texts'] and result['photo_stamp_ns']==result['reads'][-1]['stamp_ns']
+        assert abs(result['range_m']-.80)<.12 and abs(result['arrival_range_m']-.80)<.12
+        assert 0 < result['depth_m'] <= result['range_m'] and result['strategy']
+        for read in result['reads']:
+            assert scan['start_ns']<=read['stamp_ns']<scan['end_ns']
+            assert scan['start_ns']<=read['pose_stamp_ns']<scan['end_ns']
+            assert abs(read['stamp_ns']-read['pose_stamp_ns'])<=10_000_000
+        for flag, reason in [('skew', 'no_matched_pose'), ('hide', 'no_tag')]:
             setattr(cam, flag, True)
             assert runner.preview(), runner.trial
-            scan = runner.trial['scan']['cameras']
-            assert scan['ov13855']['reason'] == reason and scan['ov13855']['attempts'] == 0, scan
-            assert scan['ov9281']['status'] == 'success'
+            result=runner.trial['scan']['cameras']['ov13855']
+            assert result['reason']==reason and result['attempts']==0, result
+            if flag=='skew': assert result['arrival_range_m']>0
             setattr(cam, flag, False)
         cam.drop=True
         assert not runner.preview() and runner.trial['status']=='stream_fault',runner.trial
         summary=json.loads((args.out/'success_rates.json').read_text())
         assert summary['completed']==4 and summary['cameras']['ov13855']['rate']==.25
-        assert summary['cameras']['ov9281']['rate']==1.
+        assert set(summary['cameras'])=={'ov13855'} and summary['cameras']['ov13855']['completed']==4
         cam.drop=False
         edge_dir=args.out/'edge'
         edge_dir.mkdir()
@@ -277,7 +279,9 @@ def main():
             assert len(rounds) == 6 and rounds[0]['lock_tag1_frames'] == '0'
             assert rounds[1]['lock_outcome'] == 'locked' and int(rounds[1]['lock_max_window_frames']) >= 3
         assert not any(t=='/mavros/setpoint_raw/local' for t,_ in rosgraph.Master(rospy.get_name()).getSystemState()[0])
-        print('PASS six rounds: no lock, paired ROI decode, neighbour then target, skew, missing tag, stream fault excluded')
+        for group in rosgraph.Master(rospy.get_name()).getSystemState()[:2]:
+            assert not any(t.startswith(('/usb_cam', '/ov9281')) for t,_ in group)
+        print('PASS single-camera lock, timeout, early target, arrival distance, skew, missing tag and stream fault')
     finally:
         cam.clock.shutdown()
         f.close()
