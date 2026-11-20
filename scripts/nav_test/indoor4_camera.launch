@@ -1,0 +1,15 @@
+<launch>
+  <arg name="save_dir"/>
+  <arg name="layout_file" default="$(find barcode_reader_camera)/config/layouts/qr_top_tag_bottom.yaml"/>
+  <include file="$(find ov13855_cam)/launch/ov13855.launch"/>
+  <include file="$(find ov13855_apriltag_vision)/launch/ov13855_apriltag_vision.launch">
+    <arg name="layout_file" value="$(arg layout_file)"/>
+    <arg name="publish_detections" value="true"/>
+  </include>
+  <include file="$(find barcode_reader_camera)/launch/barcode_reader_camera.launch">
+    <arg name="layout_file" value="$(arg layout_file)"/>
+    <arg name="pose_topic" value="/indoor4/target_tag_pose"/>
+    <arg name="save_frames" value="all"/>
+    <arg name="save_dir" value="$(arg save_dir)"/>
+  </include>
+</launch>

@@ -39,7 +39,8 @@ from analyze_sequence import analyze
 
 
 class Fixture:
-    def __init__(self, out):
+    def __init__(self, out, map_yaw=0.):
+        self.map_yaw = map_yaw  # drone_map <- drone_odom; independent of the simulated PX4 alignment
         self.lock=threading.RLock();self.stop=False;self.preview=None
         self.p=np.array([0.,0.,1.]);self.a=math.radians(170)
         self.r=rz(.4);self.t=np.array([2.,-3.,.3]);self.bag=rosbag.Bag(str(out/'synthetic.bag'),'w')
@@ -98,7 +99,9 @@ class Fixture:
                                ('/drone_reloc/result',dict(confirmed=True,map='synthetic'))):
                 self.pubs[topic].publish(String(json.dumps(data)))
             tr=TransformStamped();tr.header=Header(stamp=now,frame_id='drone_map');tr.child_frame_id='drone_odom'
-            tr.transform.rotation.w=1.;self.tf.sendTransform(tr)
+            tr.transform.rotation.z = math.sin(self.map_yaw / 2)
+            tr.transform.rotation.w = math.cos(self.map_yaw / 2)
+            self.tf.sendTransform(tr)
             if i%5==0:
                 self.pubs['/drone_nav/sensor_odom'].publish(odom)
                 points=self.points+self.rng.uniform(-.055,.055,self.points.shape)
