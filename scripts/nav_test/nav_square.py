@@ -285,8 +285,11 @@ class SquareRunner:
             raise Stopped('下一段 prepare 被拒：' + hint(response.message))
         # 真实输出在 prepare 后至少 1 s 才 READY；只容忍服务返回前的旧消息。
         until, called = time.monotonic() + 3.0, time.monotonic()
+        returned_ros = rospy.Time.now().to_sec()
         while True:
-            old = self.s.st.get('gateway_status', {}).get('_at', 0) <= called
+            gateway = self.s.st.get('gateway_status', {})
+            # A pre-prepare STOP message may arrive after the service reply.
+            old = gateway.get('_at', 0) <= called or gateway.get('stamp', float('inf')) <= returned_ros
             self.guard(stopped=old, preparing=True)
             if not old and self.s.get('gateway_status') == 'READY':
                 return

@@ -63,6 +63,13 @@ def ordering():
 
 
 class Camera:
+    tag_topic, tag_type = DETECTIONS, TagObservationArray
+    target_topic = '/indoor4/target_tag_pose'
+    missing_key, neighbor_key = 3, 2
+
+    def configure(self):
+        pass
+
     def __init__(self, flight, cfg, route):
         self.flight = flight
         self.route = route
@@ -83,10 +90,11 @@ class Camera:
         self.tag_axes = {key: rz(math.radians(deg)) @ upright
                          for key, deg in zip(self.coords, (8., -9., 0., 5.))}
         self.k = [2700., 0., SIZE[0]/2, 0., 2700., SIZE[1]/2, 0., 0., 1.]
+        self.configure()
         self.image = rospy.Publisher(CAMERA_IMAGE, Image, queue_size=1)
         self.info = rospy.Publisher(CAMERA_INFO, CameraInfo, queue_size=1, latch=True)
-        self.tags = rospy.Publisher(DETECTIONS, TagObservationArray, queue_size=3)
-        self.target = rospy.Subscriber('/indoor4/target_tag_pose', PoseStamped, self.on_target, queue_size=4)
+        self.tags = rospy.Publisher(self.tag_topic, self.tag_type, queue_size=3)
+        self.target = rospy.Subscriber(self.target_topic, PoseStamped, self.on_target, queue_size=4)
         self.decoder = rospy.Service(DECODE, DecodeBarcodes, self.decode)
         self.cancel = rospy.Service(CANCEL_DECODE, Trigger, self.cancel_decode)
         self.timer = rospy.Timer(rospy.Duration(.067), self.publish)
@@ -143,12 +151,12 @@ class Camera:
         world = p + view @ np.asarray([pos.x, pos.y, pos.z])
         key = min(self.coords, key=lambda k: np.linalg.norm(self.coords[k] - world))
         self.ids.append(key)
-        if key == 3:
+        if key == self.missing_key:
             return DecodeBarcodesResponse(error='decode_fail', header=msg.header)
         matrix = view.T @ self.tag_axes[key]
         rvec = cv2.Rodrigues(matrix)[0]
         shape = np.array([[-.025,.035,0], [.025,.035,0], [.025,.085,0], [-.025,.085,0]])
-        if key == 2:
+        if key == self.neighbor_key:
             # Return a neighbouring label's pixels despite requesting tag 2.
             # The runner must reject this result even if the decoder says success.
             bad = view.T @ (self.coords[1] - self.coords[2])
@@ -184,7 +192,7 @@ def check_dispatched_goals(messages, record, route, camera, out):
             optical_center = paper + .80 * axes[:, 2]
             expected.append(('Tag %d 读码点' % key, optical_center - offset_map, optical_center))
     expected.append(('返回右下观察点', np.array(route['points'][-1]['xyz']), None))
-    assert len(messages) == len(record['legs']) == len(expected) == 9
+    assert len(messages) == len(record['legs']) == len(expected) == 5 + len(camera.coords)
     evidence = []
     for message, leg, (name, position, optical_center) in zip(messages, record['legs'], expected):
         assert leg['direction'] == name and len(message.goal.waypoints) == 1
@@ -203,7 +211,7 @@ def check_dispatched_goals(messages, record, route, camera, out):
             item['optical_center_error_m'] = float(np.linalg.norm(camera_map-optical_center))
         evidence.append(item)
     (out/'dispatched_goals.json').write_text(json.dumps(evidence, ensure_ascii=False, indent=2)+'\n')
-    print('PASS all 9 drone_map action goals have yaw %.1f deg with a %.1f deg rotated map; '
+    print('PASS all drone_map action goals have yaw %.1f deg with a %.1f deg rotated map; '
           'camera positions match independent paper normals' % (yaw_deg, math.degrees(camera.flight.map_yaw)), flush=True)
 
 
@@ -272,8 +280,8 @@ def decode_cancel(runner, camera):
     print('PASS navigation loss cancels active decode and clears target', flush=True)
 
 
-def main():
-    assert os.environ.get('ROS_MASTER_URI') == 'http://127.0.0.1:11446'
+def main(camera_type=Camera, runner_type=Indoor4Runner, route_loader=load_route, verify=None, port=11446, cold_grid_check=None):
+    assert os.environ.get('ROS_MASTER_URI') == 'http://127.0.0.1:%d' % port
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', required=True, type=Path)
     args = parser.parse_args()
@@ -283,8 +291,10 @@ def main():
     splines = []
     sub = rospy.Subscriber('/drone_nav/bspline', Bspline, splines.append, queue_size=20)
     cfg = rospy.get_param('/drone_nav/config')
-    route = load_route()
+    route = route_loader()
     route['map_id'] = 'synthetic'
+    if cold_grid_check is not None:
+        cold_grid_check()
     fixture = Fixture(args.out, map_yaw=math.radians(25.))
     map_rotation = rz(fixture.map_yaw)
     fixture.p = map_rotation.T @ np.array([.45, .34, .50])
@@ -292,7 +302,7 @@ def main():
     sent_goals = []
     wire = rospy.Subscriber('/drone_nav/execute_route/goal', ExecuteRouteActionGoal,
                             sent_goals.append, queue_size=32)
-    camera = Camera(fixture, cfg, route['points'])
+    camera = camera_type(fixture, cfg, route['points'])
     try:
         state, buffer = SquareState(), tf2_ros.Buffer()
         listener = tf2_ros.TransformListener(buffer)
@@ -303,7 +313,7 @@ def main():
         assert client.wait_for_server(rospy.Duration(15))
         run_args = SimpleNamespace(preview=True, points=[(*p['xyz'], route['yaw_deg']) for p in route['points']],
             max_start_offset=math.inf, check_segments=False, hold=3., delay=3., out=str(args.out), route=route)
-        runner = Indoor4Runner(run_args, cfg, state, buffer, prepare, check, client)
+        runner = runner_type(run_args, cfg, state, buffer, prepare, check, client)
         wait_for(lambda: not runner.inputs_problem() and prepare().success, 20, 'input not ready')
         wait_for(lambda: check(path_of([fixture.p, map_rotation.T @ route['points'][0]['xyz']])).valid, 20, 'free grid not ready')
         wait_for(lambda: wire.get_num_connections() > 0, 5, 'action goal monitor not connected')
@@ -312,19 +322,22 @@ def main():
         assert record['end'] == 'SUCCEEDED'
         assert len(record['batches']) == 4
         assert all(batch['photo'].get('file') for batch in record['batches'])
-        assert len(camera.ids) == 4 and set(camera.ids) == {1,2,3,4}, camera.ids
-        assert len(record['scans']) == 4
-        assert {item['id']: item['status'] for item in record['scans']} == {
-            1:'success', 2:'failed', 3:'failed', 4:'success'}, record['scans']
-        assert not record['batches'][2]['order'], record['batches'][2]
-        assert np.linalg.norm(map_rotation @ fixture.p - route['points'][3]['xyz']) < .05
-        check_dispatched_goals(sent_goals, record, route, camera, args.out)
+        if verify:
+            verify(runner, camera, sent_goals, route, fixture, args.out)
+        else:
+            assert len(camera.ids) == 4 and set(camera.ids) == {1,2,3,4}, camera.ids
+            assert len(record['scans']) == 4
+            assert {item['id']: item['status'] for item in record['scans']} == {
+                1:'success', 2:'failed', 3:'failed', 4:'success'}, record['scans']
+            assert not record['batches'][2]['order'], record['batches'][2]
+            assert np.linalg.norm(map_rotation @ fixture.p - route['points'][3]['xyz']) < .05
+            check_dispatched_goals(sent_goals, record, route, camera, args.out)
         for batch in record['batches']:
             for entry in batch['candidates']:
                 if 'camera_map' in entry:
                     np.testing.assert_allclose(entry['tag_xyz_map'], camera.coords[entry['id']], atol=.005)
                     np.testing.assert_allclose(np.linalg.norm(np.asarray(entry['camera_map'])-entry['paper_map']), .8)
-        print('PASS four batches, photo capture, unique decode, neighbour QR rejection, failure continuation and return', flush=True)
+        print('PASS four batches, four photos and final return', flush=True)
         runner.s.begin(False, cfg['map_id'])
         short_goals(fixture, runner, splines)
         reject_occupied(fixture, runner, splines)

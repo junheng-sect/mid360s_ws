@@ -434,7 +434,7 @@ PY
   local _nav_args=(config:="$NAV_CONFIG" enable_output:=true max_vel:="$_max_vel" max_acc:="$_max_acc" max_vel_z:="$_max_vel_z" max_acc_z:="$_max_acc_z")
   [ "$PREVIEW" -eq 1 ] && _nav_args=(config:="$NAV_CONFIG" enable_output:=false radius:="$PREVIEW_RADIUS" half_height:="$PREVIEW_HALF_HEIGHT" max_vel:="$_max_vel" max_acc:="$_max_acc" max_vel_z:="$_max_vel_z" max_acc_z:="$_max_acc_z")
   _nav_args+=(prior_grid_file:="$_prior_file" prior_map_sha256:="$_prior_map_sha")
-  [ "$TEST_NAME" != test_indoor4 ] || _nav_args+=(allow_short_goals:=true)
+  [[ "$TEST_NAME" != test_indoor4 && "$TEST_NAME" != test_indoor5 ]] || _nav_args+=(allow_short_goals:=true)
   [ "$TEST_NAME" != test_indoor3_3 ] || _nav_args+=(allow_short_goals:=true)
   start_child "$PF_NAV" "$OUT/nav.log" roslaunch drone_navigation navigation.launch "${_nav_args[@]}"
   cat >"$RUN_DIR/wait_nav.py" <<'PY'

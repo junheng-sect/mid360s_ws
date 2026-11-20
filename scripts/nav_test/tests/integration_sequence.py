@@ -179,10 +179,16 @@ def main():
         print('PASS no real MAVROS setpoint publisher',flush=True)
     finally:
         f.close()
+    validate_results(args.out, rospy.get_param('/drone_nav/config/yaw_rate_deg'))
+    rospy.signal_shutdown('done')
+
+
+def validate_results(out, yaw_rate_deg):
+    expected_turn_s = 90. / yaw_rate_deg
     results=[]
-    for path in sorted(args.out.glob('goal_test*.json')):
-        record=json.loads(path.read_text());summary=analyze(args.out/'synthetic.bag',record)
-        (args.out/(record['test']+'_summary.json')).write_text(json.dumps(summary,indent=2,ensure_ascii=False,allow_nan=False))
+    for path in sorted(out.glob('goal_test*.json')):
+        record=json.loads(path.read_text());summary=analyze(out/'synthetic.bag',record)
+        (out/(record['test']+'_summary.json')).write_text(json.dumps(summary,indent=2,ensure_ascii=False,allow_nan=False))
         assert record['end']=='SUCCEEDED'
         for leg in summary['legs']:
             assert leg['command_v_peak_mps'] is not None
@@ -195,12 +201,11 @@ def main():
                 assert leg['replans']>0 and leg['intermediate_endpoints'],leg
         else:
             for leg in summary['legs'][4:]:
-                assert 8.5<leg['turn_command_duration_s']<10.5,leg
+                assert .94 * expected_turn_s < leg['turn_command_duration_s'] < 1.17 * expected_turn_s, leg
                 assert leg['motion_position_error_peak_m']<.02,leg
         results.append(summary)
     assert len(results)==2
     print('PASS intermediate trajectories, accepted replans, continuity, limits and four stationary 90deg turns',flush=True)
-    rospy.signal_shutdown('done')
 
 
 if __name__=='__main__':main()

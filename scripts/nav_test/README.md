@@ -393,3 +393,11 @@ ROS 服务单次等待上限 2 s，并受起飞/航段/降落阶段的剩余时�
 用 `--show-dll-config` 可以在启动前核对当前任务的默认策略；命令只打印配置。导航就绪后，任务用本次重定位地图启动 DLL。已知大室外图选用经同源哈希校验的裁图。网页同时保留原导航主位姿与 DLL 对照栏。目录中的 `dll.log`、`dll_observer.json` 和配置副本用于复盘。对照量是同一扫描时刻的 DLL 减 FAST-LIO2，不写入生产 TF。
 
 默认按原有设置录包，并增加两路地图位姿、校正、状态与会话信息。需要雷达原始数据以便重跑或静止检查点 ICP 时，在本次命令末尾加 `--record-raw-lidar`；只用原定位可加 `--no-dll`。通用录包导出：`python3 ~/orange/tools/warehouse_monitor/export_dll_drift.py "$bag" "${bag%.bag}_drift"`（先 source 板端 mid360s_ws 环境）。四点观察的短停可以作同帧差值分析；ICP 工具只为满足其静止时长和几何质量条件的窗口出参考值。
+
+## 室内 test5 固定纸面四点扫码
+
+板端运行 `~/mid360s_ws/scripts/nav_test_indoor5.sh`，手持预览加 `--preview`。四个观察点沿用室内 test4，地图航向 −89.5°。货签竖直正放，外法线沿机头反方向。OV13855 在 1280×960 图上检测四角，由同帧机体姿态、相机外参和 43.7 mm 黑框拟合中心位置；扫码时使用固定纸面将 QR 区域投影到全分辨率图。机体控制点的候选高度和运行高度上限均为 1.70 m，光心距纸面中心 0.80 m。
+
+通道 6 录制 `test_indoor5_*.bag`。任务 JSON 含每张观测的角点与拟合误差、各批次的候选高度和访问顺序、到达航段、实际 QR 正文，以及 `tag_counts` 的发现、通过预检、到达、读对数量。普通未读到会继续下一张；飞手切出 OFFBOARD 后结束本圈。
+
+在私有 master 上，`scripts/nav_test/tests/run_indoor4_isolated.sh --indoor5` 验证六签任务与实发 action，`scripts/nav_test/tests/run_indoor5_replay.sh <历史实验目录> <回放输出目录>` 可复核 11 月 20 日 16:49 室内 test4 的四张照片和三张扫码命中原图。

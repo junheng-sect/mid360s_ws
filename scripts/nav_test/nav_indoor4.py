@@ -69,6 +69,13 @@ def wait_until(get, seconds, guard, after=None):
 
 
 class Vision:
+    detection_topic = DETECTIONS
+    detection_type = TagObservationArray
+    target_topic = '/indoor4/target_tag_pose'
+
+    def ready_info(self):
+        return self.info
+
     def __init__(self):
         self.lock = threading.Lock()
         self.latest = None
@@ -77,8 +84,8 @@ class Vision:
         self.target = None
         self.since = rospy.Time(0)
         self.forwarded = deque(maxlen=150)
-        self.pose_pub = rospy.Publisher('/indoor4/target_tag_pose', PoseStamped, queue_size=3)
-        self.detections = rospy.Subscriber(DETECTIONS, TagObservationArray, self.on_detections, queue_size=4)
+        self.pose_pub = rospy.Publisher(self.target_topic, PoseStamped, queue_size=3)
+        self.detections = rospy.Subscriber(self.detection_topic, self.detection_type, self.on_detections, queue_size=4)
         self.camera = rospy.Subscriber(CAMERA_INFO, CameraInfo, self.on_info, queue_size=1)
         self.decode = rospy.ServiceProxy(DECODE, DecodeBarcodes)
         self.cancel = rospy.ServiceProxy(CANCEL_DECODE, Trigger)
@@ -95,14 +102,17 @@ class Vision:
         with self.lock:
             self.latest = msg
             self.frames.append(msg)
-            if self.target is None or msg.header.stamp < self.since:
-                return
-            matches = [tag for tag in msg.tags if (msg.family, tag.id) == self.target
-                       and math.isfinite(tag.reprojection_rms_px) and tag.reprojection_rms_px <= 2.]
-            if len(matches) == 1:
-                pose = PoseStamped(header=msg.header, pose=matches[0].pose)
-                self.forwarded.append(pose)
-                self.pose_pub.publish(pose)
+            self.on_target_frame(msg)
+
+    def on_target_frame(self, msg):
+        if self.target is None or msg.header.stamp < self.since:
+            return
+        matches = [tag for tag in msg.tags if (msg.family, tag.id) == self.target
+                   and math.isfinite(tag.reprojection_rms_px) and tag.reprojection_rms_px <= 2.]
+        if len(matches) == 1:
+            pose = PoseStamped(header=msg.header, pose=matches[0].pose)
+            self.forwarded.append(pose)
+            self.pose_pub.publish(pose)
 
     def window(self, start, end):
         with self.lock:
@@ -154,6 +164,9 @@ def load_calibration():
 class Indoor4Runner(GlobalRunner):
     test_name = record_prefix = 'test_indoor4'
     route_name = '室内 test4 四点分批扫码'
+    vision_type = Vision
+    test_label = 'test4'
+    event_prefix = 'INDOOR4'
     side_m = None
     repeat_laps = False
 
@@ -163,7 +176,7 @@ class Indoor4Runner(GlobalRunner):
         self.out = Path(args.out)
         self.cam_translation, self.cam_rotation, self.layout, self.config_paths = load_calibration()
         self.lever = finite(cfg['lever_body'])
-        self.vision = Vision()
+        self.vision = self.vision_type()
         self.pose_lock = threading.Lock()
         self.poses = LocalPoseBuffer(400)
         self.odom = rospy.Subscriber('/drone_nav/odom', Odometry, self.on_odom, queue_size=25)
@@ -189,7 +202,7 @@ class Indoor4Runner(GlobalRunner):
         if (Path(self.cfg['map_id']).name != self.route['map_id']
                 or self.cfg.get('allow_unknown_above') is not False
                 or self.cfg.get('allow_short_goals') is not True):
-            raise Stopped('test4 需要飞扫图、拒绝未知区域和短目标支持')
+            raise Stopped(self.test_label + ' 需要飞扫图、拒绝未知区域和短目标支持')
         recent = wait_until(lambda: self.vision.latest, 1.5, self.guard, rospy.Time.now())
         if recent is None:
             raise Stopped('AprilTag 图像或标定未就绪')
@@ -215,7 +228,7 @@ class Indoor4Runner(GlobalRunner):
         if self.reference is not None:
             r, t = self.reference
             if (r @ self.s.pose()[0] + t)[2] > self.route['max_control_z']:
-                raise Stopped('超过 test4 地图高度上限 %.2f m' % self.route['max_control_z'])
+                raise Stopped('%s 控制点超过地图高度上限 %.2f m' % (self.test_label, self.route['max_control_z']))
 
     def stopped(self):
         self.guard(stopped=True)
@@ -296,7 +309,7 @@ class Indoor4Runner(GlobalRunner):
     def precheck(self, g, odom, current=None):
         self.stopped()
         if g[2] > self.route['max_control_z']:
-            raise ValueError('above test4 height limit')
+            raise ValueError('above %s height limit' % self.test_label)
         check_goal_bounds([odom], self.cfg, ['scan goal'])
         points = [current, odom] if current is not None and np.linalg.norm(current - odom) < .20 else [odom]
         response = self.check(path_of(points))
@@ -310,7 +323,7 @@ class Indoor4Runner(GlobalRunner):
                        success=self.counts['ok'], failed=self.counts['failed'])
         if route is not None:
             message['route'] = route
-        say('INDOOR4 ' + json.dumps(message, ensure_ascii=False, separators=(',', ':')))
+        say(self.event_prefix + ' ' + json.dumps(message, ensure_ascii=False, separators=(',', ':')))
 
     def hold_at_point(self, i, leg, seconds):
         if i >= len(self.route['points']):
@@ -468,34 +481,38 @@ class Indoor4Runner(GlobalRunner):
                 and abs(cv2.contourArea(pixels.astype(np.float32))) > 64.)
 
 
-def probe(out):
-    rospy.init_node('indoor4_camera_probe', anonymous=True)
-    vision = Vision()
+def probe(out, vision_type=Vision, name='indoor4_camera_probe'):
+    rospy.init_node(name, anonymous=True)
+    vision = vision_type()
     rospy.wait_for_service(DECODE, timeout=10.)
     rospy.wait_for_service(CANCEL_DECODE, timeout=3.)
     now = rospy.Time.now()
     if (wait_until(lambda: vision.latest, 6., lambda: None, now) is None
-            or wait_until(lambda: vision.info, 2., lambda: None, now) is None
+            or wait_until(vision.ready_info, 2., lambda: None, now) is None
             or vision.take_photo(now, lambda: None) is None):
         raise Stopped('OV13855 双路图像或标定不可用')
     if shutil.disk_usage(out).free < 1024 ** 3:
-        raise Stopped('test4 剩余空间不足以保存相片与扫码记录')
-    say('test4 相机就绪：1280×960 AprilTag、4224×3136 QR')
+        raise Stopped('剩余空间不足以保存相片与扫码记录')
+    say('相机就绪：1280×960 AprilTag、4224×3136 QR')
 
 
-def main():
+def run_cli(runner_type, route_loader, node_name):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--preview', action='store_true')
     parser.add_argument('--probe-camera', action='store_true')
     args = parser.parse_args()
     if args.probe_camera:
-        return probe(args.out)
-    route = load_route()
-    return serve('nav_indoor4', SimpleNamespace(
+        return probe(args.out, runner_type.vision_type, node_name.split('nav_', 1)[-1] + '_camera_probe')
+    route = route_loader()
+    return serve(node_name, SimpleNamespace(
         route=route, points=[(*p['xyz'], route['yaw_deg']) for p in route['points']],
         hold=route['hold_s'], check_segments=False, delay=3., max_start_offset=math.inf,
-        out=str(args.out.resolve()), preview=args.preview), Indoor4Runner)
+        out=str(args.out.resolve()), preview=args.preview), runner_type)
+
+
+def main():
+    return run_cli(Indoor4Runner, load_route, 'nav_indoor4')
 
 
 if __name__ == '__main__':
