@@ -138,7 +138,16 @@ finish() { # finish <退出码> [force]：信号触发时飞机还解锁着就�
   local _b; for _b in "$OUT"/*.bag; do [ -f "$_b" ] && log "包：$_b（$(du -h "$_b" | cut -f1)）"; done
   for _b in "$OUT"/goal_*.json; do [ -f "$_b" ] && log "目标记录：$_b"; done
   log "全部记录：$OUT"
-  if [ -n "${WAREHOUSE_TASK_ID:-}" ] && [ "$_cleanup_ok" -eq 1 ] && [ "$_code" -eq 130 ]; then
+  if declare -F test_after_cleanup >/dev/null; then
+    if [ "$_cleanup_ok" -eq 1 ]; then
+      test_after_cleanup || { echo "归档索引失败，原始文件在 $OUT" >&2; _code=1; }
+      # The indexed logs are immutable from here on.
+      if [ -n "${WAREHOUSE_TASK_ID:-}" ] && [ "$_code" -eq 130 ]; then echo "[ OK ] 网页任务已收尾"; fi
+    else
+      echo "进程未完全退出，暂不索引 $OUT" >&2
+      _code=1
+    fi
+  elif [ -n "${WAREHOUSE_TASK_ID:-}" ] && [ "$_cleanup_ok" -eq 1 ] && [ "$_code" -eq 130 ]; then
     ok "网页任务已收尾"
   fi
   if [ "${NAV_TEST_IN_TMUX:-0}" = 1 ]; then read -r -p "按回车关闭这个 tmux 会话 " _ </dev/tty; fi
@@ -235,7 +244,7 @@ nav_test_main() {
 
   nt_bringup
   if (( NT_DLL )); then
-    log "导航已就绪，异步启动 DLL 旁路（日志 $OUT/dll.log）"
+    log "定位已就绪，异步启动 DLL 旁路（日志 $OUT/dll.log）"
     start_child "$PF_DLL" "$OUT/dll.log" nice -n 10 env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
       "$NT_DIR/start_dll_observer.sh" "$MAP" "$RELOC_CONFIG" "$OUT" || warn "DLL 旁路未启动"
   fi
@@ -258,7 +267,7 @@ nav_test_main() {
   while :; do
     sleep 2
     child_pid "$PF_FUSION" >/dev/null || { err "定位链路 fusion.sh 已退出，看 $OUT/fusion.log"; finish 1 force; }
-    if [ "$_nav_gone" -eq 0 ] && ! child_pid "$PF_NAV" >/dev/null; then warn "导航已退出，看 $OUT/nav.log"; _nav_gone=1; fi
+    if [ "${NT_MANUAL_FLIGHT:-0}" = 0 ] && [ "$_nav_gone" -eq 0 ] && ! child_pid "$PF_NAV" >/dev/null; then warn "导航已退出，看 $OUT/nav.log"; _nav_gone=1; fi
   done
 }
 
@@ -420,6 +429,7 @@ PY
   python3 "$RUN_DIR/wait_reloc.py" "$_rpid" "$LOG" || { err "重定位没成功，看 $OUT/reloc.log"; finish 1 force; }
   ok "重定位完成；world map 由 car_bridge 发（看 $OUT/car_bridge.log）"
 
+  if [[ "${NT_MANUAL_FLIGHT:-0}" == 1 ]]; then return 0; fi
   hr; log "步骤 4/4：启动导航（EGO + 执行器 + 网关，$([ "$PREVIEW" -eq 1 ] && echo 只预览 || echo 真实输出)）"
   local _nav_args=(config:="$NAV_CONFIG" enable_output:=true max_vel:="$_max_vel" max_acc:="$_max_acc" max_vel_z:="$_max_vel_z" max_acc_z:="$_max_acc_z")
   [ "$PREVIEW" -eq 1 ] && _nav_args=(config:="$NAV_CONFIG" enable_output:=false radius:="$PREVIEW_RADIUS" half_height:="$PREVIEW_HALF_HEIGHT" max_vel:="$_max_vel" max_acc:="$_max_acc" max_vel_z:="$_max_vel_z" max_acc_z:="$_max_acc_z")
