@@ -90,6 +90,13 @@ def unknown_footprint():
 
 
 def verify(runner, camera, messages, route, fixture, out):
+    cfg = rospy.get_param('/drone_nav/config')
+    assert (cfg['max_vel'], cfg['max_acc']) == (.5, .5)
+    for section, keys in [('manager', ('max_vel', 'max_acc')), ('optimization', ('max_vel', 'max_acc')),
+                          ('bspline', ('limit_vel', 'limit_acc'))]:
+        actual = [rospy.get_param('/drone_0_ego_planner_node/%s/%s' % (section, key)) for key in keys]
+        np.testing.assert_allclose(actual, [.4/math.sqrt(3)] * 2)
+    print('PASS EGO 0.40 m/s and 0.40 m/s²; executor/gateway 0.50 m/s and 0.50 m/s²', flush=True)
     record=runner.record
     assert record['tag_counts']==dict(discovered=6,passed_precheck=6,arrived=6,read_ok=6), record['tag_counts']
     assert [b['order'] for b in record['batches']]==[[5],[2,1],[4,0],[3]], record['batches']

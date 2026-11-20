@@ -14,10 +14,12 @@ config:
   # drone_odom 控制参考点坐标，不是离地测距；0.10 下界 + 0.30 余量，允许起点高度 0.40～2.20 m。
   bounds_min: [-3.0, -3.0, 0.1]
   bounds_max: [3.0, 3.0, 2.5]
-  # 网关/执行器按三维模长限制，EGO 单轴上限除以 sqrt(3)，约 0.289。
+  # 执行器、网关的三维上限。EGO 读取本任务规划值后再换算单轴上限。
   max_vel: 0.5
   max_acc: 0.5
   # 沿用当前竖直限制，EGO 会再取与单轴上限的较小值；本测试目标高度不变。
   max_vel_z: 0.3
   max_acc_z: 0.3
   yaw_rate_deg: 30
+  planner_limits_by_task:
+    test_indoor5: {max_vel: 0.40, max_acc: 0.40}

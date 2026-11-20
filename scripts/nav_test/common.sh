@@ -154,6 +154,24 @@ finish() { # finish <退出码> [force]：信号触发时飞机还解锁着就�
   exit "$_code"
 }
 
+# Read the EGO launch limits; task overrides may only tighten the navigation hard limits.
+nt_ego_limits() {
+  python3 - "$1" "$2" <<'LIMITS'
+import math, sys, yaml
+with open(sys.argv[1]) as stream:
+    cfg = yaml.safe_load(stream)['config']
+overrides = cfg.get('planner_limits_by_task', {}).get(sys.argv[2], {})
+limits = []
+for key in ('max_vel', 'max_acc'):
+    hard = cfg[key]
+    value = overrides.get(key, hard)
+    if not math.isfinite(value) or not 0 < value <= hard:
+        sys.exit('EGO %s 必须大于零并且不超过导航上限 %s' % (key, hard))
+    limits.append(value)
+print(*limits, cfg.get('max_vel_z', -1), cfg.get('max_acc_z', -1))
+LIMITS
+}
+
 nt_check_chain() { # 每次发目标前确认链路还在
   child_pid "$PF_FUSION" >/dev/null || { err "定位链路 fusion.sh 已退出，看 $OUT/fusion.log"; return 1; }
   child_pid "$PF_RELOC" >/dev/null || { err "重定位节点已退出，看 $OUT/reloc.log"; return 1; }
@@ -339,11 +357,12 @@ if sys.argv[3] == '0' and c.get('deployment_verified') is not True:
     sys.exit('导航配置 deployment_verified 不是 true，真实输出会被网关拒绝（只预览加 --preview）')
 print('导航配置：三维限速 %.2f m/s、%.2f m/s²，竖直 %s，转向 %s°/s，目标范围 %s ~ %s（drone_odom）' % (c['max_vel'], c['max_acc'], '%.2f m/s、%.2f m/s²' % (c['max_vel_z'], c.get('max_acc_z', -1)) if 'max_vel_z' in c else '同水平', c.get('yaw_rate_deg', 10), c['bounds_min'], c['bounds_max']))
 PY
-  # EGO 的限速是 navigation.launch 的参数，不读这份配置：取出来传过去，EGO 和网关/执行器用同一组上限。
+  # EGO 启动参数可按任务收紧；网关和执行器直接读取导航配置。
   # 竖直上限 max_vel_z / max_acc_z 可选，没写传 -1（和水平单轴上限相同）
   local _max_vel _max_acc _max_vel_z _max_acc_z
-  read -r _max_vel _max_acc _max_vel_z _max_acc_z < <(python3 -c 'import sys, yaml; c = yaml.safe_load(open(sys.argv[1]))["config"]; print(c["max_vel"], c["max_acc"], c.get("max_vel_z", -1), c.get("max_acc_z", -1))' "$NAV_CONFIG")
+  read -r _max_vel _max_acc _max_vel_z _max_acc_z < <(nt_ego_limits "$NAV_CONFIG" "$TEST_NAME")
   [ -n "$_max_acc_z" ] || { err "读不到导航配置的 max_vel / max_acc"; finish 1 force; }
+  log "EGO 三维规划上限：速度 ${_max_vel} m/s，加速度 ${_max_acc} m/s²"
 
   hr; log "步骤 1/4：载入地图（缓存不对就重建，室外图约 70 s，只第一次）"
   if ! python3 - "$MAP" "$RELOC_CONFIG" 2>&1 <<'PY' | tee -a "$LOG"; then err "地图载入失败"; finish 1 force; fi

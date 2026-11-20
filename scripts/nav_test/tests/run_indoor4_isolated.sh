@@ -39,7 +39,9 @@ setsid roscore -p "$port" >"$INDOOR_EVIDENCE/master.log" 2>&1 & INDOOR_PIDS+=("$
 for _ in $(seq 50); do rosparam list >/dev/null 2>&1 && break; sleep .2; done
 rosparam list >/dev/null
 rosparam load "$INDOOR_EVIDENCE/config.yaml" /drone_nav
-setsid roslaunch drone_navigation ego.launch radius:=0.4 half_height:=0.3 max_vel:=0.5 max_acc:=0.5 max_vel_z:=0.3 max_acc_z:=0.3 >"$INDOOR_EVIDENCE/ego.log" 2>&1 & INDOOR_PIDS+=("$!")
+source "$INDOOR_TEST_DIR/../common.sh"
+read -r vel acc vel_z acc_z < <(nt_ego_limits "$INDOOR_EVIDENCE/config.yaml" "test_indoor${variant}")
+setsid roslaunch drone_navigation ego.launch radius:=0.4 half_height:=0.3 max_vel:="$vel" max_acc:="$acc" max_vel_z:="$vel_z" max_acc_z:="$acc_z" >"$INDOOR_EVIDENCE/ego.log" 2>&1 & INDOOR_PIDS+=("$!")
 for node in waypoint_manager trajectory_executor offboard_gateway; do
   setsid rosrun drone_navigation "$node" _enable_output:=false >"$INDOOR_EVIDENCE/$node.log" 2>&1 & INDOOR_PIDS+=("$!")
 done
