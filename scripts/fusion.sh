@@ -4,15 +4,15 @@
 #   定位核心（required，整组进退）：MID-360S 驱动 + FAST-LIO2 + 重力对齐桥接(位姿送飞控)
 #   + 附属（RC 通道 6 触发录包自动重启、系留绕线器不重启）；MAVROS 开机常驻，不归本脚本起停
 #   + 系留绕线器默认关闭（系留时使用 --winch 开启）
-#   + OV13855 相机预览（独立 roslaunch，见 launch/camera.launch）
+#   + OV13855 由监看面板或视觉任务按需启动
 #
 # 路径: /home/orangepi/mid360s_ws/scripts/fusion.sh
-# launch: scripts/launch/ 下 fusion_core / fusion_aux / camera（fusion.launch 是手动合集）
+# launch: scripts/launch/ 下 fusion_core / fusion_aux（fusion.launch 是手动合集）
 # 用法: ./fusion.sh [选项]
 #   --no-record         不启动 RC 触发录包节点（本次不会有 bag）
 #   --winch             启动绕线器控制（系留时显式开启）
 #   --no-winch          不启动绕线器控制（默认，保留兼容）
-#   --no-camera         不启动相机预览（OV13855 驱动 + AprilTag 视觉节点）
+#   --no-camera         保留兼容；相机由任务或网页按需启动
 #   --bag-prefix NAME   包名前缀（默认 noprop，产出 NAME_000001.bag）
 #   --bag-dir PATH      包输出目录（默认 /home/orangepi/test_data/bags）
 #   --allow-unsynced-clock  不等对时，直接按板端本地时间启动（没外网时用）
@@ -54,8 +54,7 @@
 # 对 required 节点退出也返回 0 的坑）。本脚本不改飞控参数、不改源码、本身不做开机自启；
 # 信号处理与退出码按后续接入 systemd 的需要保留。
 #
-# 相机预览在核心节点注册后拉起，输出只进单独日志；相机掉帧超时节点会退出，所以不并进核心组。
-# 相机、附属起不来或中途退出、MAVROS 不在或重启都只告警，不影响核心与退出码。
+# 附属起不来或中途退出、MAVROS 不在或重启都只告警，不影响核心与退出码。
 # ==============================================================================
 set -o pipefail
 
@@ -66,7 +65,6 @@ WS_SETUP="$WS/devel/setup.bash"
 ORANGE_SETUP="/home/orangepi/orange/devel/setup.bash"
 CORE_LAUNCH="$DIR/launch/fusion_core.launch"
 AUX_LAUNCH="$DIR/launch/fusion_aux.launch"
-CAMERA_LAUNCH="$DIR/launch/camera.launch"
 FC_TIME_PY="$DIR/fc_set_time.py"
 RC_RECORD_DIR="$DIR/rc_record"
 LOG_DIR="$WS/logs/fusion"
@@ -92,7 +90,6 @@ FC_TIME_TIMEOUT=20    # 飞控校时脚本的总时限（秒），正常 5~10 s
 DO_RECORD=1
 ALLOW_UNSYNCED_CLOCK=0
 DO_WINCH=0
-DO_CAMERA=1
 BAG_PREFIX="noprop"
 BAG_DIR="/home/orangepi/test_data/bags"
 # 外部定位送飞控的方式（重力桥 ev_mode）：pose = /mavros/vision_pose/pose_cov 只发位姿；
@@ -104,7 +101,7 @@ while [ $# -gt 0 ]; do
     --no-record) DO_RECORD=0 ;;
     --winch) DO_WINCH=1 ;;
     --no-winch) DO_WINCH=0 ;;
-    --no-camera) DO_CAMERA=0 ;;
+    --no-camera) : ;;
     --bag-prefix) BAG_PREFIX="${2:-}"; shift ;;
     --bag-dir) BAG_DIR="${2:-}"; shift ;;
     --allow-unsynced-clock) ALLOW_UNSYNCED_CLOCK=1 ;;
@@ -129,8 +126,6 @@ CORE_PIDFILE="$RUN_DIR/core.pid"
 AUX_PIDFILE="$RUN_DIR/aux.pid"
 WATCH_PIDFILE="$RUN_DIR/watch.pid"
 WATCH_CSV="$LOG_DIR/core_watch_${STAMP}.csv"
-CAM_PIDFILE="$RUN_DIR/camera.pid"
-CAM_LOGFILE="$LOG_DIR/camera_${STAMP}.log"
 
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE"; }
 ok()   { printf '[%s] [ OK ] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOGFILE"; }
@@ -307,7 +302,6 @@ stop_leader() {
 # 收尾顺序：相机 → 附属（录包节点先把 bag 收尾写索引）→ 核心 → 监控。
 # roscore 和 MAVROS 是常驻服务，不停。
 stop_all() {
-  stop_proc "相机 roslaunch" "$CAM_PIDFILE" 15
   stop_proc "附属 roslaunch（录包节点会先把 bag 收尾）" "$AUX_PIDFILE" "$STOP_TIMEOUT"
   stop_proc "核心 roslaunch" "$CORE_PIDFILE" "$STOP_TIMEOUT"
   stop_proc "数据连续性监控（退出时打印最终汇总）" "$WATCH_PIDFILE" 10
@@ -329,31 +323,6 @@ check_mavros() {
   fi
 }
 
-# 相机预览：单独的 roslaunch，不带 required。输出只进单独日志，避免 15 Hz 相机日志刷屏主终端。
-# 失败只告警，不影响核心。
-start_camera() {
-  local _i=0 _cur _miss _n
-  log "启动相机预览（launch/camera.launch，日志：$CAM_LOGFILE）"
-  if ! spawn "$CAM_PIDFILE" "$CAM_LOGFILE" roslaunch --screen "$CAMERA_LAUNCH" || ! proc_alive "$CAM_PIDFILE"; then
-    warn "相机 roslaunch 没起来，RViz 将没有预览图（看 $CAM_LOGFILE）"
-    return 1
-  fi
-  while [ "$_i" -lt 20 ]; do
-    proc_alive "$CAM_PIDFILE" || break
-    _cur="$(timeout 5 rosnode list 2>/dev/null)"
-    _miss=""
-    for _n in /ov13855_cam /ov13855_full_cam /ov13855_apriltag_vision_node; do
-      printf '%s\n' "$_cur" | grep -qx "$_n" || _miss="$_miss $_n"
-    done
-    if [ -z "$_miss" ]; then
-      ok "相机已启动：预览 /ov13855_apriltag_vision/image_preview/compressed（有订阅者才生成），读码全图 /ov13855_full/image_raw"
-      return 0
-    fi
-    sleep 1; _i=$((_i + 1))
-  done
-  warn "相机节点未全部注册（缺：${_miss:-roslaunch 已退出}），核心不受影响；看 $CAM_LOGFILE"
-  return 1
-}
 
 # ------------------------------------------------------------------- 收尾 ------
 # 收尾检查：只报告，不再顺手杀别的进程
@@ -368,13 +337,9 @@ verify_clean() {
   if [ "$DO_WINCH" -eq 1 ] && alive "tether_winch_nod[e]"; then
     _left="$_left tether_winch_node"
   fi
-  if [ "$DO_CAMERA" -eq 1 ]; then
-    alive "ov13855_cam_nod[e]" && _left="$_left ov13855_cam_node"
-    alive "ov13855_apriltag_vision_nod[e]" && _left="$_left ov13855_apriltag_vision_node"
-  fi
   if [ -n "$_left" ]; then
     warn "仍有节点进程残留：$_left"
-    warn "核对：ps -eo pid,args | grep -E 'livox_ros_driver2_node|fastlio_mapping|gravity_bridge_node|bag_recorder_node|tether_winch_node|ov13855_'"
+    warn "核对：ps -eo pid,args | grep -E 'livox_ros_driver2_node|fastlio_mapping|gravity_bridge_node|bag_recorder_node|tether_winch_node'"
   else
     ok "链路节点已全部退出"
   fi
@@ -457,16 +422,13 @@ hr; log "步骤 1/3：前置检查（环境 / 常驻 roscore 与 MAVROS / 防重
 for f in "$CORE_LAUNCH" "$AUX_LAUNCH"; do
   [ -f "$f" ] || { err "缺少 $f"; exit 1; }
 done
-if [ "$DO_CAMERA" -eq 1 ]; then
-  [ -f "$CAMERA_LAUNCH" ] || { err "缺少 $CAMERA_LAUNCH；或使用 --no-camera"; exit 1; }
-fi
 [ -f "$RC_RECORD_DIR/start_rc_record.sh" ] || { err "缺少 $RC_RECORD_DIR/start_rc_record.sh"; exit 1; }
 [ -f "$RC_RECORD_DIR/package.xml" ] || { err "缺少 $RC_RECORD_DIR/package.xml（roslaunch 靠它定位 rc_record 包）"; exit 1; }
 ok "脚本、launch 与 rc_record 包文件齐全（工作空间 $WS）"
 
 set +u; source "$ROS_SETUP"; source "$WS_SETUP"; set -u
-if [ "$DO_WINCH" -eq 1 ] || [ "$DO_CAMERA" -eq 1 ]; then
-  [ -f "$ORANGE_SETUP" ] || { err "缺少 $ORANGE_SETUP；请构建 orange 或使用 --no-winch --no-camera"; exit 1; }
+if [ "$DO_WINCH" -eq 1 ]; then
+  [ -f "$ORANGE_SETUP" ] || { err "缺少 $ORANGE_SETUP；请构建 orange 或使用 --no-winch"; exit 1; }
   set +u; source "$ORANGE_SETUP" --extend; set -u
 fi
 # rc_record 不是 catkin 包，把 scripts 挂进 ROS_PACKAGE_PATH，roslaunch 才解析得到它
@@ -481,11 +443,6 @@ done
 if [ "$DO_WINCH" -eq 1 ]; then
   rospack find tether_winch_control >/dev/null 2>&1 || { err "找不到 tether_winch_control，请在 orange 构建"; exit 1; }
   python3 -c 'from tether_winch_control.msg import WinchStatus' || { err "绕线器消息不可用，请重新构建 tether_winch_control"; exit 1; }
-fi
-if [ "$DO_CAMERA" -eq 1 ]; then
-  for p in ov13855_cam ov13855_apriltag_vision; do
-    rospack find "$p" >/dev/null 2>&1 || { err "找不到 $p，请在 orange 构建或使用 --no-camera"; exit 1; }
-  done
 fi
 ok "ROS Noetic 与所选功能包齐备"
 
@@ -527,10 +484,6 @@ done
 if [ "$DO_WINCH" -eq 1 ] && alive "tether_winch_nod[e]"; then
   stale="$stale tether_winch_node"
 fi
-if [ "$DO_CAMERA" -eq 1 ]; then
-  alive "ov13855_cam_nod[e]" && stale="$stale ov13855_cam_node"
-  alive "ov13855_apriltag_vision_nod[e]" && stale="$stale ov13855_apriltag_vision_node"
-fi
 if [ -n "$stale" ]; then
   err "检测到残留进程：$stale"
   err "上一次实例可能没退干净，先收尾（Ctrl+C 或 kill -INT <roslaunch pid>）再启动"
@@ -541,7 +494,6 @@ ok "无残留 ROS 进程（常驻服务除外）"
 _nodes="$(timeout 5 rosnode list 2>/dev/null)"
 _busy=""
 _check="${EXPECT_NODES#/mavros } /rc_bag_recorder"   # /mavros 是常驻的，本来就该在
-[ "$DO_CAMERA" -eq 1 ] && _check="$_check /ov13855_cam /ov13855_full_cam /ov13855_apriltag_vision_node"
 for n in $_check; do
   printf '%s\n' "$_nodes" | grep -qx "$n" && _busy="$_busy $n"
 done
@@ -671,11 +623,6 @@ else
   WINCH_ARG=false
   log "绕线器：关闭（默认，--winch 可开启），不由 fusion 发送 DUTY"
 fi
-if [ "$DO_CAMERA" -eq 1 ]; then
-  log "相机预览：核心节点注册后单独拉起（非 required，掉线不影响定位）"
-else
-  log "已指定 --no-camera：不启动相机预览"
-fi
 if [ "$EV_MODE" = "odom" ]; then
   log "外部定位：odom 方式，位姿 + 速度送 /mavros/odometry/out（飞控 EKF2_EV_CTRL 带 bit2 才融合速度）"
 else
@@ -767,7 +714,6 @@ elif [ "$NODES_RC" -eq 0 ]; then
       warn "录包节点没注册上，检查上面的日志"
     fi
   fi
-  [ "$DO_CAMERA" -eq 1 ] && start_camera
   hr; log "等待桥接输出里程计：首帧 /fastlio/odom_world（桥接收到有效 gravity_init 才发）"
   # 每轮只阻塞 READY_POLL 秒：Bash 要等前台命令结束才处理 trap，
   # 一次 timeout 180 的同步等待会让 SIGTERM 拖到 180 s，期间节点崩了也报不出来。
@@ -849,15 +795,11 @@ TIP
       if [ -e "$AUX_PIDFILE.tried" ]; then
         if proc_alive "$AUX_PIDFILE"; then _aux=" · aux=up"; else _aux=" · aux=down"; fi
       fi
-      _cam=""
-      if [ "$DO_CAMERA" -eq 1 ]; then
-        if proc_alive "$CAM_PIDFILE"; then _cam=" · cam=up"; else _cam=" · cam=down"; fi
-      fi
       _winch=""
       if [ "$DO_WINCH" -eq 1 ]; then
         if [ "$WINCH_GONE" -eq 0 ]; then _winch=" · winch=up"; else _winch=" · winch=已退出"; fi
       fi
-      log "运行中 · armed=${_armed:-?} · ${_mav}${_aux}${_winch} · ${_rec:-rec=n/a}${_cam} · ${_utc}"
+      log "运行中 · armed=${_armed:-?} · ${_mav}${_aux}${_winch} · ${_rec:-rec=n/a} · ${_utc}"
     fi
   done
 fi

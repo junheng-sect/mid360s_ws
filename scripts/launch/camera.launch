@@ -1,19 +1,5 @@
 <launch>
-  <!--
-    相机预览：OV13855 驱动 + AprilTag 视觉节点（产出 /ov13855_apriltag_vision/image_preview，
-    供本机 RViz 的 OV13855 Preview 面板经 /compressed 查看）。
-
-    由 fusion.sh 在核心节点注册后作为单独的、非 required 的 roslaunch 拉起，
-    不并进核心组 fusion_core.launch：fusion.sh 给核心 roslaunch 传 required 选项，相机掉帧超时节点会退出，
-    并进去就会把 FAST-LIO 整组定位一起带下来。这里的节点都 respawn，
-    相机断流只影响预览和读码，不影响定位与录包。
-
-    OV13855 双路（与 ov13855.launch 一致）：ov13855_cam 是自通路 1280x960，给 AprilTag；
-    ov13855_full_cam 是主通路 4224x3136，读码节点（manual_read / auto_read）读码时才订阅，平时不拷贝图像。
-    两路各自一个进程，可单独重启。
-    参数沿用 orange 工作空间各包自带的 YAML（与 ov13855.launch / ov13855_apriltag_vision.launch 一致）。
-    不启动 front_marker_control：本入口只看图，不做视觉控制。
-  -->
+  <!-- 独立的双路采集和任务视觉。控制台通过 H.264 观看，普通 fusion 默认不加载相机。 -->
   <arg name="camera_config" default="$(find ov13855_cam)/config/ov13855.yaml"/>
   <arg name="full_camera_config" default="$(find ov13855_cam)/config/ov13855_full.yaml"/>
   <arg name="vision_config" default="$(find ov13855_apriltag_vision)/config/ov13855_apriltag_vision.yaml"/>
