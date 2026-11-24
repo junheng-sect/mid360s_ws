@@ -43,7 +43,7 @@ PY
       shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --preview) PREVIEW_ARG=(--preview); shift ;;
-    --allow-unsynced-clock) shift ;;
+    --allow-unsynced-clock|--live-grid-only) shift ;;
     --map|--reloc-config|--map-frame|--nav-config|--ev-mode)
       [ $# -ge 2 ] && [ -n "$2" ] && [[ "$2" != --* ]] || { echo "$1 后面缺参数" >&2; exit 2; }
       [ "$1" != --nav-config ] || SELECTED_NAV="$2"
@@ -53,6 +53,7 @@ PY
       shift 2 ;;
     -h|--help)
       sed -n '3,16s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"
+      echo '  --live-grid-only  跳过先验栅格，仅用实时观测'
       exit 0 ;;
     *) echo "未知参数：$1" >&2; exit 2 ;;
   esac

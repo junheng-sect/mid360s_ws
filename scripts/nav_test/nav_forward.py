@@ -82,6 +82,8 @@ def say(msg):
 
 
 class State:
+    odom_receive_timeout = 0.30
+
     def __init__(self):
         self.odom = None
         self.odom_at = 0.0
@@ -155,7 +157,7 @@ class State:
 
     def pose(self):
         o = self.odom
-        if o is None or time.monotonic() - self.odom_at > 0.3:
+        if o is None or time.monotonic() - self.odom_at > self.odom_receive_timeout:
             return None
         p = o.pose.pose.position
         v = o.twist.twist.linear  # 机体系

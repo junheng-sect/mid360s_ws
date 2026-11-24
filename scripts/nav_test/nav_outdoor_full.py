@@ -845,9 +845,9 @@ def main():
     return run_full(a, FullRunner, 'test10')
 
 
-def run_full(a, runner_cls, test_name):
+def run_full(a, runner_cls, test_name, state_cls=None):
     rospy.init_node(test_name, anonymous=True, disable_signals=True)
-    s = FullState()
+    s = (state_cls or FullState)()
     fc = Fc(s)
     s.fc = fc
     buf = tf2_ros.Buffer()

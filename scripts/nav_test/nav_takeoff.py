@@ -88,6 +88,8 @@ def main():
 def wait_arm(s, fc):
     """等飞手在地面解锁；期间把影响起飞的问题说出来（变化时才打印）。"""
     last = None
+    web_task = bool(os.environ.get('WAREHOUSE_TASK_ID'))
+    ready = False
     while not armed(s):
         why = []
         if not fc.ext_fresh():
@@ -98,11 +100,20 @@ def wait_arm(s, fc):
             why.append('还没记到地面高度（飞机要静止在地面、上锁）')
         if s.get('input_status') != 'READY':
             why.append('导航输入 %s' % (s.get('input_status') or '无消息'))
+        if web_task:
+            if not s.fcu or not s.fcu.connected or time.monotonic() - s.fcu_at >= 2. or mode(s) != 'POSCTL':
+                why.append('等待飞控连接并切到定点模式')
+            if s.ekf_problem() and not s.resting_only():
+                why.append(s.ekf_problem())
+        ready = not why
         note = '待命：定点模式在地面解锁，%s' % ('；'.join(why) if why else '解锁后自动起飞')
         if note != last:
             say(note)
             last = note
         time.sleep(0.1)
+    if web_task and not ready:
+        say('预检完成前已解锁，本轮取消。上锁后重新下发')
+        sys.exit(2)
 
 
 def fly(a, s, fc, prepare, takeoff, set_mode, h, out):

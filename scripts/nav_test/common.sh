@@ -373,6 +373,10 @@ m = MapModel(sys.argv[1], load(sys.argv[2]))
 print('地图 %d 点，载入 %.1f s，%s' % (len(m.P), m.load_s, '缓存命中' if m.cache_hit else '已重建缓存'))
 PY
 
+  if declare -F test_bringup >/dev/null && ! test_bringup; then
+    err "测试设备未就绪"; finish 1 force
+  fi
+
   hr; log "步骤 2/4：启动定位链路 fusion.sh（位姿送飞控，通道 6 录包到本次目录）。飞机放好别动"
   local _record_env=("NAV_TEST_DLL_TASK=")
   if (( NT_DLL )); then _record_env=("NAV_TEST_DLL_TASK=$TEST_NAME"); fi

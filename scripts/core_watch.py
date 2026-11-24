@@ -23,7 +23,10 @@ import time
 
 import rospy
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from mavros_msgs.msg import State
 from nav_msgs.msg import Odometry
+
+from fastlio_timing import TimingLog
 
 # (话题, 断流阈值 s)；消息第一个字段都是 std_msgs/Header，AnyMsg 直接从原始字节读 seq / stamp
 TOPICS = [
@@ -35,6 +38,8 @@ TOPICS = [
     ('/mavros/local_position/pose', 0.3),
     ('/mavros/state', 3.0),
 ]
+FC_STATE = '/mavros/state'
+NAV = '/drone_nav/odom'
 LOCAL = '/mavros/local_position/pose'
 # 送给飞控的视觉位姿：TOPICS 里写的是 pose 方式的话题，odom 方式换成 /mavros/odometry/out
 VISION_TOPICS = {'pose': ('/mavros/vision_pose/pose_cov', PoseWithCovarianceStamped),
@@ -108,12 +113,22 @@ class Watch:
         self.clock_jumps = 0
         self.max_clock_step = 0.0
         self.t0 = time.monotonic()
+        self.timing = None
+        if args.timing_dir:
+            try:
+                self.timing = TimingLog(args.timing_dir, args.storage_path, say, args.timing_archive)
+            except OSError as exc:
+                say('详细诊断无法启动：%s' % exc)
+            if self.timing:
+                rospy.Subscriber(NAV, rospy.AnyMsg, self.on_any, NAV, queue_size=50, tcp_nodelay=True)
         for name, _ in self.topic_list:
             if name == self.vision:
                 # PoseWithCovarianceStamped 和 Odometry 的位置都在 msg.pose.pose.position
                 rospy.Subscriber(name, vision_type, self.on_pose, (name, True), queue_size=50)
             elif name == LOCAL:
                 rospy.Subscriber(name, PoseStamped, self.on_pose, (name, False), queue_size=50)
+            elif name == FC_STATE and self.timing and args.timing_archive:
+                rospy.Subscriber(name, State, self.on_state, queue_size=50)
             else:
                 rospy.Subscriber(name, rospy.AnyMsg, self.on_any, name, queue_size=50)
         self.csv = None
@@ -127,17 +142,32 @@ class Watch:
             self.csv.writerow(head + ['ev_resid_max', 'clock_step'])
 
     def on_any(self, msg, name):
-        mono, wall = time.monotonic(), time.time()
+        mono_ns, wall_ns = time.monotonic_ns(), time.time_ns()
         try:
             _, secs, nsecs = HEADER.unpack_from(msg._buff, 0)
         except struct.error:
             return
-        with self.lock:
-            self.topics[name].rx(secs + nsecs * 1e-9, mono, wall)
+        self.record_arrival(name, secs, nsecs, mono_ns, wall_ns)
+
+    def on_state(self, msg):
+        mono_ns, wall_ns = time.monotonic_ns(), time.time_ns()
+        self.timing.on_state(msg)
+        stamp = msg.header.stamp
+        self.record_arrival(FC_STATE, stamp.secs, stamp.nsecs, mono_ns, wall_ns)
+
+    def record_arrival(self, name, secs, nsecs, mono_ns, wall_ns):
+        if self.timing:
+            self.timing.arrival(mono_ns, wall_ns, name, secs * 10**9 + nsecs)
+        if name in self.topics:
+            with self.lock:
+                self.topics[name].rx(secs + nsecs * 1e-9, mono_ns * 1e-9, wall_ns * 1e-9)
 
     def on_pose(self, msg, cb_args):
         name, with_cov = cb_args
-        mono, wall = time.monotonic(), time.time()
+        mono_ns, wall_ns = time.monotonic_ns(), time.time_ns()
+        mono, wall = mono_ns * 1e-9, wall_ns * 1e-9
+        if self.timing:
+            self.timing.arrival(mono_ns, wall_ns, name, msg.header.stamp.to_nsec())
         p = msg.pose.pose.position if with_cov else msg.pose.position
         with self.lock:
             self.topics[name].rx(msg.header.stamp.to_sec(), mono, wall)
@@ -181,6 +211,9 @@ class Watch:
         while not rospy.is_shutdown():
             time.sleep(0.05)
             wall, mono = time.time(), time.monotonic()
+            if self.timing:
+                self.timing.sample()
+                self.timing.checkpoint(mono)
             step = (wall - wall_prev) - (mono - mono_prev)
             wall_prev, mono_prev = wall, mono
             if abs(step) > CLOCK_JUMP_S:
@@ -210,12 +243,17 @@ class Watch:
                     self.summary()
         with self.lock:
             self.summary(final=True)
+        if self.timing:
+            self.timing.close()
         if self.csv:
             self.csv_file.close()
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--timing-dir', help='详细诊断 CSV 的 tmpfs 目录（默认关闭）')
+    ap.add_argument('--timing-archive', help='着地上锁且关包后保存诊断的目录')
+    ap.add_argument('--storage-path', default='.', help='录包目录，用于定位对应块设备')
     ap.add_argument('--csv', help='逐秒明细 CSV 路径（不给就不写）')
     ap.add_argument('--summary-sec', type=float, default=60.0, help='汇总间隔（秒），默认 60')
     ap.add_argument('--resid-warn', type=float, default=0.5,

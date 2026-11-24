@@ -20,6 +20,7 @@
   -->
   <arg name="send_to_mavros" default="true"/>
   <arg name="ev_mode"        default="pose"/>
+  <arg name="frame_timing"   default="false"/>
 
   <!-- MID-360S 驱动：关 RViz，也关驱动自带的 rosbag（录包统一交给通道 6 触发） -->
   <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360s.launch">
@@ -30,6 +31,7 @@
   <!-- FAST-LIO2：关 RViz -->
   <include file="$(find fast_lio)/launch/mapping_mid360s.launch">
     <arg name="rviz" value="false"/>
+    <arg name="frame_timing" value="$(arg frame_timing)"/>
   </include>
 
   <!-- 重力对齐桥接：pose 方式送 /mavros/vision_pose/pose_cov，odom 方式送 /mavros/odometry/out -->

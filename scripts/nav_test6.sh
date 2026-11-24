@@ -45,6 +45,10 @@ run_test() {
     nt_check_chain || return
     nav_takeoff --delay "$DELAY"
     _rc=$?
+    if [ "${WAREHOUSE_TASK_ID:-}" ] && [ "$_rc" -ne 130 ]; then
+      warn "网页起飞任务退出（$_rc），本次不再自动起飞"
+      return
+    fi
     if [ "$_rc" -eq 130 ]; then
       _ans=""
       read -r -p "自动起飞已停。回车=重新开始｜q=不再触发（上锁后 Ctrl+C 收尾）：" _ans </dev/tty

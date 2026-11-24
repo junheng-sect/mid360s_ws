@@ -14,6 +14,9 @@ with (HERE / 'inspection_route.yaml').open() as stream:
 SEGMENTS = ROUTE['segments']
 FINAL_HOLD = 2.
 ROUTE_TIMEOUT = 240.
+INSPECTION_RECOVERY_S = 5.
+INSPECTION_STABLE_SPEED = .10
+INSPECTION_ABORT_SPEED = .15
 
 
 def profile(config):
@@ -74,6 +77,10 @@ from nav_forward import say
 from nav_outdoor_full import FullRunner, FullState, run_full
 from nav_land import Fc
 from nav_square import STOP_REASON, Stopped
+
+
+class InspectionState(FullState):
+    odom_receive_timeout = 0.50
 
 
 class InspectionRunner(FullRunner):
@@ -171,18 +178,44 @@ class InspectionRunner(FullRunner):
                    end_error_m=float(np.linalg.norm(p-self.goals[index])),
                    end_yaw_odom_deg=math.degrees(yaw), hold_start_wall=time.time())
         self.save()
-        hold_start = time.monotonic()
         if segment['hold_s']:
-            end = hold_start + segment['hold_s']
-            while time.monotonic() < end:
-                self.guard(stopped=True)
-                actual, actual_yaw, speed = self.s.pose()
-                if (np.linalg.norm(actual-self.goals[index]) > .15 or speed > .1 or
-                        abs(wrap(actual_yaw-yaw)) > math.radians(5)):
-                    raise Stopped('%s 停留期间失去稳定' % segment['name'])
-                time.sleep(min(.05, max(0., end-time.monotonic())))
-        leg['hold_elapsed_s'] = time.monotonic()-hold_start
+            self.hold_inspection(leg, self.goals[index], yaw, segment['hold_s'])
+        else:
+            leg['hold_elapsed_s'] = 0.
         self.save()
+
+    def hold_inspection(self, leg, target, yaw, seconds):
+        start = time.monotonic()
+        deadline = start + seconds + INSPECTION_RECOVERY_S
+        stable_since = None
+        leg.update(hold_speed_resets=0, hold_peak_speed_mps=0.)
+        while True:
+            self.guard(stopped=True)
+            pose = self.s.pose()
+            if pose is None:
+                raise Stopped('/drone_nav/odom 断流')
+            actual, actual_yaw, speed = pose
+            now = time.monotonic()
+            position_error = np.linalg.norm(actual - target)
+            yaw_error = math.degrees(abs(wrap(actual_yaw - yaw)))
+            leg['hold_peak_speed_mps'] = max(leg['hold_peak_speed_mps'], speed)
+            if not (position_error <= .15 and yaw_error <= 5. and speed <= INSPECTION_ABORT_SPEED):
+                raise Stopped('%s 停留超限：位置 %.3f m、航向 %.1f°、速度 %.3f m/s' %
+                              (leg['direction'], position_error, yaw_error, speed))
+            if speed > INSPECTION_STABLE_SPEED:
+                if stable_since is not None:
+                    leg['hold_speed_resets'] += 1
+                stable_since = None
+            elif stable_since is None:
+                stable_since = now
+            # Keep holding the endpoint until the entire valid window is re-established.
+            if now <= deadline and stable_since is not None and now - stable_since >= seconds:
+                leg['hold_elapsed_s'] = now - start
+                return
+            if now >= deadline:
+                raise Stopped('%s 停留超时：%.1f s 内未连续稳定 %.1f s（速度峰值 %.3f m/s）' %
+                              (leg['direction'], now - start, seconds, leg['hold_peak_speed_mps']))
+            time.sleep(min(.05, deadline - now))
 
     def route_finished(self):
         return (len(self.record['legs']) == len(SEGMENTS)+1 and
@@ -255,7 +288,7 @@ class InspectionRunner(FullRunner):
 def preview(args):
     rospy.init_node('nav_test11_preview', anonymous=True, disable_signals=True)
     rospy.wait_for_service('/drone_nav/prepare', timeout=10)
-    state = FullState()
+    state = InspectionState()
     buf = tf2_ros.Buffer()
     listener = tf2_ros.TransformListener(buf)
     client = actionlib.SimpleActionClient('/drone_nav/execute_route', ExecuteRouteAction)
@@ -270,7 +303,9 @@ def preview(args):
 if __name__ == '__main__':
     try:
         args = arguments(rospy.myargv()[1:])
-        raise SystemExit(preview(args) if args.preview else run_full(args, InspectionRunner, 'test11'))
+        if args.preview:
+            raise SystemExit(preview(args))
+        raise SystemExit(run_full(args, InspectionRunner, 'test11', state_cls=InspectionState))
     except KeyboardInterrupt:
         raise SystemExit(130)
     except Exception as error:

@@ -14,6 +14,7 @@
 #   --no-winch          不启动绕线器控制（默认，保留兼容）
 #   --no-camera         保留兼容；相机由任务或网页按需启动
 #   --bag-prefix NAME   包名前缀（默认 noprop，产出 NAME_000001.bag）
+#   --timing-dir PATH   诊断 CSV 着地关包或正常退出时归档到 PATH（运行中暂存在 tmpfs）
 #   --bag-dir PATH      包输出目录（默认 /home/orangepi/test_data/bags）
 #   --allow-unsynced-clock  不等对时，直接按板端本地时间启动（没外网时用）
 #   --ev-mode MODE      外部定位送飞控的方式：pose（默认，只发位姿）/ odom（位姿 + 速度，要 MAVROS 用 MAVLink2）
@@ -91,6 +92,8 @@ DO_RECORD=1
 ALLOW_UNSYNCED_CLOCK=0
 DO_WINCH=0
 BAG_PREFIX="noprop"
+TIMING_DIR=""
+TIMING_TMP=""
 BAG_DIR="/home/orangepi/test_data/bags"
 # 外部定位送飞控的方式（重力桥 ev_mode）：pose = /mavros/vision_pose/pose_cov 只发位姿；
 # odom = /mavros/odometry/out 位姿 + 速度。启动时选定，运行中不切换（见 gravity_bridge.launch）。
@@ -104,9 +107,12 @@ while [ $# -gt 0 ]; do
     --no-camera) : ;;
     --bag-prefix) BAG_PREFIX="${2:-}"; shift ;;
     --bag-dir) BAG_DIR="${2:-}"; shift ;;
+    --timing-dir)
+      [ -n "${2:-}" ] && [[ "$2" != --* ]] || { echo "--timing-dir 后面缺目录" >&2; exit 2; }
+      TIMING_DIR="$2"; shift ;;
     --allow-unsynced-clock) ALLOW_UNSYNCED_CLOCK=1 ;;
     --ev-mode) EV_MODE="${2:-}"; shift ;;
-    -h|--help) sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1（-h 看用法）" >&2; exit 2 ;;
   esac
   shift
@@ -146,6 +152,20 @@ on_exit() {
       warn "处理掉这些进程后执行 sudo systemctl start chrony"
     else
       warn "chronyd 没起来：多半还有核心进程占着 $CLOCK_FREEZE_LOCK，等它们退出后执行 sudo systemctl start chrony"
+    fi
+  fi
+  if [ -n "$TIMING_TMP" ]; then
+    if proc_alive "$WATCH_PIDFILE"; then
+      warn "诊断监控还在运行，暂存于 $TIMING_TMP"
+    elif [ "$(cat "$TIMING_DIR/.checkpoint" 2>/dev/null)" = "$TIMING_TMP" ]; then
+      rm -rf "$TIMING_TMP"
+    elif [ ! -s "$TIMING_TMP/arrivals.csv" ]; then
+      rm -rf "$TIMING_TMP"
+    elif mkdir -- "$TIMING_DIR" && cp -a -- "$TIMING_TMP/." "$TIMING_DIR/"; then
+      log "FAST-LIO 单帧 / CPU 调度 / 存储诊断已保存：$TIMING_DIR"
+      rm -rf "$TIMING_TMP"
+    else
+      warn "诊断归档失败，原始记录保留在 $TIMING_TMP"
     fi
   fi
   rm -rf "$RUN_DIR"
@@ -659,14 +679,25 @@ else
 fi
 # 数据连续性监控先于核心起：从第一帧开始记。只读消息头，断流 / 时间戳倒退 / 时间跳变 / 飞控本地位置与
 # 视觉位姿偏差即时打到终端，逐秒明细进 CSV。起不来只告警。
-if spawn "$WATCH_PIDFILE" tee python3 -u "$DIR/core_watch.py" --csv "$WATCH_CSV" --ev-mode "$EV_MODE"; then
+WATCH_TIMING_ARGS=()
+FRAME_TIMING=false
+if [ -n "$TIMING_DIR" ]; then
+  if TIMING_TMP="$(mktemp -d /dev/shm/mid360s_timing.XXXXXX)"; then
+    WATCH_TIMING_ARGS=(--timing-dir "$TIMING_TMP" --storage-path "$BAG_DIR" --timing-archive "$TIMING_DIR")
+    FRAME_TIMING=true
+    log "FAST-LIO 诊断暂存于 $TIMING_TMP，着地关包或正常退出时保存到 $TIMING_DIR"
+  else
+    warn "无法建立诊断暂存目录（定位与录包照常运行）"
+  fi
+fi
+if spawn "$WATCH_PIDFILE" tee python3 -u "$DIR/core_watch.py" --csv "$WATCH_CSV" --ev-mode "$EV_MODE" "${WATCH_TIMING_ARGS[@]}"; then
   log "数据连续性监控 pid=$(proc_pid_now "$WATCH_PIDFILE")（逐秒明细：$WATCH_CSV）"
 else
   warn "数据连续性监控没起来（核心照常运行）"
 fi
 
 spawn "$CORE_PIDFILE" tee roslaunch --screen --required "$CORE_LAUNCH" send_to_mavros:=true \
-  ev_mode:="$EV_MODE" || start_fail "核心 roslaunch 没能在 12 s 内起来"
+  ev_mode:="$EV_MODE" frame_timing:="$FRAME_TIMING" || start_fail "核心 roslaunch 没能在 12 s 内起来"
 CORE_SETSID_PID="$SPAWN_PID"
 log "核心 roslaunch pid=$(proc_pid_now "$CORE_PIDFILE")（雷达驱动 / FAST-LIO / 重力桥，任一退出整组停）"
 # 从这里起盯常驻 MAVROS：mavros_node 的 PID 变了就是重启过（check_mavros）

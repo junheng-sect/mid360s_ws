@@ -15,6 +15,7 @@ from drone_navigation.core import wrap
 from drone_navigation.ros_common import xyz
 from geometry_msgs.msg import Point
 from traj_utils.msg import PathTrajectory
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 sys.path.insert(0, '/home/orangepi/orange/src/drone_navigation/test')
@@ -31,9 +32,31 @@ class InspectionHarness(Harness):
             (np.cos(el)*np.cos(az)).ravel(), (np.cos(el)*np.sin(az)).ravel(), np.sin(el).ravel()])
         self.commands = []
         self.trajectories = []
+        self.path_generations = set()
+        self.third_hold_at = None
         super().__init__()
         self.track = True
         rospy.Subscriber('/drone_nav/path_trajectory', PathTrajectory, self.on_trajectory)
+        rospy.Subscriber('/drone_nav/gateway_status', String, self.on_gateway)
+        self.pubs['/fastlio/velocity'] = self.VelocityPublisher(self, self.pubs['/fastlio/velocity'])
+
+    class VelocityPublisher:
+        def __init__(self, harness, publisher):
+            self.harness = harness
+            self.publisher = publisher
+
+        def publish(self, message):
+            started = self.harness.third_hold_at
+            if started is not None and 1.4 <= time.monotonic() - started < 1.65:
+                # Reproduce the brief speed excursion observed during the C hover.
+                message.vector.x, message.vector.y, message.vector.z = .103, 0., 0.
+            self.publisher.publish(message)
+
+    def on_gateway(self, message):
+        status = json.loads(message.data)
+        if (self.third_hold_at is None and len(self.path_generations) == 3 and
+                status.get('reason') == 'task stopped; prepare before next route'):
+            self.third_hold_at = time.monotonic()
 
     @property
     def points(self):
@@ -49,6 +72,8 @@ class InspectionHarness(Harness):
 
     def cmd(self, message):
         super().cmd(message)
+        if message.generation >= 2**32:
+            self.path_generations.add(message.generation)
         self.commands.append([message.header.stamp.to_sec(), message.generation,
                               *xyz(message.position), *xyz(message.velocity),
                               *xyz(message.acceleration), message.yaw, int(message.terminal)])
@@ -96,6 +121,11 @@ def main(out):
         assert record['end'] == 'SUCCEEDED'
         assert [leg['end'] for leg in record['legs']] == ['SUCCEEDED']*5
         assert all(leg['hold_elapsed_s'] >= 3. for leg in record['legs'][:3])
+        third_hold = record['legs'][2]
+        assert third_hold['hold_speed_resets'] == 1, third_hold
+        assert .10 < third_hold['hold_peak_speed_mps'] < .15, third_hold
+        assert third_hold['hold_elapsed_s'] >= 4.4, third_hold
+        print('PASS brief C hover speed excursion resets the 3 s dwell before return', flush=True)
         assert record['legs'][-1]['kind'] == 'return_heading'
         rows = np.array(harness.commands)
         metrics = dict(length=0., max_heading_error_deg=0., max_yaw_rate_deg_s=0., moving_turn_samples=0)
